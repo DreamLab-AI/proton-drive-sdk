@@ -42,8 +42,24 @@ pub struct DownloadStats {
     pub bytes: u64,
     /// Number of blocks fetched and decrypted.
     pub blocks: u32,
-    /// Modification time from the XAttr (if present and decryptable).
+    /// Modification time from the XAttr (if present, decryptable, and
+    /// parsed as one of the accepted formats — see
+    /// [`parse_xattr_modification_time`]).
     pub last_modification_time: Option<std::time::SystemTime>,
+    /// Set when `Common.ModificationTime` was present in the (decrypted)
+    /// XAttr JSON but was not a value we could parse into a time — e.g. the
+    /// wrong JSON type, or a string that isn't one of the accepted date
+    /// formats. This is a **per-node degradation, never a download failure**:
+    /// mirrors cs `DtoToMetadataConverter` recording a
+    /// `ExtendedAttributesDeserializationError` against the node while still
+    /// returning everything else that decrypted successfully
+    /// (`reference/client/cs/src/Proton.Drive.Sdk/Nodes/DtoToMetadataConverter.cs`).
+    /// The message shows the shape of what was actually in the JSON with
+    /// digits redacted (`0`→`#`), mirroring cs
+    /// `Iso8601DateTimeResultJsonConverter`'s `redactedValue` — enough to
+    /// diagnose the format, not enough to leak the exact claimed timestamp
+    /// into logs.
+    pub modification_time_error: Option<String>,
     /// Whether the revision's manifest signature verified against the signer's
     /// keys. `false` means the data was delivered intact (every block matched
     /// its SHA-256 hash) but its **authenticity** could not be confirmed — e.g.
@@ -296,7 +312,10 @@ impl FileDownloader {
             .await?;
 
         // ── Step 5 (XAttr) ────────────────────────────────────────────────────
-        let last_modification_time = self
+        // A garbage/unparseable ModificationTime is a per-node degradation,
+        // never a download failure — the bytes above are already written and
+        // hash-verified regardless of what `verify_xattr` finds here.
+        let xattr_mtime = self
             .verify_xattr(
                 revision.x_attr.as_deref(),
                 total_bytes,
@@ -307,7 +326,8 @@ impl FileDownloader {
         Ok(DownloadStats {
             bytes: total_bytes,
             blocks: total_blocks,
-            last_modification_time,
+            last_modification_time: xattr_mtime.time,
+            modification_time_error: xattr_mtime.error,
             signature_verified,
         })
     }
@@ -510,23 +530,29 @@ impl FileDownloader {
     /// Attempt to cross-check the assembled file against XAttr metadata.
     ///
     /// XAttr decryption is best-effort for MVP: if absent or undecryptable,
-    /// we warn and return `None` (JS does the same fallback).
+    /// we warn and return an empty result (JS does the same fallback).
     ///
     /// When present, we verify:
     /// - `Common.Size` matches `total_bytes`
     /// - `Common.Digests.SHA1` matches `sha1_digest`
+    /// - `Common.ModificationTime`, if present, parses as one of the accepted
+    ///   date formats (see [`parse_xattr_modification_time`]); an unparseable
+    ///   value is reported via [`XAttrModificationTime::error`] but never
+    ///   aborts the download — mirrors cs `DtoToMetadataConverter` treating a
+    ///   modification-time parse failure as a per-node degradation, not a
+    ///   fatal error.
     async fn verify_xattr(
         &self,
         xattr_armored: Option<&str>,
         total_bytes: u64,
         sha1_digest: &[u8],
-    ) -> Option<std::time::SystemTime> {
+    ) -> XAttrModificationTime {
         let Some(xattr_raw) = xattr_armored else {
             tracing::debug!(
                 node_id = %self.node_uid.node_id,
                 "no XAttr on revision — skipping XAttr cross-check (legacy revision)"
             );
-            return None;
+            return XAttrModificationTime::default();
         };
 
         // XAttr is an armored PGP message (`armoredExtendedAttributes`):
@@ -546,7 +572,7 @@ impl FileDownloader {
                     node_id = %self.node_uid.node_id,
                     "XAttr session-key decrypt failed: {e} — skipping cross-check"
                 );
-                return None;
+                return XAttrModificationTime::default();
             }
         };
 
@@ -561,7 +587,7 @@ impl FileDownloader {
                     node_id = %self.node_uid.node_id,
                     "XAttr decrypt failed: {e} — skipping cross-check"
                 );
-                return None;
+                return XAttrModificationTime::default();
             }
         };
 
@@ -572,18 +598,23 @@ impl FileDownloader {
                     node_id = %self.node_uid.node_id,
                     "XAttr plaintext not UTF-8: {e}"
                 );
-                return None;
+                return XAttrModificationTime::default();
             }
         };
 
         let xattr: serde_json::Value = match serde_json::from_str(json_str) {
             Ok(v) => v,
             Err(e) => {
+                // Show what was actually in the JSON (digits redacted, matching
+                // cs `Iso8601DateTimeResultJsonConverter`'s redaction) rather
+                // than just the serde_json parse error — that error alone
+                // doesn't say what shape the payload had.
                 tracing::warn!(
                     node_id = %self.node_uid.node_id,
-                    "XAttr JSON parse failed: {e}"
+                    "XAttr JSON parse failed: {e}; payload was: {}",
+                    redact_digits(json_str)
                 );
-                return None;
+                return XAttrModificationTime::default();
             }
         };
 
@@ -609,15 +640,203 @@ impl FileDownloader {
             }
         }
 
-        // Extract modification time.
-        xattr["Common"]["ModificationTime"].as_i64().map(|ts| {
-            if ts >= 0 {
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts as u64)
-            } else {
-                std::time::UNIX_EPOCH
+        // Extract modification time. `ModificationTime` is a JSON *string* on
+        // the wire (`dateToIsoString` — `reference/client/js/src/internal/nodes/extendedAttributes.ts`),
+        // never a number — the previous `.as_i64()` here could never match a
+        // real payload.
+        match xattr.get("Common").and_then(|c| c.get("ModificationTime")) {
+            None | Some(serde_json::Value::Null) => XAttrModificationTime::default(),
+            Some(serde_json::Value::String(raw)) => match parse_xattr_modification_time(raw) {
+                Some(time) => XAttrModificationTime {
+                    time: Some(time),
+                    error: None,
+                },
+                None => {
+                    let msg = format!(
+                        "XAttr ModificationTime \"{}\" is not a recognized date format",
+                        redact_digits(raw)
+                    );
+                    tracing::warn!(node_id = %self.node_uid.node_id, "{msg}");
+                    XAttrModificationTime {
+                        time: None,
+                        error: Some(msg),
+                    }
+                }
+            },
+            Some(other) => {
+                let msg = format!(
+                    "XAttr ModificationTime has unexpected JSON type (expected string): {}",
+                    redact_digits(&other.to_string())
+                );
+                tracing::warn!(node_id = %self.node_uid.node_id, "{msg}");
+                XAttrModificationTime {
+                    time: None,
+                    error: Some(msg),
+                }
             }
-        })
+        }
     }
+}
+
+/// Outcome of best-effort `Common.ModificationTime` extraction from a
+/// decrypted XAttr document — mirrors cs's `Result<DateTime,
+/// ProtonDriveError>?` on `CommonExtendedAttributes.ModificationTime`
+/// (`reference/client/cs/src/Proton.Drive.Sdk/Api/Files/CommonExtendedAttributes.cs`):
+/// absent, present-and-valid, or present-but-unparseable. The last case is a
+/// per-node degradation surfaced to the caller, never a download failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct XAttrModificationTime {
+    time: Option<std::time::SystemTime>,
+    error: Option<String>,
+}
+
+/// Redact ASCII digits from a string for safe inclusion in logs/error text —
+/// mirrors cs `Iso8601DateTimeResultJsonConverter`'s `redactedValue`
+/// (`char.IsDigit(c) ? '#' : c`): shows the *shape* of what was actually in
+/// the JSON without leaking the exact claimed timestamp.
+fn redact_digits(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect()
+}
+
+/// Parse an XAttr `Common.ModificationTime` string into a `SystemTime`.
+///
+/// Accepts the format set upstream both writes and reads:
+/// - JS `Date.prototype.toISOString()` (`extendedAttributes.ts`
+///   `dateToIsoString`) — always UTC, always exactly 3 fractional digits:
+///   `YYYY-MM-DDTHH:MM:SS.sssZ`.
+/// - C# round-trip (`"O"`) format
+///   (`Iso8601DateTimeResultJsonConverter.Write`) — always UTC, always
+///   exactly 7 fractional digits: `YYYY-MM-DDTHH:MM:SS.fffffffZ`.
+/// - The general RFC 3339 shape cs's reader also accepts (`TryGetDateTimeOffset`
+///   plus its `DateTimeOffset.TryParse` fallback): any fractional-second
+///   digit count from 0 to 9, and either a `Z` suffix or a numeric
+///   `+HH:MM`/`-HH:MM` offset in place of `Z` — covering values written by
+///   other first-party clients (desktop/mobile), not just this SDK's own
+///   writer.
+///
+/// Returns `None` — not an error — for anything else. The caller ([`FileDownloader::verify_xattr`])
+/// treats `None` as a per-node degradation (mirrors cs recording an
+/// `ExtendedAttributesDeserializationError` against the node), never a fatal
+/// download error.
+fn parse_xattr_modification_time(raw: &str) -> Option<std::time::SystemTime> {
+    let bytes = raw.as_bytes();
+    // Shortest valid form: "YYYY-MM-DDTHH:MM:SS" + "Z" == 20 bytes.
+    if bytes.len() < 20 {
+        return None;
+    }
+
+    let digit = |i: usize| -> Option<i64> {
+        let c = *bytes.get(i)?;
+        if c.is_ascii_digit() {
+            Some((c - b'0') as i64)
+        } else {
+            None
+        }
+    };
+    let two = |i: usize| -> Option<i64> { Some(digit(i)? * 10 + digit(i + 1)?) };
+    let four = |i: usize| -> Option<i64> {
+        Some(digit(i)? * 1000 + digit(i + 1)? * 100 + digit(i + 2)? * 10 + digit(i + 3)?)
+    };
+
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let year = four(0)?;
+    let month = two(5)?;
+    let day = two(8)?;
+
+    let t = bytes.get(10)?;
+    if *t != b'T' && *t != b't' {
+        return None;
+    }
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let hour = two(11)?;
+    let minute = two(14)?;
+    let second = two(17)?;
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+
+    let mut cursor = 19usize;
+    let mut nanos: i64 = 0;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let frac_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        let frac_len = cursor - frac_start;
+        if !(1..=9).contains(&frac_len) {
+            return None;
+        }
+        let mut value: i64 = 0;
+        for i in frac_start..cursor {
+            value = value * 10 + digit(i)?;
+        }
+        let scale = 10i64.pow(9 - frac_len as u32);
+        nanos = value * scale;
+    }
+
+    let offset_minutes: i64 = match bytes.get(cursor) {
+        Some(b'Z') | Some(b'z') => {
+            cursor += 1;
+            0
+        }
+        Some(b'+') | Some(b'-') => {
+            let sign = if bytes[cursor] == b'+' { 1 } else { -1 };
+            let offset_hour = two(cursor + 1)?;
+            if bytes.get(cursor + 3) != Some(&b':') {
+                return None;
+            }
+            let offset_minute = two(cursor + 4)?;
+            cursor += 6;
+            sign * (offset_hour * 60 + offset_minute)
+        }
+        _ => return None,
+    };
+
+    // Trailing garbage after a well-formed timestamp+offset is not tolerated.
+    if cursor != bytes.len() {
+        return None;
+    }
+
+    // days_from_civil (Howard Hinnant, http://howardhinnant.github.io/date_algorithms.html)
+    // — the inverse of `upload::system_time_to_iso8601`'s `civil_from_days`.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (month + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days_since_epoch = era * 146_097 + doe - 719_468;
+
+    let seconds_of_day = hour * 3_600 + minute * 60 + second;
+    let total_seconds = days_since_epoch * 86_400 + seconds_of_day - offset_minutes * 60;
+
+    // `std::time::SystemTime`'s `Duration`-based API cannot represent an
+    // instant before `UNIX_EPOCH` on all platforms; treat as unparseable
+    // rather than panicking or silently clamping to the epoch (the previous
+    // behaviour here for the — never actually reachable — negative-integer
+    // branch).
+    if total_seconds < 0 {
+        return None;
+    }
+
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(total_seconds as u64)
+            + std::time::Duration::from_nanos(nanos as u64),
+    )
 }
 
 // ── factory helpers (used by ProtonDriveClient) ───────────────────────────────
@@ -3027,5 +3246,308 @@ mod tests {
             "manifest must verify: it was signed by the same address key the \
              downloader resolves via the file's SignatureEmail"
         );
+    }
+
+    // ── XAttr ModificationTime: format parsing + per-node degradation ────────
+
+    /// Pure unit tests for [`parse_xattr_modification_time`] — no crypto or
+    /// HTTP setup needed, so the accepted-format matrix is cheap to cover
+    /// exhaustively here; the end-to-end behavioural guarantee (download
+    /// still succeeds when the value is garbage) is covered separately below
+    /// via `download_with_xattr_common`.
+    mod parse_xattr_modification_time_tests {
+        use super::super::parse_xattr_modification_time;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // 1_700_000_000s since epoch == 2023-11-14T22:13:20.000Z (same constant
+        // `upload::tests::xattr_json_with_mtime` uses for the writer side).
+        const EPOCH_SECS: u64 = 1_700_000_000;
+
+        #[test]
+        fn accepts_js_millisecond_format() {
+            assert_eq!(
+                parse_xattr_modification_time("2023-11-14T22:13:20.000Z"),
+                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
+            );
+        }
+
+        #[test]
+        fn accepts_no_fractional_seconds() {
+            assert_eq!(
+                parse_xattr_modification_time("2023-11-14T22:13:20Z"),
+                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
+            );
+        }
+
+        #[test]
+        fn accepts_cs_seven_digit_round_trip_format() {
+            assert_eq!(
+                parse_xattr_modification_time("2023-11-14T22:13:20.1234567Z"),
+                Some(
+                    UNIX_EPOCH
+                        + Duration::from_secs(EPOCH_SECS)
+                        + Duration::from_nanos(123_456_700)
+                )
+            );
+        }
+
+        #[test]
+        fn accepts_positive_numeric_offset() {
+            // 23:13:20+01:00 == 22:13:20Z.
+            assert_eq!(
+                parse_xattr_modification_time("2023-11-14T23:13:20+01:00"),
+                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
+            );
+        }
+
+        #[test]
+        fn accepts_negative_numeric_offset() {
+            // 21:13:20-01:00 == 22:13:20Z.
+            assert_eq!(
+                parse_xattr_modification_time("2023-11-14T21:13:20-01:00"),
+                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
+            );
+        }
+
+        #[test]
+        fn rejects_empty_and_truncated_strings() {
+            assert_eq!(parse_xattr_modification_time(""), None);
+            assert_eq!(parse_xattr_modification_time("2023-11-14"), None);
+        }
+
+        #[test]
+        fn rejects_non_date_garbage() {
+            assert_eq!(parse_xattr_modification_time("not-a-date-at-all!!"), None);
+        }
+
+        #[test]
+        fn rejects_out_of_range_components() {
+            assert_eq!(parse_xattr_modification_time("2023-13-14T22:13:20Z"), None); // month 13
+            assert_eq!(parse_xattr_modification_time("2023-11-14T25:13:20Z"), None); // hour 25
+        }
+
+        #[test]
+        fn rejects_missing_offset_or_z() {
+            assert_eq!(parse_xattr_modification_time("2023-11-14T22:13:20"), None);
+        }
+    }
+
+    /// Builds a single-block revision whose XAttr is
+    /// `{"Common": <xattr_common_json>}`, downloads it end to end (real
+    /// crypto, mocked HTTP), and returns the resulting `DownloadStats`.
+    /// Asserts along the way that the download itself always succeeds and
+    /// delivers the plaintext byte-identically — the whole point of the
+    /// per-node-degradation contract this section tests is that a bad
+    /// `Common.ModificationTime` never prevents that.
+    async fn download_with_xattr_common(xattr_common_json: serde_json::Value) -> DownloadStats {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("xattr-mtime-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let plaintext = b"xattr modification-time test content";
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                std::slice::from_ref(&sign_pub),
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let ciphertext_hash = block_hash_b64(&ciphertext);
+
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        let hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&ciphertext_hash)
+            .unwrap();
+        let manifest_sig_bytes = crypto.sign(&hash_bytes, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&manifest_sig_bytes);
+
+        // XAttr encrypted to the node key and signed by the same key —
+        // mirrors production shape closely enough for this cross-check
+        // (`encrypt_and_sign` on write, `decrypt_and_verify` on read).
+        let xattr_json = serde_json::json!({ "Common": xattr_common_json }).to_string();
+        let xattr_session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let xattr_ciphertext = crypto
+            .encrypt_and_sign(
+                xattr_json.as_bytes(),
+                &xattr_session_key,
+                std::slice::from_ref(&sign_pub),
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let xattr_armored = armor(&xattr_ciphertext, ArmorKind::Message);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1",
+                "State": 1,
+                "Blocks": [{
+                    "Index": 1,
+                    "BareURL": "https://cdn.proton.me/block-1",
+                    "Token": "tok-abc",
+                    "Hash": ciphertext_hash,
+                    "EncryptedSignature": null,
+                    "Size": ciphertext.len() as u64,
+                }],
+                "ManifestSignature": manifest_sig_b64,
+                "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null,
+                "XAttr": xattr_armored,
+                "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
+        mock.add("block-1", Bytes::from(ciphertext.clone()));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto: crypto.clone(),
+            node_uid: NodeUid {
+                volume_id: "vol-1".into(),
+                node_id: "link-1".into(),
+            },
+            volume_id: "vol-1".into(),
+            share_id: "share-1".into(),
+            revision_id: "rev-1".into(),
+            node_private_key: sign_key,
+            signature_address_pubs: vec![sign_pub],
+            content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
+        };
+
+        let mut output = Vec::new();
+        let stats = downloader
+            .download_to_writer(&mut output)
+            .await
+            .expect("download must succeed even with a degraded XAttr ModificationTime");
+        assert_eq!(
+            output, plaintext,
+            "bytes must still be delivered intact regardless of XAttr ModificationTime validity"
+        );
+        stats
+    }
+
+    #[tokio::test]
+    async fn xattr_with_no_modification_time_field_downloads_cleanly() {
+        let stats = download_with_xattr_common(serde_json::json!({})).await;
+        assert!(stats.last_modification_time.is_none());
+        assert!(stats.modification_time_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn xattr_modification_time_js_millisecond_format_round_trips() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": "2023-11-14T22:13:20.000Z"
+        }))
+        .await;
+        assert_eq!(
+            stats.last_modification_time,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        );
+        assert!(stats.modification_time_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn xattr_modification_time_cs_seven_digit_fraction_round_trips() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": "2023-11-14T22:13:20.1234567Z"
+        }))
+        .await;
+        assert!(stats.modification_time_error.is_none());
+        let expected = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000)
+            + std::time::Duration::from_nanos(123_456_700);
+        assert_eq!(stats.last_modification_time, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn xattr_modification_time_no_fraction_round_trips() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": "2023-11-14T22:13:20Z"
+        }))
+        .await;
+        assert!(stats.modification_time_error.is_none());
+        assert_eq!(
+            stats.last_modification_time,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn xattr_modification_time_numeric_offset_round_trips() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": "2023-11-14T23:13:20+01:00"
+        }))
+        .await;
+        assert!(stats.modification_time_error.is_none());
+        assert_eq!(
+            stats.last_modification_time,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        );
+    }
+
+    /// The regression test for the actual bug: before this fix,
+    /// `Common.ModificationTime` was read with `.as_i64()`, which can never
+    /// match the string upstream actually writes — every real
+    /// ModificationTime was silently dropped. A garbage value must still
+    /// degrade gracefully rather than aborting the download, mirroring cs
+    /// `DtoToMetadataConverter`'s per-node
+    /// `ExtendedAttributesDeserializationError` handling.
+    #[tokio::test]
+    async fn xattr_garbage_modification_time_degrades_without_failing_download() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": "13/45/2023 not-a-real-date"
+        }))
+        .await;
+        assert!(stats.last_modification_time.is_none());
+        let err = stats
+            .modification_time_error
+            .expect("a garbage mtime must be reported, not silently dropped");
+        assert!(err.contains("ModificationTime"));
+        // Digits are redacted — the raw claimed value never appears verbatim.
+        assert!(!err.contains("13/45/2023"));
+        assert!(err.contains("##/##/####"));
+    }
+
+    /// A `ModificationTime` present with the wrong JSON type (a number
+    /// instead of an ISO-8601 string) is exactly as invalid as a garbage
+    /// string, and must degrade the same way — matching cs's explicit
+    /// `JsonTokenType.String` check in `Iso8601DateTimeResultJsonConverter`.
+    #[tokio::test]
+    async fn xattr_modification_time_wrong_json_type_degrades_without_failing_download() {
+        let stats = download_with_xattr_common(serde_json::json!({
+            "ModificationTime": 1_700_000_000
+        }))
+        .await;
+        assert!(stats.last_modification_time.is_none());
+        assert!(stats.modification_time_error.is_some());
     }
 }
