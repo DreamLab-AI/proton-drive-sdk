@@ -5,11 +5,18 @@
 //! A pure rpgp self-roundtrip proves internal consistency only; these tests
 //! prove interoperability with the OpenPGP.js path used by the Proton JS SDK.
 //!
-//! Test 4 (wrong-signer) is marked `#[ignore]` because the current
-//! `decrypt_and_verify` implementation does not distinguish `VerificationResult::Invalid`
-//! from `VerificationResult::Valid` — `verify_nested` returns a non-empty `Ok` in both
-//! cases and the current code maps that to `VerificationStatus::Ok`. The fixture and
-//! assertion are correct; the impl needs the fix-forward noted in ADR-0012.
+//! The wrong-signer test (`wire_wrong_signer_is_rejected`, test 3 below) is
+//! **not** ignored: the C1 fix (ADR-0012) landed — `decrypt_and_verify`
+//! inspects the individual `VerificationResult` variants rather than
+//! collapsing a non-empty `verify_nested` `Ok` to `VerificationStatus::Ok`,
+//! so it correctly asserts `VerificationStatus::SignatureWrongSigner`.
+//!
+//! The only `#[ignore]`d test in this file is
+//! `wire_rust_encrypted_decryptable_by_node` (a Rust-encrypts /
+//! Node-decrypts round-trip), and it is ignored purely because it shells out
+//! to `node` + the `openpgp` npm package, which CI does not provision — not
+//! because of any known bug. Run it manually with `cargo test -- --ignored`
+//! once `tests/fixtures/wire/node_modules` is populated (see README.md).
 
 #![allow(
     clippy::unwrap_used,
@@ -219,7 +226,61 @@ async fn wire_wrong_signer_is_rejected() {
     );
 }
 
-// ── test 4 (JS roundtrip): Rust encrypts → Node/openpgp.js decrypts ──────────
+// ── test 4: compressed + signed fixture — decompress before verify ───────────
+
+/// `seipdv1_signed_compressed.bin`'s SEIPD wraps an OpenPGP-compressed (ZIP)
+/// packet around the signed literal — exactly the shape JS produces for
+/// ExtendedAttributes (`compress: true`, see
+/// reference/js/sdk/src/crypto/driveCrypto.ts:556
+/// `encryptExtendedAttributes` -> openPGPCrypto.ts:124-132
+/// `encryptAndSignArmored`). Before the `finalize_decrypted` fix this either
+/// mis-verified the signature (rpgp's `verify_nested` refuses a
+/// `Message::Compressed`) or returned corrupted (still-compressed)
+/// "plaintext"; both are exercised here with real, non-empty verification
+/// keys against a validly-signed payload.
+#[tokio::test]
+async fn wire_compressed_signed_decrypts_and_verifies() {
+    let crypto = RpgpCrypto::new();
+    let fx = load_fixtures(&crypto).await;
+    let compressed_bin = fixture("seipdv1_signed_compressed.bin");
+
+    let session_key = crypto
+        .decrypt_session_key(&compressed_bin, &[fx.priv_key.clone()])
+        .await
+        .expect("decrypt_session_key");
+
+    let (decrypted, status) = crypto
+        .decrypt_and_verify(&compressed_bin, &session_key, &[fx.signer_pub.clone()])
+        .await
+        .expect("decrypt_and_verify");
+
+    // Plaintext must be byte-identical to the committed fixture — i.e.
+    // actually decompressed, not the raw compressed bytes.
+    assert_eq!(
+        decrypted, fx.plaintext,
+        "decompressed plaintext does not match seipdv1_signed.plaintext.bin"
+    );
+
+    let meta_raw = fixture_str("seipdv1_signed_compressed.meta.json");
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("valid JSON");
+    let expected_sha256 = meta["plaintext_sha256"].as_str().expect("sha256 field");
+    let actual_sha256 = hex::encode(Sha256::digest(&decrypted));
+    assert_eq!(
+        actual_sha256, expected_sha256,
+        "plaintext SHA-256 mismatch vs meta.json"
+    );
+
+    // With real verification keys against a validly-signed compressed
+    // payload, the status must be Ok — not SignatureInvalid (verify_nested
+    // erroring on an undecompressed Message::Compressed) and not NoSignature.
+    assert_eq!(
+        status,
+        VerificationStatus::Ok,
+        "expected Ok but got {status:?}"
+    );
+}
+
+// ── test 5 (JS roundtrip): Rust encrypts → Node/openpgp.js decrypts ──────────
 
 /// Rust encrypts + signs the fixture plaintext, then a small Node.js script
 /// (`wire_roundtrip.mjs`) decrypts it using openpgp.js and writes the

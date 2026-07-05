@@ -36,6 +36,8 @@ interoperability with the actual Proton wire format.  Implements ADR-0012.
 | `seipdv1_signed.meta.json` | Metadata: key fingerprints, plaintext SHA-256 |
 | `seipdv1_tampered.bin` | `seipdv1_signed.bin` with one SEIPD-body byte flipped |
 | `seipdv1_wrong_signer.bin` | Re-signed with a throwaway key not in `signer_pub.asc` |
+| `seipdv1_signed_compressed.bin` | Encrypted+signed with ZIP compression on the inner literal — the shape JS produces for ExtendedAttributes (`compress: true`, see `driveCrypto.ts` `encryptExtendedAttributes`). Same keys and plaintext as `seipdv1_signed.bin`. |
+| `seipdv1_signed_compressed.meta.json` | Metadata for the compressed fixture (same plaintext SHA-256 as `seipdv1_signed.meta.json`) |
 | `generate.mjs` | Script to regenerate all of the above |
 
 ## Regenerating
