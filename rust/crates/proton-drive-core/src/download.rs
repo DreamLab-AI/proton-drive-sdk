@@ -342,6 +342,40 @@ impl FileDownloader {
         }
     }
 
+    /// Best-effort peek at the file's *claimed* plaintext size, decrypted
+    /// from the revision's `XAttr` (`Common.Size`) — **not** `Revision.Size`,
+    /// which is the ciphertext/block size on the wire and does not equal the
+    /// plaintext length (encryption overhead, padding).
+    ///
+    /// Mirrors the C# SDK's `RevisionOperations.GetClaimedSizeAsync`
+    /// (cs/v0.15.0 "Report extended attributes size for download progress
+    /// instead of revision size";
+    /// `client/cs/src/Proton.Drive.Sdk/Nodes/RevisionOperations.cs:68-78`),
+    /// whose result (`DownloadState.ClaimedSize`) is threaded into the
+    /// download progress callback's total instead of the revision's raw byte
+    /// count (`RevisionReader.cs:59`,
+    /// `downloaded => onProgress(downloaded, _state.ClaimedSize)`).
+    ///
+    /// Callers are expected to invoke this *before* `download_to_writer`/
+    /// `download_to_path` to learn the total up front for a progress bar;
+    /// it performs its own single-page revision fetch rather than
+    /// restructuring the main download protocol to plumb a callback through,
+    /// so it costs one extra (cheap, metadata-only) GET. Returns `Ok(None)`
+    /// whenever the size can't be determined (missing XAttr, undecryptable,
+    /// or malformed) rather than failing outright — a progress total is a UX
+    /// nicety, not a correctness gate, matching `verify_xattr`'s existing
+    /// best-effort treatment of the same field.
+    pub async fn claimed_size(&self) -> Result<Option<u64>> {
+        let revision = self.fetch_revision_page(1).await?;
+        let Some(xattr_armored) = revision.x_attr.as_deref() else {
+            return Ok(None);
+        };
+        Ok(self
+            .decrypt_xattr_json(xattr_armored)
+            .await
+            .and_then(|xattr| xattr["Common"]["Size"].as_u64()))
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// Fetch one page of the revision's blocks, starting at `from_block_index`
@@ -507,34 +541,21 @@ impl FileDownloader {
         Ok(plaintext)
     }
 
-    /// Attempt to cross-check the assembled file against XAttr metadata.
+    /// Decrypt a revision's armored `XAttr` blob to its plaintext JSON.
     ///
-    /// XAttr decryption is best-effort for MVP: if absent or undecryptable,
-    /// we warn and return `None` (JS does the same fallback).
+    /// XAttr decryption is best-effort for MVP: if undecryptable or not valid
+    /// UTF-8/JSON, we warn and return `None` (JS does the same fallback).
+    /// Shared by `verify_xattr` (post-download cross-check) and
+    /// `claimed_size` (pre-download progress total) so both read the same
+    /// bytes the same way.
     ///
-    /// When present, we verify:
-    /// - `Common.Size` matches `total_bytes`
-    /// - `Common.Digests.SHA1` matches `sha1_digest`
-    async fn verify_xattr(
-        &self,
-        xattr_armored: Option<&str>,
-        total_bytes: u64,
-        sha1_digest: &[u8],
-    ) -> Option<std::time::SystemTime> {
-        let Some(xattr_raw) = xattr_armored else {
-            tracing::debug!(
-                node_id = %self.node_uid.node_id,
-                "no XAttr on revision — skipping XAttr cross-check (legacy revision)"
-            );
-            return None;
-        };
-
-        // XAttr is an armored PGP message (`armoredExtendedAttributes`):
-        // encrypted to the node key, signed by the address key. Decrypt the
-        // session key with the node key, then the message body; verification is
-        // best-effort (empty keys → no signature check), mirroring JS where a
-        // failed XAttr decrypt is non-fatal.
-        let xattr_bytes = xattr_raw.as_bytes();
+    /// XAttr is an armored PGP message (`armoredExtendedAttributes`):
+    /// encrypted to the node key, signed by the address key. Decrypt the
+    /// session key with the node key, then the message body; verification is
+    /// best-effort (empty keys → no signature check), mirroring JS where a
+    /// failed XAttr decrypt is non-fatal.
+    async fn decrypt_xattr_json(&self, xattr_armored: &str) -> Option<serde_json::Value> {
+        let xattr_bytes = xattr_armored.as_bytes();
         let session_key = match self
             .crypto
             .decrypt_session_key(xattr_bytes, std::slice::from_ref(&self.node_private_key))
@@ -576,16 +597,41 @@ impl FileDownloader {
             }
         };
 
-        let xattr: serde_json::Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
+        match serde_json::from_str(json_str) {
+            Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(
                     node_id = %self.node_uid.node_id,
                     "XAttr JSON parse failed: {e}"
                 );
-                return None;
+                None
             }
+        }
+    }
+
+    /// Attempt to cross-check the assembled file against XAttr metadata.
+    ///
+    /// XAttr decryption is best-effort for MVP: if absent or undecryptable,
+    /// we warn and return `None` (JS does the same fallback).
+    ///
+    /// When present, we verify:
+    /// - `Common.Size` matches `total_bytes`
+    /// - `Common.Digests.SHA1` matches `sha1_digest`
+    async fn verify_xattr(
+        &self,
+        xattr_armored: Option<&str>,
+        total_bytes: u64,
+        sha1_digest: &[u8],
+    ) -> Option<std::time::SystemTime> {
+        let Some(xattr_raw) = xattr_armored else {
+            tracing::debug!(
+                node_id = %self.node_uid.node_id,
+                "no XAttr on revision — skipping XAttr cross-check (legacy revision)"
+            );
+            return None;
         };
+
+        let xattr = self.decrypt_xattr_json(xattr_raw).await?;
 
         // Verify size.
         if let Some(claimed_size) = xattr["Common"]["Size"].as_u64() {
@@ -1151,6 +1197,128 @@ mod tests {
         assert!(
             stats.signature_verified,
             "manifest signed by the resolved verification key must verify"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cs/v0.15.0 "Report extended attributes size for download progress
+    // instead of revision size"
+    // (`client/cs/src/Proton.Drive.Sdk/Nodes/RevisionOperations.cs:68-78`).
+    // -----------------------------------------------------------------------
+
+    /// `claimed_size` must read `Common.Size` from the decrypted XAttr, via a
+    /// single up-front revision fetch independent of the main block-download
+    /// loop.
+    #[tokio::test]
+    async fn claimed_size_reads_xattr_common_size() {
+        let (crypto, node_key, node_pub) = make_crypto_material("claimed-size-pass").await;
+        let crypto = Arc::new(crypto);
+
+        // A deliberately implausible declared size that cannot be confused
+        // with any block/ciphertext length in this test, proving the value
+        // returned genuinely comes from the XAttr and nowhere else (e.g. not
+        // `Revision.Size`, which this wire shape doesn't even carry).
+        const CLAIMED_SIZE: u64 = 123_456_789;
+
+        let xattr_json = serde_json::json!({ "Common": { "Size": CLAIMED_SIZE } }).to_string();
+        let xattr_session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let xattr_ciphertext = crypto
+            .encrypt_and_sign(
+                xattr_json.as_bytes(),
+                &xattr_session_key,
+                std::slice::from_ref(&node_pub),
+                &node_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let xattr_armored = armor(&xattr_ciphertext, ArmorKind::Message);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-claimed-size", "State": 1, "Blocks": [],
+                "ManifestSignature": null, "ContentKeyPacket": null,
+                "ContentKeyPacketSignature": null, "XAttr": xattr_armored,
+                "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add("revisions/rev-claimed-size", Bytes::from(revision_json));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto: crypto.clone(),
+            node_uid: NodeUid {
+                volume_id: "vol-1".into(),
+                node_id: "link-1".into(),
+            },
+            volume_id: "vol-1".into(),
+            share_id: "share-1".into(),
+            revision_id: "rev-claimed-size".into(),
+            node_private_key: node_key,
+            signature_address_pubs: vec![node_pub],
+            content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
+        };
+
+        let claimed = downloader.claimed_size().await.unwrap();
+        assert_eq!(
+            claimed,
+            Some(CLAIMED_SIZE),
+            "claimed_size must read Common.Size from the decrypted XAttr"
+        );
+    }
+
+    /// A legacy revision with no XAttr must yield `Ok(None)`, not fail —
+    /// matching `verify_xattr`'s existing best-effort treatment of a missing
+    /// XAttr, since a progress total is a UX nicety, not a correctness gate.
+    #[tokio::test]
+    async fn claimed_size_is_none_when_xattr_absent() {
+        let (crypto, node_key, node_pub) = make_crypto_material("no-xattr-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-no-xattr", "State": 1, "Blocks": [],
+                "ManifestSignature": null, "ContentKeyPacket": null,
+                "ContentKeyPacketSignature": null, "XAttr": null,
+                "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add("revisions/rev-no-xattr", Bytes::from(revision_json));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto: crypto.clone(),
+            node_uid: NodeUid {
+                volume_id: "vol-1".into(),
+                node_id: "link-1".into(),
+            },
+            volume_id: "vol-1".into(),
+            share_id: "share-1".into(),
+            revision_id: "rev-no-xattr".into(),
+            node_private_key: node_key,
+            signature_address_pubs: vec![node_pub],
+            content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
+        };
+
+        let claimed = downloader.claimed_size().await.unwrap();
+        assert_eq!(
+            claimed, None,
+            "a legacy revision with no XAttr must yield None, not fail the download"
         );
     }
 
@@ -2985,6 +3153,7 @@ mod tests {
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
             },
+            telemetry: None,
         };
 
         let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
@@ -3011,6 +3180,20 @@ mod tests {
         });
 
         let uid = make_node_uid(share_id, ROUNDTRIP_FILE_LINK_ID);
+
+        // `claimed_size` (cs/v0.15.0 XAttr-sourced progress total) against a
+        // *real* uploaded file, decrypted with the genuine crypto stack —
+        // not just the lighter `MockHttpClient` unit tests above. A second,
+        // independent `file_downloader()` call, since `claimed_size` is
+        // meant to be queried before the consuming `download_to_writer`/
+        // `download_to_path` call takes ownership of its `FileDownloader`.
+        let size_probe = client.file_downloader(&uid).await.unwrap();
+        assert_eq!(
+            size_probe.claimed_size().await.unwrap(),
+            Some(content.len() as u64),
+            "claimed_size should report the real uploaded file's XAttr-declared size"
+        );
+
         let downloader = client.file_downloader(&uid).await.unwrap();
         let mut out = Vec::new();
         let stats = downloader.download_to_writer(&mut out).await.unwrap();

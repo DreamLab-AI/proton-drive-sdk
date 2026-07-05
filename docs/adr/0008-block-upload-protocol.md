@@ -50,8 +50,19 @@ Port `client/js/src/internal/upload/` happy path 1:1 into `proton-drive-core::up
 - Thumbnail upload (`thumbnailUploader` paths)
 - Photos block protocol (`photos/`)
 - Resumable / multi-part / parallel-block upload
-- Verifier retry loop on hash mismatch
-- Telemetry (`upload/telemetry.ts`) — track later
+- Telemetry (`upload/telemetry.ts`) beyond the one metric below — track later
+
+**Update 2026-07-05 (wp/c2-resilience, js/v0.16.0 alignment):** the block
+"verify then retry on hash mismatch" loop that this ADR originally excluded
+*is* now ported — `upload.rs::encrypt_block_with_verify_retry` encrypts a
+block, self-verifies it by decrypting it back with the content session key
+(catches bitflips/bad hardware, mirroring JS `cryptoService.verifyBlock`),
+and retries the whole encrypt step once (`MAX_BLOCK_ENCRYPTION_RETRIES = 1`,
+matching `streamUploader.ts`) before giving up. Whether the retry helped is
+reported as `MetricEvent::BlockVerificationError { retry_helped }` through
+the existing (optional) `proton-drive-telemetry` sink — the one piece of
+`upload/telemetry.ts` this port implements; the rest (per-volume-type
+context, upload-outcome telemetry) remains out of scope.
 
 ## Rust API shape
 

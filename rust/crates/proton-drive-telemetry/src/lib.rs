@@ -37,6 +37,11 @@ pub enum MetricEvent {
     },
     BlockVerificationError {
         detail: String,
+        /// Whether retrying the block encryption resolved the integrity
+        /// failure. Mirrors JS `UploadTelemetry.logBlockVerificationError`'s
+        /// `retryHelped` argument
+        /// (`client/js/src/internal/upload/telemetry.ts:29-41`).
+        retry_helped: bool,
     },
     ApiRetrySucceeded {
         attempts: u32,

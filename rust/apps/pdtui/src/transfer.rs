@@ -11,8 +11,15 @@
 //! Progress is driven by three watch channels:
 //! - `progress_rx`: `u64` bytes_done, sent by the upload/download task.
 //! - `total_rx`: `Option<u64>` bytes_total, set once known (uploads set it
-//!   immediately after `stat`ing the local file; downloads leave it `None`,
-//!   matching prior behaviour since the total isn't known up front there).
+//!   immediately after `stat`ing the local file; downloads set it from the
+//!   remote revision's XAttr-declared plaintext size — `Common.Size`, *not*
+//!   the raw `Revision.Size` on the wire, which is the ciphertext/block size
+//!   and does not equal the plaintext length — via
+//!   `FileDownloader::claimed_size`, mirroring the C# SDK's `ClaimedSize`
+//!   (cs/v0.15.0 "Report extended attributes size for download progress
+//!   instead of revision size"). It stays `None` when the XAttr is missing
+//!   or undecryptable (legacy revisions, best-effort — see `claimed_size`'s
+//!   own doc comment).
 //! - `outcome_rx`: `Option<Result<TransferOutcome, String>>` — `None` while
 //!   running, `Some(Ok(outcome))` on success, `Some(Err(msg))` on failure.
 //!
@@ -237,10 +244,10 @@ pub fn spawn_download(
 ) -> Transfer {
     let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
     let (progress_tx, progress_rx) = watch::channel::<u64>(0);
-    // Downloads don't know the total size up front (no equivalent to
-    // upload's pre-transfer `stat`), so this channel is never written —
-    // `total_rx` simply stays `None` for the life of the transfer.
-    let (_total_tx, total_rx) = watch::channel::<Option<u64>>(None);
+    // Set from the revision's XAttr-declared plaintext size once
+    // `do_download` fetches it (best-effort — see `claimed_size`); stays
+    // `None` for legacy revisions with no decryptable XAttr.
+    let (total_tx, total_rx) = watch::channel::<Option<u64>>(None);
     let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<TransferOutcome, String>>>(None);
 
     let label = node_name.clone();
@@ -254,6 +261,7 @@ pub fn spawn_download(
             node_name,
             dest_dir,
             progress_tx,
+            total_tx,
             cancel_clone,
         )
         .await;
@@ -347,6 +355,7 @@ async fn do_download(
     node_name: String,
     dest_dir: PathBuf,
     progress_tx: watch::Sender<u64>,
+    total_tx: watch::Sender<Option<u64>>,
     cancel: Arc<tokio_util::sync::CancellationToken>,
 ) -> Result<TransferOutcome, String> {
     if cancel.is_cancelled() {
@@ -357,6 +366,21 @@ async fn do_download(
         .file_downloader(&node_uid)
         .await
         .map_err(|e| format!("file_downloader: {e}"))?;
+
+    // Best-effort progress total, sourced from the revision's XAttr-declared
+    // plaintext size (`Common.Size`), *not* the raw `Revision.Size` on the
+    // wire (ciphertext/block size — mirrors the C# SDK's `ClaimedSize`,
+    // cs/v0.15.0). A fetch/decrypt failure here (legacy revision with no
+    // XAttr, transient error, ...) only means the gauge stays indeterminate;
+    // it must never fail the download itself.
+    match downloader.claimed_size().await {
+        Ok(size) => {
+            let _ = total_tx.send(size);
+        }
+        Err(e) => {
+            tracing::debug!("claimed_size: {e} — progress total stays unknown");
+        }
+    }
 
     // `node_name` is the decrypted remote node name — plaintext chosen by
     // whoever created/shared the node, never trustworthy as a raw path

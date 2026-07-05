@@ -422,6 +422,7 @@ impl ProtonDriveClient {
             parent: parent.clone(),
             name: name.to_owned(),
             metadata: meta,
+            telemetry: self.opts.telemetry.clone(),
         }))
     }
 
