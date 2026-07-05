@@ -1123,8 +1123,8 @@ mod tests {
 
     #[async_trait]
     impl proton_drive_crypto::OpenPgpCrypto for FakeCrypto {
-        fn generate_passphrase(&self) -> String {
-            "fake-passphrase".into()
+        fn generate_passphrase(&self) -> zeroize::Zeroizing<String> {
+            zeroize::Zeroizing::new("fake-passphrase".into())
         }
 
         async fn decrypt_key(

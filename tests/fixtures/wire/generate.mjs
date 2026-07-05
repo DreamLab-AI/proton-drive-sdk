@@ -229,6 +229,52 @@ writeFileSync(out('seipdv1_wrong_signer.bin'), Buffer.from(wrongSigned));
 console.log('  Written: seipdv1_wrong_signer.bin (signed by throwaway key NOT in signer_pub.asc)');
 console.log('  Throwaway signer fingerprint:', (await openpgp.readKey({ armoredKey: throwawayKey.publicKey })).getFingerprint());
 
+// ── compressed + signed (ExtendedAttributes-shaped payload) ──────────────────
+//
+// The JS SDK sets `compress: true` when encrypting ExtendedAttributes
+// (reference/js/sdk/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
+// -> openPGPCrypto.ts:124-132 `encryptAndSignArmored`, which forwards
+// `compress: options.compress || false` to the host-injected CryptoProxy).
+// That means real XAttr blobs from any first-party client arrive as a
+// SEIPD whose inner plaintext is an OpenPGP-compressed packet wrapping the
+// signed literal. This fixture reproduces that shape (ZIP — RFC 4880 §9.3's
+// mandatory-to-implement algorithm, chosen here for interop since the exact
+// algorithm CryptoProxy selects lives in the host-injected @proton/crypto
+// package, not vendored under reference/) so the Rust decrypt path can be
+// proven to decompress before verifying (see proton-drive-crypto finalize_decrypted).
+
+console.log('Encrypting and signing a compressed payload (XAttr-shaped)…');
+const compressedSigned = await openpgp.encrypt({
+  message: await openpgp.createMessage({ binary: plaintext }),
+  encryptionKeys: encPublicKey,
+  signingKeys: signerPrivateKey,
+  config: {
+    preferredCompressionAlgorithm: openpgp.enums.compression.zip,
+    aeadProtect: false,
+    allowInsecureDecryptionWithSigningKeys: false,
+  },
+  format: 'binary',
+});
+
+const compressedSignedBuf = Buffer.from(compressedSigned);
+writeFileSync(out('seipdv1_signed_compressed.bin'), compressedSignedBuf);
+console.log('  Written: seipdv1_signed_compressed.bin (' + compressedSignedBuf.length + ' bytes)');
+
+const compressedMeta = {
+  generator: 'generate.mjs (openpgp.js v6, SEIPDv1, ZIP-compressed)',
+  generated_at: new Date().toISOString(),
+  plaintext_seed: SEED,
+  plaintext_length: plaintext.length,
+  plaintext_sha256: sha256hex(plaintext),
+  encryption_key_fingerprint: encParsed.getFingerprint(),
+  signer_key_fingerprint: signerParsed.getFingerprint(),
+  cipher_algorithm: 'AES-256',
+  compression: 'zip',
+  aead: false,
+};
+writeFileSync(out('seipdv1_signed_compressed.meta.json'), JSON.stringify(compressedMeta, null, 2) + '\n', 'utf8');
+console.log('  Written: seipdv1_signed_compressed.meta.json');
+
 // ── done ──────────────────────────────────────────────────────────────────────
 
 console.log('\nAll fixtures written successfully.');
