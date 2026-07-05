@@ -1,4 +1,4 @@
-//! Root client. Mirrors `js/sdk/src/protonDriveClient.ts` shape.
+//! Root client. Mirrors `client/js/src/protonDriveClient.ts` shape.
 
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use crate::nodes::{
 use crate::upload::{FileUploader, ProtonFileUploader, UploadMetadata};
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
 use proton_drive_cache::ProtonDriveCache;
-use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, SrpModule};
+use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey, SrpModule, VerificationStatus};
 use proton_drive_telemetry::Telemetry;
 
 /// All host-supplied dependencies for the SDK.
@@ -140,10 +140,24 @@ impl ProtonDriveClient {
     /// Iterate all children of a folder.
     ///
     /// Uses `GET drive/shares/{shareID}/folders/{linkID}/children` with
-    /// page-based pagination (Page=0..N, PageSize=page_size). Iterates until
-    /// `More == 0`. Returns a `Vec` rather than a stream; for MVP a single
-    /// collected result is sufficient. Streams would be preferable for large
-    /// folders — see TODO below.
+    /// page-based pagination (Page=0..N, PageSize=page_size). Returns a `Vec`
+    /// rather than a stream; for MVP a single collected result is sufficient.
+    /// Streams would be preferable for large folders — see TODO below.
+    ///
+    /// Termination is **not** driven by the wire's `More` field: the
+    /// deprecated legacy endpoint's response shape in the vendored OpenAPI
+    /// spec (`get_drive-shares-{shareID}-folders-{linkID}-children` in
+    /// `reference/client/js/src/internal/apiService/driveTypes.ts`) is
+    /// `{ Code, AllowSorting, Links }` — there is no `More`/cursor field at
+    /// all (that only exists on the v2 volume-scoped sibling endpoint, see
+    /// `docs/IMPLEMENTATION-STATUS.md` B8). `GetChildrenResponse::more`
+    /// therefore always deserializes to its `#[serde(default)]` of `0`, and a
+    /// termination check of `more == 0` would silently truncate every folder
+    /// with more than `page_size` children after the first page. Instead we
+    /// use the standard offset-pagination convention: a page shorter than the
+    /// requested `PageSize` is definitionally the last page. `more` is still
+    /// read and OR'd in, tolerating a future/undocumented server that does
+    /// send a real `More` signal.
     ///
     /// # TODO MC-followup: convert to async stream for large folder support
     ///
@@ -175,6 +189,7 @@ impl ProtonDriveClient {
                 self.api_get_with_query(&path, query).await?;
 
             let more = resp.more;
+            let returned = resp.links.len();
             for link in resp.links {
                 let name = match &parent_key {
                     Some(key) => decrypt_node_name(&self.opts.openpgp, &link.name, key)
@@ -185,7 +200,8 @@ impl ProtonDriveClient {
                 results.push(link_to_maybe_node(link, &parent.volume_id, name));
             }
 
-            if more == 0 {
+            let full_page = returned >= page_size as usize;
+            if more == 0 && !full_page {
                 break;
             }
             page += 1;
@@ -207,6 +223,12 @@ impl ProtonDriveClient {
     }
 
     /// Decrypt the share private key for `share_id` via the user's address key.
+    ///
+    /// Non-fatally verifies the share's `PassphraseSignature` against the
+    /// creator address's public keys (JS `SharesCryptoService.decryptRootShare`
+    /// -> `account.getPublicKeys(share.creatorEmail)`); an unresolvable or
+    /// unverifiable signature is only logged, never aborts share-key
+    /// derivation.
     async fn resolve_share_key(&self, share_id: &str) -> Result<PrivateKey> {
         let share_resp: proton_drive_api::shares::GetShareResponse =
             self.api_get(&format!("/drive/shares/{share_id}")).await?;
@@ -215,13 +237,41 @@ impl ProtonDriveClient {
         let address_email = self.opts.account.primary_email();
         let address_key = self.opts.account.address_private_key(address_email).await?;
 
-        decrypt_share_key(
+        let verification_keys = match &share.creator_email {
+            Some(email) => match self.opts.account.address_public_keys(email).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(
+                        email = %email,
+                        "could not resolve share creator public keys for \
+                         PassphraseSignature verification: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+
+        let (share_priv, verified) = decrypt_share_key(
             &self.opts.openpgp,
             &share.key,
             &share.passphrase,
+            &share.passphrase_signature,
             &address_key,
+            &verification_keys,
         )
-        .await
+        .await?;
+
+        if verified != VerificationStatus::Ok {
+            tracing::warn!(
+                share_id = %share_id,
+                status = ?verified,
+                "share PassphraseSignature present but unverifiable (non-fatal, \
+                 JS-faithful) — key still unlocked"
+            );
+        }
+
+        Ok(share_priv)
     }
 
     /// Resolve a node's private key by walking the parent chain to the share
@@ -234,6 +284,14 @@ impl ProtonDriveClient {
     /// `ParentLinkID`, then derive keys top-down starting from `share_priv`.
     ///
     /// `MAX_CHAIN_DEPTH` guards against a malformed/cyclic parent chain.
+    ///
+    /// Each node's `NodePassphraseSignature` is verified non-fatally against
+    /// the resolved verification keys — the signer address's public keys
+    /// when the node carries a `SignatureEmail`, else the parent key's own
+    /// public portion (JS `decryptNode`'s `keyVerificationKeys` /
+    /// `nodeParentKeys` fallback). An unresolvable/invalid signature is only
+    /// logged; it never aborts key derivation (JS-faithful, non-fatal
+    /// `keyAuthor`).
     async fn resolve_node_key_via_chain(
         &self,
         share_id: &str,
@@ -242,8 +300,15 @@ impl ProtonDriveClient {
     ) -> Result<PrivateKey> {
         const MAX_CHAIN_DEPTH: usize = 64;
 
-        // Collect (node_key, node_passphrase) from the target up to the root.
-        let mut chain: Vec<(String, String)> = Vec::new();
+        struct ChainLink {
+            node_key: String,
+            node_passphrase: String,
+            node_passphrase_signature: String,
+            signature_email: Option<String>,
+        }
+
+        // Collect the chain from the target up to the root.
+        let mut chain: Vec<ChainLink> = Vec::new();
         let mut current_id = link_id.to_owned();
 
         loop {
@@ -257,7 +322,12 @@ impl ProtonDriveClient {
             let resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&path).await?;
             let link = resp.link;
             let parent = link.parent_link_id.clone();
-            chain.push((link.node_key, link.node_passphrase));
+            chain.push(ChainLink {
+                node_key: link.node_key,
+                node_passphrase: link.node_passphrase,
+                node_passphrase_signature: link.node_passphrase_signature,
+                signature_email: link.signature_email,
+            });
 
             match parent {
                 Some(p) => current_id = p,
@@ -268,11 +338,45 @@ impl ProtonDriveClient {
         // Fold from the root down: the deepest ancestor (last pushed) unlocks
         // with the share key, each descendant with its parent's node key.
         let mut current: Option<PrivateKey> = None;
-        for (node_key, node_passphrase) in chain.iter().rev() {
+        for entry in chain.iter().rev() {
             let parent_ref: &PrivateKey = current.as_ref().unwrap_or(share_priv);
-            let next =
-                decrypt_node_private_key(&self.opts.openpgp, node_key, node_passphrase, parent_ref)
-                    .await?;
+
+            let verification_keys: Vec<PublicKey> = match &entry.signature_email {
+                Some(email) => match self.opts.account.address_public_keys(email).await {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        tracing::warn!(
+                            email = %email,
+                            "could not resolve node signature address public keys: {e}"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => match self.opts.openpgp.public_key(parent_ref).await {
+                    Ok(pk) => vec![pk],
+                    Err(_) => Vec::new(),
+                },
+            };
+
+            let (next, verified) = decrypt_node_private_key(
+                &self.opts.openpgp,
+                &entry.node_key,
+                &entry.node_passphrase,
+                &entry.node_passphrase_signature,
+                parent_ref,
+                &verification_keys,
+            )
+            .await?;
+
+            if verified != VerificationStatus::Ok {
+                tracing::warn!(
+                    signature_email = ?entry.signature_email,
+                    status = ?verified,
+                    "node NodePassphraseSignature present but unverifiable \
+                     (non-fatal, JS-faithful) — key still unlocked"
+                );
+            }
+
             current = Some(next);
         }
 
@@ -334,6 +438,7 @@ impl ProtonDriveClient {
             parent: parent.clone(),
             name: name.to_owned(),
             metadata: meta,
+            telemetry: self.opts.telemetry.clone(),
         }))
     }
 
@@ -428,11 +533,39 @@ impl ProtonDriveClient {
             Vec::new()
         };
 
-        // ContentKeyPacket is on the node (file link), not the revision.
+        // ContentKeyPacket (+ its signature) is on the node (file link), not
+        // the revision; `download_to_writer` falls back to the revision's own
+        // field for legacy shapes.
         let content_key_packet = link
             .file_properties
             .as_ref()
             .and_then(|fp| fp.content_key_packet.clone());
+        let content_key_packet_signature = link
+            .file_properties
+            .as_ref()
+            .and_then(|fp| fp.content_key_packet_signature.clone());
+
+        // ContentKeyPacketSignature verification keys: JS `decryptContentKeyPacket`
+        // verifies against `[nodeKey, ...keyVerificationKeys]`, where
+        // `keyVerificationKeys` comes from the node's own `SignatureEmail`
+        // (`link.signature_email`) — which can differ from the revision's own
+        // signer used for `signature_address_pubs` above. The node key itself
+        // is added automatically in `download_to_writer`; only the resolved
+        // address key set is carried here.
+        let content_key_verification_pubs = match &link.signature_email {
+            Some(email) => match self.opts.account.address_public_keys(email).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(
+                        email = %email,
+                        "could not resolve node signature address public keys for \
+                         ContentKeyPacket verification: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
 
         Ok(FileDownloader {
             http: self.opts.http_client.clone(),
@@ -444,6 +577,8 @@ impl ProtonDriveClient {
             node_private_key: node_priv,
             signature_address_pubs,
             content_key_packet,
+            content_key_packet_signature,
+            content_key_verification_pubs,
         })
     }
 
@@ -497,3 +632,430 @@ pub use async_trait::async_trait as _async_trait;
 #[async_trait]
 trait _AssertSendSync: Send + Sync {}
 impl _AssertSendSync for ProtonDriveClient {}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+mod tests {
+    use super::*;
+    use crate::http::JsonResponse;
+    use bytes::Bytes;
+    use proton_drive_crypto::{EncryptOptions, RpgpCrypto, SrpModule};
+
+    /// Account fake for tests that never actually call it: the chain-walk
+    /// tests below leave every link's `SignatureEmail` as `None`, so
+    /// `resolve_node_key_via_chain`'s verification-key resolution always
+    /// takes the `openpgp.public_key(parent_ref)` fallback path, never
+    /// `account.address_public_keys`.
+    struct UnusedAccount;
+
+    #[async_trait]
+    impl crate::account::ProtonDriveAccount for UnusedAccount {
+        fn user_id(&self) -> &str {
+            "unused"
+        }
+        fn primary_email(&self) -> &str {
+            "unused@example.com"
+        }
+        async fn address_private_key(&self, _email: &str) -> Result<PrivateKey> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+        async fn address_public_keys(&self, _email: &str) -> Result<Vec<PublicKey>> {
+            Ok(Vec::new())
+        }
+        async fn address_id(&self, _email: &str) -> Result<String> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+        async fn key_password(&self) -> Result<String> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+    }
+
+    /// Responses keyed by a path substring, matched via `contains` (mirrors
+    /// `download.rs`'s `MockHttpClient`) — sufficient for the chain-walk's
+    /// repeated `GET /drive/shares/{share}/links/{id}` calls, which differ
+    /// only by the trailing link id.
+    struct ChainMockHttpClient {
+        responses: std::collections::HashMap<String, Bytes>,
+    }
+
+    impl ChainMockHttpClient {
+        fn new() -> Self {
+            Self {
+                responses: Default::default(),
+            }
+        }
+        fn add(&mut self, path_substr: impl Into<String>, body: impl Into<Bytes>) {
+            self.responses.insert(path_substr.into(), body.into());
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for ChainMockHttpClient {
+        async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
+            let body = self
+                .responses
+                .iter()
+                .find(|(k, _)| req.path.contains(k.as_str()))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| Bytes::from(r#"{"Code":2501,"Error":"not found"}"#));
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+        }
+
+        async fn request_blob(&self, _req: crate::http::BlobRequest) -> Result<JsonResponse> {
+            Err(Error::Internal("blob requests unused in this test".into()))
+        }
+    }
+
+    fn test_client(
+        http: impl ProtonDriveHttpClient + 'static,
+        crypto: Arc<RpgpCrypto>,
+    ) -> ProtonDriveClient {
+        ProtonDriveClient::new(ProtonDriveClientOptions {
+            http_client: Arc::new(http),
+            entities_cache: Arc::new(proton_drive_cache::MemoryCache::<String>::new()),
+            crypto_cache: Arc::new(proton_drive_cache::MemoryCache::<CachedCryptoMaterial>::new()),
+            account: Arc::new(UnusedAccount),
+            openpgp: Arc::clone(&crypto) as Arc<dyn OpenPgpCrypto>,
+            srp: crypto as Arc<dyn SrpModule>,
+            config: ProtonDriveConfig::default(),
+            telemetry: None,
+            latest_event_id: None,
+        })
+    }
+
+    /// Builds a `GetLinkResponse` JSON body for the chain walk. All fields
+    /// unrelated to key derivation are filled with harmless placeholders.
+    fn link_json(
+        link_id: &str,
+        parent_link_id: Option<&str>,
+        node_key_armored: &str,
+        node_passphrase_b64: &str,
+    ) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": link_id,
+                "ParentLinkID": parent_link_id,
+                "Type": 1,
+                "Name": "irrelevant",
+                "NameSignatureEmail": null,
+                "Hash": null,
+                "MIMEType": null,
+                "State": 1,
+                "Size": 0,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "Trashed": null,
+                "NodeKey": node_key_armored,
+                "NodePassphrase": node_passphrase_b64,
+                "NodePassphraseSignature": "",
+                "SignatureEmail": null,
+                "FileProperties": null,
+                "FolderProperties": null,
+            }
+        })
+        .to_string()
+    }
+
+    /// Encrypt `passphrase` to `parent_pub` the way node passphrases are
+    /// encrypted on the wire: a plain PGP-encrypted message (PKESK + SEIPD),
+    /// base64 on the wire. The detached `NodePassphraseSignature` is a
+    /// separate field checked non-fatally, so no signing key is needed here.
+    async fn encrypt_passphrase_b64(
+        crypto: &RpgpCrypto,
+        passphrase: &[u8],
+        parent_pub: &PublicKey,
+    ) -> String {
+        use base64::Engine as _;
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let message = crypto
+            .encrypt(
+                passphrase,
+                &session_key,
+                std::slice::from_ref(parent_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(message)
+    }
+
+    /// Deterministic 3-deep parent-chain derivation: share root (L1) → mid
+    /// folder (L2) → target leaf (L3), each level's `NodePassphrase`
+    /// encrypted to the *previous* level's public key (L1's directly to the
+    /// share key, matching the "only the share root's passphrase is
+    /// encrypted to the share key directly" rule). Regression test for the
+    /// exact logic behind the historical B2 nested-download bug (see
+    /// `docs/IMPLEMENTATION-STATUS.md`) — no live credentials, no network.
+    #[tokio::test]
+    async fn resolve_node_key_via_chain_unlocks_three_level_nesting() {
+        let crypto = RpgpCrypto::new();
+
+        let (share_priv, share_pub_armored) = crypto
+            .generate_key("share-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let share_pub = PublicKey {
+            armored: share_pub_armored,
+            fingerprint_hex: share_priv.fingerprint_hex.clone(),
+        };
+
+        let (root_priv, root_pub_armored) = crypto
+            .generate_key("root-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let root_pub = PublicKey {
+            armored: root_pub_armored,
+            fingerprint_hex: root_priv.fingerprint_hex.clone(),
+        };
+
+        let (mid_priv, mid_pub_armored) = crypto
+            .generate_key("mid-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let mid_pub = PublicKey {
+            armored: mid_pub_armored,
+            fingerprint_hex: mid_priv.fingerprint_hex.clone(),
+        };
+
+        let (leaf_priv, leaf_pub_armored) = crypto
+            .generate_key("leaf-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let leaf_pub = PublicKey {
+            armored: leaf_pub_armored,
+            fingerprint_hex: leaf_priv.fingerprint_hex.clone(),
+        };
+
+        let root_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"root-pass", &share_pub).await;
+        let mid_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"mid-pass", &root_pub).await;
+        let leaf_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"leaf-pass", &mid_pub).await;
+
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/link-root",
+            link_json("link-root", None, &root_priv.armored, &root_passphrase_b64),
+        );
+        http.add(
+            "links/link-mid",
+            link_json(
+                "link-mid",
+                Some("link-root"),
+                &mid_priv.armored,
+                &mid_passphrase_b64,
+            ),
+        );
+        http.add(
+            "links/link-leaf",
+            link_json(
+                "link-leaf",
+                Some("link-mid"),
+                &leaf_priv.armored,
+                &leaf_passphrase_b64,
+            ),
+        );
+
+        let client = test_client(http, Arc::new(crypto));
+
+        let unlocked = client
+            .resolve_node_key_via_chain("share-1", "link-leaf", &share_priv)
+            .await
+            .unwrap();
+
+        assert_eq!(unlocked.fingerprint_hex, leaf_priv.fingerprint_hex);
+
+        // Prove the returned key is functionally the leaf key, not merely
+        // fingerprint-equal: round-trip a message through it.
+        let rt_crypto = RpgpCrypto::new();
+        let session_key = rt_crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = rt_crypto
+            .encrypt(
+                b"nested file content",
+                &session_key,
+                &[leaf_pub],
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let recovered_session_key = rt_crypto
+            .decrypt_session_key(&ciphertext, std::slice::from_ref(&unlocked))
+            .await
+            .unwrap();
+        let (plaintext, _) = rt_crypto
+            .decrypt_and_verify(&ciphertext, &recovered_session_key, &[])
+            .await
+            .unwrap();
+        assert_eq!(plaintext, b"nested file content");
+    }
+
+    /// A cyclic `ParentLinkID` chain must never hang the walk:
+    /// `MAX_CHAIN_DEPTH` (64) caps the number of hops and surfaces
+    /// `Error::Internal` instead of looping forever.
+    #[tokio::test]
+    async fn resolve_node_key_via_chain_cyclic_parent_hits_depth_guard() {
+        let crypto = RpgpCrypto::new();
+        let (share_priv, _) = crypto
+            .generate_key("share-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        // A link that is its own parent — every fetch returns the identical
+        // body, so the walk can only terminate via the depth guard.
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/link-cycle",
+            link_json(
+                "link-cycle",
+                Some("link-cycle"),
+                "unused-node-key",
+                "unused-passphrase",
+            ),
+        );
+
+        let client = test_client(http, Arc::new(crypto));
+
+        let err = client
+            .resolve_node_key_via_chain("share-1", "link-cycle", &share_priv)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::Internal(ref msg) if msg.contains("exceeded depth")),
+            "expected depth-guard Internal error, got {err:?}"
+        );
+    }
+
+    /// A minimal `Link` JSON object valid for `GetChildrenResponse` parsing.
+    /// Crypto fields are placeholders — this test only exercises pagination
+    /// continuation, not name decryption or key derivation.
+    fn child_link_json(link_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "LinkID": link_id,
+            "ParentLinkID": "parent-1",
+            "Type": 2,
+            "Name": "irrelevant",
+            "NameSignatureEmail": null,
+            "Hash": null,
+            "MIMEType": "text/plain",
+            "State": 1,
+            "Size": 0,
+            "CreateTime": 0,
+            "ModifyTime": 0,
+            "Trashed": null,
+            "NodeKey": "",
+            "NodePassphrase": "",
+            "NodePassphraseSignature": "",
+            "SignatureEmail": null,
+        })
+    }
+
+    /// Mocks the real (undocumented-`More`) legacy children endpoint: each
+    /// `Page` query value maps to its own canned response body, exactly
+    /// `{ Code, AllowSorting, Links }` — no `More` field at all, matching
+    /// `get_drive-shares-{shareID}-folders-{linkID}-children` in
+    /// `reference/client/js/src/internal/apiService/driveTypes.ts`. Any other
+    /// request (e.g. the key-resolution calls `fetch_folder_children` makes
+    /// first) gets a benign "not found" so key resolution fails softly and
+    /// `parent_key` falls back to `None`.
+    struct PagedChildrenMockHttpClient {
+        pages: std::collections::HashMap<String, Bytes>,
+    }
+
+    impl PagedChildrenMockHttpClient {
+        fn new() -> Self {
+            Self {
+                pages: Default::default(),
+            }
+        }
+
+        fn add_page(&mut self, page: u32, link_ids: &[&str]) {
+            let links: Vec<_> = link_ids.iter().map(|id| child_link_json(id)).collect();
+            let body = serde_json::json!({
+                "Code": 1000,
+                "AllowSorting": true,
+                "Links": links,
+            })
+            .to_string();
+            self.pages.insert(page.to_string(), Bytes::from(body));
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for PagedChildrenMockHttpClient {
+        async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
+            if !req.path.contains("/children") {
+                return Ok(JsonResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::from(r#"{"Code":2501,"Error":"not found"}"#),
+                });
+            }
+            let page = req
+                .query
+                .iter()
+                .find(|(k, _)| k == "Page")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("0");
+            let body =
+                self.pages.get(page).cloned().unwrap_or_else(|| {
+                    Bytes::from(r#"{"Code":1000,"AllowSorting":true,"Links":[]}"#)
+                });
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+        }
+
+        async fn request_blob(&self, _req: crate::http::BlobRequest) -> Result<JsonResponse> {
+            Err(Error::Internal("blob requests unused in this test".into()))
+        }
+    }
+
+    /// Regression test for the B-series pagination-truncation bug found in
+    /// the c4 DTO diff sweep: the legacy children endpoint's real response
+    /// shape has no `More` field (see `GetChildrenResponse::more`'s doc
+    /// comment), so a termination check of `more == 0` alone would stop
+    /// after the very first page. With two full pages (`page_size` items
+    /// each) followed by a shorter final page, `fetch_folder_children` must
+    /// still walk all three pages and return every child.
+    #[tokio::test]
+    async fn fetch_folder_children_paginates_past_first_full_page_without_more_field() {
+        let mut http = PagedChildrenMockHttpClient::new();
+        http.add_page(0, &["child-1", "child-2"]);
+        http.add_page(1, &["child-3", "child-4"]);
+        http.add_page(2, &["child-5"]);
+
+        let crypto = Arc::new(RpgpCrypto::new());
+        let client = test_client(http, crypto);
+
+        let parent = NodeUid {
+            volume_id: "share-1".to_owned(),
+            node_id: "parent-1".to_owned(),
+        };
+        let results = client
+            .fetch_folder_children(&parent, 2)
+            .await
+            .expect("fetch_folder_children should succeed across all pages");
+
+        let ids: Vec<String> = results.iter().map(|n| n.uid().node_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["child-1", "child-2", "child-3", "child-4", "child-5"],
+            "all three pages must be walked even though the wire never sends a More field: {ids:?}"
+        );
+    }
+}

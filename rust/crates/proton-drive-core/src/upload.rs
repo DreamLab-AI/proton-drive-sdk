@@ -1,8 +1,12 @@
 //! Block-upload protocol — ADR-0008 §"The protocol".
 //!
 //! Implements `FileUploader::upload_from_stream` for files < 16 MiB.
-//! Happy path only; thumbnail upload, resumable upload, parallel blocks, and
-//! telemetry are explicitly out of scope (ADR-0008 §"What is NOT ported").
+//! Happy path only; thumbnail upload, resumable upload, and parallel blocks
+//! remain out of scope (ADR-0008 §"What is NOT ported"). The block-encryption
+//! verify/retry loop and its telemetry metric (js/v0.16.0, see
+//! `encrypt_block_with_verify_retry` below) *are* now ported, narrowing that
+//! exclusion list — general telemetry beyond that one metric is still out of
+//! scope.
 //!
 //! ## Mapping divergence: JS vs ADR-0008
 //!
@@ -40,9 +44,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
 use proton_drive_api::upload::{
     BlockUploadEntry, BlockVerifier as ApiBlockVerifier, CommitRevisionRequest, CreateFileRequest,
-    RequestBlockUploadRequest,
+    DeleteNodesRequest, DeleteNodesResponse, RequestBlockUploadRequest,
 };
-use proton_drive_crypto::{ArmorKind, EncryptOptions, OpenPgpCrypto, PublicKey, armor};
+use proton_drive_crypto::{
+    ArmorKind, EncryptOptions, OpenPgpCrypto, PrivateKey, PublicKey, SessionKey, armor,
+};
+use proton_drive_telemetry::{MetricEvent, Telemetry};
 
 use crate::account::ProtonDriveAccount;
 use crate::error::{Error, Result};
@@ -54,6 +61,13 @@ pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// 16 MiB MVP limit (domain-model-mvp.md invariant table).
 pub const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Extra attempts allowed for a single block's encrypt-then-self-verify
+/// round trip before giving up on the whole upload. Matches the JS
+/// reference's `MAX_BLOCK_ENCRYPTION_RETRIES`
+/// (`client/js/src/internal/upload/streamUploader.ts:76`) — i.e. up to 2
+/// total attempts per block (1 initial + 1 retry).
+const MAX_BLOCK_ENCRYPTION_RETRIES: u32 = 1;
+
 /// Minimal envelope used to inspect a response's `Code`/`Error` without
 /// requiring the typed body — Proton error responses omit the typed payload.
 #[derive(serde::Deserialize)]
@@ -62,6 +76,22 @@ struct EnvelopeProbe {
     code: u32,
     #[serde(rename = "Error", default)]
     error: Option<String>,
+}
+
+/// Name hash: `HMAC-SHA256(parent_hash_key, name_bytes)` → hex. Mirrors JS
+/// `generateLookupHash` (`reference/client/js/src/crypto/driveCrypto.ts:439-443`:
+/// `computeHmacSignature(importHmacKey(parentHashKey), utf8(newName)).toHex()`).
+/// The key is the parent folder's decrypted `NodeHashKey` bytes; the message
+/// is the UTF-8 file name. Pulled out to a standalone, pure function so a
+/// known-answer test (`name_hash_hex_matches_known_answer`) can pin the exact
+/// byte-for-byte computation without driving the full upload protocol — B1
+/// (see `docs/IMPLEMENTATION-STATUS.md`) was this same computation done as
+/// plain SHA-256 instead of HMAC-SHA256, and previously blocked every upload.
+fn compute_name_hash_hex(parent_hash_key: &[u8], name: &str) -> Result<String> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(parent_hash_key)
+        .map_err(|e| Error::Internal(format!("HMAC key init: {e}")))?;
+    mac.update(name.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Truncated, lossy view of a response body for error diagnostics.
@@ -172,6 +202,10 @@ pub struct ProtonFileUploader {
     pub(crate) name: String,
     /// UploadMetadata for this upload.
     pub(crate) metadata: UploadMetadata,
+    /// Optional telemetry sink. `None` (or `NullTelemetry`) drops every
+    /// event — the only metric currently emitted from this module is
+    /// [`MetricEvent::BlockVerificationError`] (js/v0.16.0 "report metric").
+    pub(crate) telemetry: Option<Arc<dyn Telemetry>>,
 }
 
 #[async_trait::async_trait]
@@ -314,12 +348,7 @@ impl ProtonFileUploader {
         // parent folder's decrypted NodeHashKey bytes; the message is the
         // UTF-8 file name. The server validates this against the parent's
         // hash-key namespace, so a wrong key yields HTTP 422.
-        let name_hash_hex = {
-            let mut mac = <Hmac<Sha256>>::new_from_slice(&parent_hash_key)
-                .map_err(|e| Error::Internal(format!("HMAC key init: {e}")))?;
-            mac.update(self.name.as_bytes());
-            hex::encode(mac.finalize().into_bytes())
-        };
+        let name_hash_hex = compute_name_hash_hex(&parent_hash_key, &self.name)?;
 
         // ── step 2: POST create file node ─────────────────────────────────────
         let create_req = CreateFileRequest {
@@ -342,13 +371,67 @@ impl ProtonFileUploader {
 
         let (link_id, revision_id) = self.post_create_file(&volume_id, create_req).await?;
 
+        // ── steps 3-9: verification code, block encrypt+upload, manifest,
+        // XAttr, commit ────────────────────────────────────────────────────────
+        // A failure anywhere in here leaves an orphaned draft node on the
+        // server. JS treats deletion as unconditional cleanup on any failure
+        // downstream of node creation (`fileUploader.ts` `createRevisionDraft`'s
+        // catch block calls `manager.deleteDraftNode`; `streamUploader.ts`
+        // `start()`'s `finally { await this.onFinish(failure) }` does the same
+        // for every exception raised by `encryptAndUploadBlocks`/`commitFile`),
+        // and treats the delete call itself as best-effort — `deleteDraftNode`
+        // (manager.ts) only logs a delete failure, it never lets it mask the
+        // original error. We mirror both here: wrap the whole post-creation
+        // body, and swallow (log) any cleanup failure in
+        // `delete_draft_best_effort`.
+        let body_result = self
+            .upload_after_create(
+                &mut stream,
+                progress_tx,
+                cancel,
+                &volume_id,
+                &link_id,
+                &revision_id,
+                &address_email,
+                &address_priv,
+                &node_pub,
+                &content_session_key,
+            )
+            .await;
+
+        if body_result.is_err() {
+            self.delete_draft_best_effort(&volume_id, &link_id).await;
+        }
+
+        body_result
+    }
+
+    /// Steps 3-9 of the block-upload protocol, run once the draft node and
+    /// revision already exist on the server (`link_id`/`revision_id`). Split
+    /// out from `run_upload` so any failure here can trigger best-effort
+    /// draft cleanup at the call site without duplicating that logic on every
+    /// early return.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_after_create(
+        &self,
+        stream: &mut Box<dyn AsyncRead + Send + Unpin>,
+        progress_tx: &tokio::sync::watch::Sender<u64>,
+        cancel: &tokio_util::sync::CancellationToken,
+        volume_id: &str,
+        link_id: &str,
+        revision_id: &str,
+        address_email: &str,
+        address_priv: &PrivateKey,
+        node_pub: &PublicKey,
+        content_session_key: &SessionKey,
+    ) -> Result<()> {
         // ── step 3: get verification data from server ─────────────────────────
         // The JS SDK fetches a verification code from:
         //   GET drive/v2/volumes/{volumeID}/links/{linkID}/revisions/{revisionID}/verification
         // which returns { VerificationCode: base64, ContentKeyPacket: base64 }.
         // This is used to compute the verifier token per block.
         let verification_code = self
-            .get_verification_code(&volume_id, &link_id, &revision_id)
+            .get_verification_code(volume_id, link_id, revision_id)
             .await?;
 
         // ── step 4: read stream, chunk into 4 MiB blocks, encrypt each ────────
@@ -395,17 +478,30 @@ impl ProtonFileUploader {
             total_bytes += read_bytes as u64;
             block_sizes.push(read_bytes as u64);
 
-            // Encrypt block with content session key (no PKESK for blocks —
-            // bare SEIPD per ADR-0008).
+            // Encrypt-only the block content with the content session key (no
+            // PKESK — bare SEIPD per ADR-0008 — and no embedded signature).
+            // Mirrors JS `encryptBlock` (driveCrypto.ts), which calls
+            // `encryptAndSignDetached(blockData, sessionKey, [], signingKey,
+            // ...)`: passing `detached: true` to `cryptoProxy.encryptMessage`
+            // means the returned ciphertext carries only the literal content —
+            // the signature is produced and transmitted separately (below).
+            // An earlier version of this port used `encrypt_and_sign` here,
+            // which embeds a redundant One-Pass-Signature + Signature packet
+            // inside the SEIPD payload alongside the literal data. That
+            // embedded signature was never verified on read — `download.rs`
+            // decrypts blocks via `decrypt_and_verify(&ciphertext, session_key,
+            // &[])` with an empty verification-key list, and JS's own
+            // `decryptBlock` does the same ("We do not verify signatures on
+            // blocks") — so removing it changes nothing observable for either
+            // this port or JS-produced files (which never had a block-level
+            // embedded signature to begin with); it only drops dead bytes and
+            // a redundant signing operation per block.
+            //
+            // The encrypt step itself is retried on a self-verification
+            // failure (js/v0.16.0 "Retry block encryption and report
+            // metric") — see `encrypt_block_with_verify_retry`.
             let ciphertext = self
-                .openpgp
-                .encrypt_and_sign(
-                    plaintext_block,
-                    &content_session_key,
-                    &[], // no PKESK — bare SEIPD
-                    &address_priv,
-                    EncryptOptions::default(),
-                )
+                .encrypt_block_with_verify_retry(plaintext_block, content_session_key, block_index)
                 .await?;
 
             // SHA256 of ciphertext.
@@ -418,10 +514,7 @@ impl ProtonFileUploader {
 
             // Detached signature of the plaintext block, signed by the address
             // key, no signature context (JS `encryptBlock`).
-            let block_sig_bytes = self
-                .openpgp
-                .sign(plaintext_block, &address_priv, "")
-                .await?;
+            let block_sig_bytes = self.openpgp.sign(plaintext_block, address_priv, "").await?;
 
             // Encrypt-only the detached signature to the **node** key under the
             // **content session key** (JS `encryptSignature`: `encryptArmored(sig,
@@ -431,8 +524,8 @@ impl ProtonFileUploader {
                 .openpgp
                 .encrypt(
                     &block_sig_bytes,
-                    &content_session_key,
-                    std::slice::from_ref(&node_pub),
+                    content_session_key,
+                    std::slice::from_ref(node_pub),
                     EncryptOptions::default(),
                 )
                 .await?;
@@ -493,12 +586,12 @@ impl ProtonFileUploader {
 
         // Block-upload keys on the Proton AddressID, not the email (the email is
         // only valid for `SignatureAddress` on the create-file request).
-        let address_id = self.account.address_id(&address_email).await?;
+        let address_id = self.account.address_id(address_email).await?;
         let block_req = RequestBlockUploadRequest {
             address_id,
-            volume_id: volume_id.clone(),
-            link_id: link_id.clone(),
-            revision_id: revision_id.clone(),
+            volume_id: volume_id.to_owned(),
+            link_id: link_id.to_owned(),
+            revision_id: revision_id.to_owned(),
             block_list: block_entries,
             thumbnail_list: Vec::new(),
         };
@@ -537,17 +630,37 @@ impl ProtonFileUploader {
             .collect();
 
         // No signature context: JS signManifest → signArmored signs with no
-        // context (js/sdk/src/crypto/driveCrypto.ts), and verifyManifest →
+        // context (client/js/src/crypto/driveCrypto.ts), and verifyManifest →
         // verifyArmored reads it back with no context. A non-empty context here
         // would embed a critical notation that OpenPGP.js verification rejects.
         let manifest_sig = self
             .openpgp
-            .sign(&manifest_payload, &address_priv, "")
+            .sign(&manifest_payload, address_priv, "")
             .await?;
         let manifest_sig_armored = armor(&manifest_sig, ArmorKind::Signature);
 
-        // ── step 8: compute XAttr ─────────────────────────────────────────────
+        // ── step 8: compute XAttr, verify integrity ───────────────────────────
         let sha1_hex = hex::encode(sha1_hasher.finalize());
+
+        // Compare the streamed digest against the caller-supplied expectation,
+        // mirroring JS `verifyIntegrity` (streamUploader.ts): a mismatch is
+        // fatal — JS throws `IntegrityError` from `commitFile` *before*
+        // `commitDraft`/`ChecksumVerified` is ever sent — and `checksumVerified`
+        // is only `true` when the comparison actually matched, never simply
+        // "a checksum was supplied":
+        // `checksumVerified: !!(expectedSha1 && digests.sha1 === expectedSha1)`.
+        // `Error::Integrity` (not `IntegrityCheckFailed`) matches the variant
+        // `download.rs` already uses for a computed-vs-expected digest
+        // mismatch (ciphertext SHA-256), keeping the two symmetric.
+        let checksum_verified = match &self.metadata.expected_sha1_hex {
+            Some(expected) if expected == &sha1_hex => true,
+            Some(expected) => {
+                return Err(Error::Integrity(format!(
+                    "file hash does not match expected hash: expected {expected}, got {sha1_hex}"
+                )));
+            }
+            None => false,
+        };
 
         let xattr_json = build_xattr_json(
             total_bytes,
@@ -565,8 +678,8 @@ impl ProtonFileUploader {
             .encrypt_and_sign(
                 xattr_json.as_bytes(),
                 &xattr_session_key,
-                std::slice::from_ref(&node_pub),
-                &address_priv,
+                std::slice::from_ref(node_pub),
+                address_priv,
                 EncryptOptions::default(),
             )
             .await?;
@@ -575,17 +688,175 @@ impl ProtonFileUploader {
         // ── step 9: commit revision ───────────────────────────────────────────
         let commit_req = CommitRevisionRequest {
             manifest_signature: manifest_sig_armored,
-            signature_address: address_email.clone(),
+            signature_address: address_email.to_owned(),
             x_attr: xattr_armored,
-            checksum_verified: false,
+            checksum_verified,
             photo: None,
         };
 
-        self.put_commit_revision(&volume_id, &link_id, &revision_id, commit_req)
+        self.put_commit_revision(volume_id, link_id, revision_id, commit_req)
             .await?;
 
         let _ = progress_tx.send(total_bytes);
         Ok(())
+    }
+
+    /// Best-effort draft-node cleanup after a post-creation failure.
+    ///
+    /// Mirrors JS `UploadManager.deleteDraftNode` (manager.ts): the delete
+    /// call's own failure is only logged, never propagated, so it can never
+    /// mask the original upload error that triggered this cleanup. Wire
+    /// format: `POST drive/v2/volumes/{volumeID}/delete_multiple` with
+    /// `{"LinkIDs": [nodeId]}` (JS `apiService.ts` `deleteDraft`), whose
+    /// response is a per-link multi-status wrapper — the outer envelope
+    /// `Code` is a fixed marker (`1001`); the real per-link result lives at
+    /// `Responses[0].Response.Code`, which is what JS actually inspects.
+    async fn delete_draft_best_effort(&self, volume_id: &str, link_id: &str) {
+        let req_body = DeleteNodesRequest {
+            link_ids: vec![link_id.to_owned()],
+        };
+        let body_bytes = match serde_json::to_vec(&req_body) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(
+                    link_id = %link_id,
+                    "delete_draft: failed to serialize request: {e}"
+                );
+                return;
+            }
+        };
+        let req = JsonRequest {
+            method: HttpMethod::Post,
+            path: format!("/drive/v2/volumes/{volume_id}/delete_multiple"),
+            query: vec![],
+            headers: vec![],
+            body: Some(body_bytes),
+        };
+        let resp = match self.http.request_json(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    link_id = %link_id,
+                    "failed to delete draft node after upload failure: {e}"
+                );
+                return;
+            }
+        };
+        match serde_json::from_slice::<ResponseEnvelope<DeleteNodesResponse>>(&resp.body) {
+            Ok(env) => {
+                let per_link_code = env
+                    .inner
+                    .responses
+                    .first()
+                    .map(|r| r.response.code)
+                    .unwrap_or(0);
+                if per_link_code != CODE_OK {
+                    tracing::error!(
+                        link_id = %link_id,
+                        code = per_link_code,
+                        "failed to delete draft node after upload failure"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    link_id = %link_id,
+                    "delete_draft: failed to parse response: {e}; body={}",
+                    body_snippet(&resp.body)
+                );
+            }
+        }
+    }
+
+    /// Encrypt a plaintext block, then self-verify it by attempting to
+    /// decrypt it back with the same content session key -- this is JS's
+    /// `verifyBlock` self-check for bitflips / bad hardware ("Attempt to
+    /// decrypt data block, to try to detect bitflips / bad hardware ... we
+    /// use the key provided by the verification endpoint, to ensure the
+    /// correct key was used to encrypt the data",
+    /// `client/js/src/internal/upload/cryptoService.ts:214-234`).
+    ///
+    /// On a self-verify failure, retry the *entire* encrypt step up to
+    /// [`MAX_BLOCK_ENCRYPTION_RETRIES`] additional times (js/v0.16.0 "Retry
+    /// block encryption and report metric";
+    /// `client/js/src/internal/upload/streamUploader.ts:315-354`), then
+    /// report whether the retry helped via a
+    /// `MetricEvent::BlockVerificationError` (only if at least one attempt
+    /// failed — a clean first attempt emits nothing, matching JS's
+    /// `integrityError` flag gate,
+    /// `client/js/src/internal/upload/streamUploader.ts:328-351`).
+    async fn encrypt_block_with_verify_retry(
+        &self,
+        plaintext_block: &[u8],
+        content_session_key: &SessionKey,
+        block_index: u32,
+    ) -> Result<Vec<u8>> {
+        let mut attempt: u32 = 0;
+        let mut integrity_error_seen = false;
+        loop {
+            let ciphertext = self
+                .openpgp
+                .encrypt(
+                    plaintext_block,
+                    content_session_key,
+                    &[], // no PKESK — bare SEIPD
+                    EncryptOptions::default(),
+                )
+                .await?;
+
+            match self
+                .openpgp
+                .decrypt_and_verify(&ciphertext, content_session_key, &[])
+                .await
+            {
+                Ok(_) => {
+                    if integrity_error_seen {
+                        self.emit_block_verification_metric(true).await;
+                    }
+                    return Ok(ciphertext);
+                }
+                Err(e) => {
+                    integrity_error_seen = true;
+                    if attempt < MAX_BLOCK_ENCRYPTION_RETRIES {
+                        tracing::warn!(
+                            block_index,
+                            attempt,
+                            error = %e,
+                            "block encryption failed self-verification; retrying"
+                        );
+                        attempt += 1;
+                        continue;
+                    }
+                    tracing::error!(
+                        block_index,
+                        attempts = attempt + 1,
+                        error = %e,
+                        "block encryption failed self-verification; giving up"
+                    );
+                    self.emit_block_verification_metric(false).await;
+                    return Err(Error::Integrity(format!(
+                        "block {block_index}: encryption self-verification failed after {} attempts: {e}",
+                        attempt + 1
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Emit the `BlockVerificationError` metric if a telemetry sink is
+    /// configured. Mirrors JS `UploadTelemetry.logBlockVerificationError`
+    /// (`client/js/src/internal/upload/telemetry.ts:29-41`) -- we drop the
+    /// per-volume-type breakdown JS attaches (`getVolumeMetricContext`),
+    /// which is out of scope for this personal-use, single-volume port.
+    async fn emit_block_verification_metric(&self, retry_helped: bool) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry
+                .emit(MetricEvent::BlockVerificationError {
+                    detail: "block encryption self-verification failed at least once".to_owned(),
+                    retry_helped,
+                })
+                .await;
+        }
     }
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
@@ -653,11 +924,18 @@ impl ProtonFileUploader {
         let address_email = self.account.primary_email().to_owned();
         let address_priv = self.account.address_private_key(&address_email).await?;
 
-        let share_priv = crate::download::decrypt_share_key(
+        // Upload's parent-context resolution doesn't (yet) verify
+        // PassphraseSignature/NodePassphraseSignature — pass no verification
+        // keys, preserving prior (pre-verification) behaviour exactly. See
+        // `ProtonDriveClient::resolve_share_key`/`resolve_node_key_via_chain`
+        // in `client.rs` for the download path's non-fatal verification.
+        let (share_priv, _verified) = crate::download::decrypt_share_key(
             &self.openpgp,
             &share.key,
             &share.passphrase,
+            &share.passphrase_signature,
             &address_priv,
+            &[],
         )
         .await?;
 
@@ -683,11 +961,13 @@ impl ProtonFileUploader {
             env.inner.link
         };
 
-        let parent_node_priv = crate::download::decrypt_node_private_key(
+        let (parent_node_priv, _verified) = crate::download::decrypt_node_private_key(
             &self.openpgp,
             &link.node_key,
             &link.node_passphrase,
+            &link.node_passphrase_signature,
             &share_priv,
+            &[],
         )
         .await?;
 
@@ -1053,6 +1333,32 @@ mod tests {
         assert!(json.contains("\"BlockSizes\":[5678]"));
     }
 
+    /// Known-answer test locking `compute_name_hash_hex`'s exact byte output
+    /// against an independent HMAC-SHA256 computation. Provenance: Node's
+    /// built-in `crypto` module (standard HMAC-SHA256 — the same primitive
+    /// JS's `@protontech/crypto/subtle/hmac.ts` `importKey`/`signData` wraps
+    /// for `generateLookupHash`, `reference/client/js/src/crypto/driveCrypto.ts:439-443`;
+    /// `@protontech/crypto` itself isn't vendored under `reference/`, so this
+    /// cross-checks the algorithm rather than shelling out to their exact lib):
+    /// ```text
+    /// node -e 'console.log(require("crypto")
+    ///   .createHmac("sha256", Buffer.from("my-hash-key", "utf8"))
+    ///   .update("test-file.txt", "utf8").digest("hex"))'
+    /// ```
+    /// computed 2026-07-05, matching the `key`/`name` pair
+    /// `mock_upload_protocol_flow` below drives through the real upload path.
+    /// Regression class: B1 (name hash computed as plain SHA-256 instead of
+    /// HMAC-SHA256) previously blocked every upload with HTTP 422 — see
+    /// `docs/IMPLEMENTATION-STATUS.md`.
+    const NAME_HASH_KAT_HEX: &str =
+        "57926179833b9813451381f9e7af89dec9f49ddc5b8bc0cabae1079805ee77ca";
+
+    #[test]
+    fn name_hash_hex_matches_known_answer() {
+        let got = compute_name_hash_hex(b"my-hash-key", "test-file.txt").unwrap();
+        assert_eq!(got, NAME_HASH_KAT_HEX);
+    }
+
     // ── Mock-HTTP protocol flow test ──────────────────────────────────────────
     // This test exercises the 9-step protocol using in-process fakes for the
     // HTTP client, crypto module, and account — without hitting the real API.
@@ -1071,6 +1377,10 @@ mod tests {
     struct FakeHttpClient {
         responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
         recorded_paths: Mutex<Vec<String>>,
+        /// `request_json` bodies only, aligned by index with the subset of
+        /// `recorded_paths` entries that came from `request_json` calls (blob
+        /// requests are not recorded here since no test currently needs them).
+        recorded_json_bodies: Mutex<Vec<(String, Option<Vec<u8>>)>>,
     }
 
     impl FakeHttpClient {
@@ -1078,6 +1388,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 recorded_paths: Mutex::new(vec![]),
+                recorded_json_bodies: Mutex::new(vec![]),
             }
         }
 
@@ -1092,12 +1403,29 @@ mod tests {
         fn recorded_paths(&self) -> Vec<String> {
             self.recorded_paths.lock().unwrap().clone()
         }
+
+        /// Find the recorded `request_json` body for the first path containing
+        /// `needle` that actually has a body (skips GETs, which pass `None`),
+        /// parsed as JSON.
+        fn json_body_containing(&self, needle: &str) -> Option<serde_json::Value> {
+            self.recorded_json_bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, body)| path.contains(needle) && body.is_some())
+                .and_then(|(_, body)| body.as_ref())
+                .map(|b| serde_json::from_slice(b).unwrap())
+        }
     }
 
     #[async_trait]
     impl ProtonDriveHttpClient for FakeHttpClient {
         async fn request_json(&self, req: JsonRequest) -> Result<crate::http::JsonResponse> {
             self.recorded_paths.lock().unwrap().push(req.path.clone());
+            self.recorded_json_bodies
+                .lock()
+                .unwrap()
+                .push((req.path.clone(), req.body.clone()));
             let (status, body) = self.next_response();
             Ok(crate::http::JsonResponse {
                 status,
@@ -1123,8 +1451,8 @@ mod tests {
 
     #[async_trait]
     impl proton_drive_crypto::OpenPgpCrypto for FakeCrypto {
-        fn generate_passphrase(&self) -> String {
-            "fake-passphrase".into()
+        fn generate_passphrase(&self) -> zeroize::Zeroizing<String> {
+            zeroize::Zeroizing::new("fake-passphrase".into())
         }
 
         async fn decrypt_key(
@@ -1268,6 +1596,200 @@ mod tests {
                 armored: "FAKE_PUB_KEY".into(),
                 fingerprint_hex: "12345678".into(),
             })
+        }
+    }
+
+    // ── Flaky crypto: fails the block self-verification decrypt a
+    // configurable number of times, otherwise delegates to `FakeCrypto` ──────
+
+    /// Crypto double for `encrypt_block_with_verify_retry` tests: its
+    /// `decrypt_and_verify` fails the first `remaining_failures` calls whose
+    /// ciphertext corresponds to encrypting `target_plaintext` (i.e. the
+    /// block-content self-verification check specifically), then succeeds.
+    /// Every *other* `decrypt_and_verify` call (share passphrase, node
+    /// passphrase, hash key, ...) always delegates straight to
+    /// `FakeCrypto`'s fixed behaviour, unaffected by the counter — run_upload
+    /// performs several such decrypts before ever reaching block encryption,
+    /// and none of those should be perturbed by this double.
+    struct FlakyVerifyCrypto {
+        remaining_failures: std::sync::atomic::AtomicUsize,
+        target_plaintext: Vec<u8>,
+    }
+
+    impl FlakyVerifyCrypto {
+        fn new(failures: usize, target_plaintext: &[u8]) -> Self {
+            Self {
+                remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
+                target_plaintext: target_plaintext.to_vec(),
+            }
+        }
+
+        /// True iff `data` is exactly `FakeCrypto::encrypt(target_plaintext, ..)`'s
+        /// output (the `FAKE_ENC:` marker prefix followed by the tracked
+        /// plaintext).
+        fn is_target_ciphertext(&self, data: &[u8]) -> bool {
+            data.strip_prefix(b"FAKE_ENC:") == Some(self.target_plaintext.as_slice())
+        }
+    }
+
+    #[async_trait]
+    impl proton_drive_crypto::OpenPgpCrypto for FlakyVerifyCrypto {
+        fn generate_passphrase(&self) -> zeroize::Zeroizing<String> {
+            FakeCrypto.generate_passphrase()
+        }
+
+        async fn decrypt_key(
+            &self,
+            armored: &str,
+            passphrase: &str,
+        ) -> std::result::Result<CPrivKey, CryptoError> {
+            FakeCrypto.decrypt_key(armored, passphrase).await
+        }
+
+        async fn encrypt(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+            opts: EncryptOptions,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt(data, session_key, encryption_keys, opts)
+                .await
+        }
+
+        async fn encrypt_and_sign(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+            signing_key: &CPrivKey,
+            opts: EncryptOptions,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_and_sign(data, session_key, encryption_keys, signing_key, opts)
+                .await
+        }
+
+        async fn decrypt_and_verify(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            verification_keys: &[CPubKey],
+        ) -> std::result::Result<(Vec<u8>, VerificationStatus), CryptoError> {
+            if self.is_target_ciphertext(data) {
+                let remaining = self
+                    .remaining_failures
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if remaining > 0 {
+                    self.remaining_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(CryptoError::Decrypt(
+                        "simulated bitflip for block self-verification test".into(),
+                    ));
+                }
+            }
+            FakeCrypto
+                .decrypt_and_verify(data, session_key, verification_keys)
+                .await
+        }
+
+        async fn decrypt_session_key(
+            &self,
+            data: &[u8],
+            decryption_keys: &[CPrivKey],
+        ) -> std::result::Result<SessionKey, CryptoError> {
+            FakeCrypto.decrypt_session_key(data, decryption_keys).await
+        }
+
+        async fn encrypt_session_key(
+            &self,
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_session_key(session_key, encryption_keys)
+                .await
+        }
+
+        async fn encrypt_session_key_with_password(
+            &self,
+            session_key: &SessionKey,
+            password: &str,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_session_key_with_password(session_key, password)
+                .await
+        }
+
+        async fn generate_session_key(
+            &self,
+            encryption_keys: &[CPubKey],
+            opts: EncryptOptions,
+        ) -> std::result::Result<SessionKey, CryptoError> {
+            FakeCrypto.generate_session_key(encryption_keys, opts).await
+        }
+
+        async fn generate_key(
+            &self,
+            passphrase: &str,
+            opts: EncryptOptions,
+        ) -> std::result::Result<(CPrivKey, String), CryptoError> {
+            FakeCrypto.generate_key(passphrase, opts).await
+        }
+
+        async fn sign(
+            &self,
+            data: &[u8],
+            signing_key: &CPrivKey,
+            context: &str,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto.sign(data, signing_key, context).await
+        }
+
+        async fn verify(
+            &self,
+            data: &[u8],
+            signature: &[u8],
+            verification_keys: &[CPubKey],
+        ) -> std::result::Result<VerificationStatus, CryptoError> {
+            FakeCrypto.verify(data, signature, verification_keys).await
+        }
+
+        async fn public_key(&self, key: &CPrivKey) -> std::result::Result<CPubKey, CryptoError> {
+            FakeCrypto.public_key(key).await
+        }
+
+        async fn public_key_from_armored(
+            &self,
+            armored: &str,
+        ) -> std::result::Result<CPubKey, CryptoError> {
+            FakeCrypto.public_key_from_armored(armored).await
+        }
+    }
+
+    // ── Recording telemetry: captures every emitted metric for assertions ────
+
+    struct RecordingTelemetry {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl RecordingTelemetry {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<MetricEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Telemetry for RecordingTelemetry {
+        async fn emit(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
         }
     }
 
@@ -1431,6 +1953,7 @@ mod tests {
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
             },
+            telemetry: None,
         };
 
         let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
@@ -1471,6 +1994,358 @@ mod tests {
         );
         // paths[6] is the blob upload path (bare_url)
         assert!(paths[7].contains("/revisions/"), "8 commit: {}", paths[7]);
+
+        // Regression pin for B1 (name hash computed as plain SHA-256 instead
+        // of HMAC-SHA256 — see docs/IMPLEMENTATION-STATUS.md): the recorded
+        // create-file POST body's Hash field must be the known-answer
+        // HMAC-SHA256 value for key=b"my-hash-key" (FakeCrypto strips the
+        // "FAKE_ENC:" prefix from the FolderProperties.NodeHashKey fixture
+        // above, leaving "my-hash-key") and name="test-file.txt" —
+        // see `name_hash_hex_matches_known_answer` for how NAME_HASH_KAT_HEX
+        // was independently derived.
+        let create_body = http
+            .json_body_containing("/files")
+            .expect("create-file POST body must be recorded");
+        assert_eq!(
+            create_body["Hash"].as_str(),
+            Some(NAME_HASH_KAT_HEX),
+            "CreateFile request's Hash must be the HMAC-SHA256 name hash, not a \
+             regression (e.g. plain SHA-256 — the historical B1 bug)"
+        );
+    }
+
+    // ── Draft-cleanup / checksum-verification tests ───────────────────────────
+    // Shared fixtures for the steps every uploader test needs regardless of
+    // where (or whether) the upload is made to fail.
+
+    /// `(share_bytes, link_bytes, create_file_bytes, verification_bytes)` —
+    /// steps 0-3's responses, in call order.
+    fn common_upload_responses() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let share_resp = serde_json::json!({
+            "Code": 1000,
+            "ShareID": "share-abc",
+            "VolumeID": "vol-xyz",
+            "LinkID": "root-link",
+            "Type": 1,
+            "Key": "FAKE_SHARE_KEY",
+            "Passphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-share-passphrase"),
+            "PassphraseSignature": "SIG:fake",
+            "AddressID": "addr-001",
+            "AddressKeyID": "key-001"
+        });
+        let share_bytes = serde_json::to_vec(&share_resp).unwrap();
+
+        let link_resp = serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": "root-link",
+                "ParentLinkID": null,
+                "Type": 1,
+                "Name": "root",
+                "Hash": null,
+                "MIMEType": "Folder",
+                "State": 1,
+                "Size": 0,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "NodeKey": "FAKE_NODE_KEY",
+                "NodePassphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-node-passphrase"),
+                "NodePassphraseSignature": "SIG:fake",
+                "FolderProperties": { "NodeHashKey": "FAKE_ENC:my-hash-key" }
+            }
+        });
+        let link_bytes = serde_json::to_vec(&link_resp).unwrap();
+
+        let create_file_resp = serde_json::json!({
+            "Code": 1000,
+            "File": {
+                "ID": "new-link-id",
+                "RevisionID": "new-revision-id"
+            }
+        });
+        let create_file_bytes = serde_json::to_vec(&create_file_resp).unwrap();
+
+        let verification_resp = serde_json::json!({
+            "Code": 1000,
+            "VerificationCode": base64::engine::general_purpose::STANDARD.encode(vec![0xAA; 128]),
+            "ContentKeyPacket": base64::engine::general_purpose::STANDARD.encode("FAKE_CKP")
+        });
+        let verification_bytes = serde_json::to_vec(&verification_resp).unwrap();
+
+        (
+            share_bytes,
+            link_bytes,
+            create_file_bytes,
+            verification_bytes,
+        )
+    }
+
+    fn block_request_response() -> Vec<u8> {
+        let block_req_resp = serde_json::json!({
+            "Code": 1000,
+            "UploadLinks": [
+                {
+                    "Index": 1,
+                    "BareURL": "https://upload.proton.me/block/1",
+                    "Token": "block-token-1"
+                }
+            ]
+        });
+        serde_json::to_vec(&block_req_resp).unwrap()
+    }
+
+    /// A well-formed `MultiResponsesPerLinkFactory` reporting the delete as
+    /// successful — `Responses[0].Response.Code == 1000`.
+    fn delete_draft_ok_response() -> Vec<u8> {
+        let resp = serde_json::json!({
+            "Code": 1001,
+            "Responses": [
+                { "LinkID": "new-link-id", "Response": { "Code": 1000 } }
+            ]
+        });
+        serde_json::to_vec(&resp).unwrap()
+    }
+
+    /// A well-formed but *unsuccessful* per-link response — exercises the
+    /// "cleanup itself reports failure" branch of `delete_draft_best_effort`.
+    fn delete_draft_error_response() -> Vec<u8> {
+        let resp = serde_json::json!({
+            "Code": 1001,
+            "Responses": [
+                { "LinkID": "new-link-id", "Response": { "Code": 2501, "Error": "not found" } }
+            ]
+        });
+        serde_json::to_vec(&resp).unwrap()
+    }
+
+    fn make_test_uploader(
+        http: Arc<FakeHttpClient>,
+        expected_size: u64,
+        expected_sha1_hex: Option<String>,
+    ) -> ProtonFileUploader {
+        make_test_uploader_with_crypto(http, Arc::new(FakeCrypto), expected_size, expected_sha1_hex)
+    }
+
+    /// Like `make_test_uploader`, but with an injectable crypto backend and
+    /// no telemetry sink wired up (callers that need to observe emitted
+    /// metrics build a `ProtonFileUploader` directly instead).
+    fn make_test_uploader_with_crypto(
+        http: Arc<FakeHttpClient>,
+        openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto>,
+        expected_size: u64,
+        expected_sha1_hex: Option<String>,
+    ) -> ProtonFileUploader {
+        use crate::nodes::make_node_uid;
+        ProtonFileUploader {
+            http,
+            openpgp,
+            account: Arc::new(FakeAccount),
+            parent: make_node_uid("share-abc", "root-link"),
+            name: "test-file.txt".into(),
+            metadata: UploadMetadata {
+                media_type: "text/plain".into(),
+                expected_size,
+                expected_sha1_hex,
+                modification_time: None,
+                additional_metadata_json: None,
+                override_existing_draft_by_other_client: false,
+            },
+            telemetry: None,
+        }
+    }
+
+    /// SHA1 of `b"hello proton drive block upload!"`, precomputed, for the
+    /// checksum-match test.
+    const TEST_CONTENT_SHA1: &str = "a4e8d58a712883da14ce4c025e37d627a1733431";
+
+    #[tokio::test]
+    async fn draft_cleanup_deletes_node_on_block_upload_failure() {
+        // Finding: "Failed uploads leave permanently orphaned draft
+        // nodes/revisions on the server" — a failure downstream of node
+        // creation (here: the block PUT returns a non-200 status) must
+        // trigger a best-effort `DeleteDraft` call for the link_id that
+        // `post_create_file` returned.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),        // 1: resolve volume_id
+            (200, share_bytes),                // 2: parent context — share key
+            (200, link_bytes),                 // 3: parent context — node + hash key
+            (200, create_file_bytes),          // 4: POST create file
+            (200, verification_bytes),         // 5: GET verification code
+            (200, block_req_bytes),            // 6: POST request blocks
+            (500, b"{}".to_vec()),             // 7: PUT block blob — FAILS
+            (200, delete_draft_ok_response()), // 8: best-effort delete_draft
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_uploader(http.clone(), content.len() as u64, None);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+
+        assert!(
+            matches!(result, Err(Error::IntegrityCheckFailed(_))),
+            "expected the original block-upload error to surface, got {:?}",
+            result.err()
+        );
+
+        let paths = http.recorded_paths();
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/drive/v2/volumes/vol-xyz/delete_multiple"),
+            "expected a best-effort delete_multiple cleanup call, got paths: {paths:?}"
+        );
+
+        let delete_body = http
+            .json_body_containing("/delete_multiple")
+            .expect("delete_multiple call should have a JSON body");
+        assert_eq!(delete_body["LinkIDs"], serde_json::json!(["new-link-id"]));
+    }
+
+    #[tokio::test]
+    async fn draft_cleanup_failure_does_not_mask_original_error() {
+        // The delete-draft call itself reports failure (a non-OK per-link
+        // code), mirroring a server that, e.g., already reaped the draft.
+        // JS `deleteDraftNode` (manager.ts) only logs this — it must never
+        // replace the original upload error.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (500, b"{}".to_vec()),                // block PUT fails
+            (200, delete_draft_error_response()), // cleanup itself fails
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_uploader(http.clone(), content.len() as u64, None);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+
+        assert!(
+            matches!(result, Err(Error::IntegrityCheckFailed(_))),
+            "cleanup failure must not mask the original error, got {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_is_fatal_and_triggers_draft_cleanup() {
+        // Finding: `expected_sha1_hex` was accepted, format-validated, and
+        // then silently ignored. A mismatch must now be fatal (mirroring JS
+        // `verifyIntegrity`'s `IntegrityError`), thrown *before* the commit
+        // call, and — being a failure downstream of node creation — must also
+        // trigger best-effort draft cleanup.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (200, b"{}".to_vec()),             // block PUT succeeds
+            (200, delete_draft_ok_response()), // best-effort delete_draft
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_uploader(
+            http.clone(),
+            content.len() as u64,
+            Some("f".repeat(40)), // deliberately wrong digest
+        );
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+
+        assert!(
+            matches!(result, Err(Error::Integrity(_))),
+            "expected a fatal Integrity error on SHA1 mismatch, got {:?}",
+            result.err()
+        );
+
+        // Exactly the 8 queued responses were consumed: steps 0-6 plus the
+        // cleanup call — `put_commit_revision` must never have been reached.
+        let paths = http.recorded_paths();
+        assert_eq!(paths.len(), 8, "unexpected call sequence: {paths:?}");
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/drive/v2/volumes/vol-xyz/delete_multiple")
+        );
+    }
+
+    #[tokio::test]
+    async fn checksum_match_sets_checksum_verified_true() {
+        // Finding: `CommitRevisionRequest.checksum_verified` was hardcoded to
+        // `false`. When the streamed digest matches the caller-supplied
+        // expectation, the commit request sent to the server must report
+        // `ChecksumVerified: true` (mirroring JS
+        // `checksumVerified: !!(expectedSha1 && digests.sha1 === expectedSha1)`),
+        // and the upload must succeed without any draft cleanup.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (200, b"{}".to_vec()), // block PUT succeeds
+            (200, commit_bytes),   // commit revision succeeds
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_uploader(
+            http.clone(),
+            content.len() as u64,
+            Some(TEST_CONTENT_SHA1.to_owned()),
+        );
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(result.is_ok(), "upload failed: {:?}", result.err());
+
+        let paths = http.recorded_paths();
+        assert_eq!(
+            paths.len(),
+            8,
+            "no draft-cleanup call should have been made: {paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.contains("delete_multiple")));
+
+        let commit_body = http
+            .json_body_containing("/revisions/")
+            .expect("commit call should have a JSON body");
+        assert_eq!(commit_body["ChecksumVerified"], serde_json::json!(true));
     }
 
     #[test]
@@ -1485,5 +2360,126 @@ mod tests {
             "server returned 0 upload links but 1 blocks were requested".into(),
         );
         assert!(matches!(e, Error::ProtocolViolation(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // js/v0.16.0 "Retry block encryption and report metric"
+    // (`client/js/src/internal/upload/streamUploader.ts:315-354`,
+    // `client/js/src/internal/upload/telemetry.ts:29-41`).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn block_encryption_retries_once_on_self_verify_failure_then_succeeds() {
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (200, b"{}".to_vec()), // block PUT succeeds
+            (200, commit_bytes),
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let telemetry = Arc::new(RecordingTelemetry::new());
+        // Fails the block self-verification exactly once (well within
+        // MAX_BLOCK_ENCRYPTION_RETRIES=1), so the single retry should
+        // resolve it and the upload should still succeed.
+        let openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto> =
+            Arc::new(FlakyVerifyCrypto::new(1, content));
+
+        let mut uploader =
+            make_test_uploader_with_crypto(http.clone(), openpgp, content.len() as u64, None);
+        uploader.telemetry = Some(telemetry.clone() as Arc<dyn Telemetry>);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            result.is_ok(),
+            "upload should succeed once the single retry resolves the integrity failure: {:?}",
+            result.err()
+        );
+
+        let events = telemetry.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one BlockVerificationError metric, got {events:?}"
+        );
+        match &events[0] {
+            MetricEvent::BlockVerificationError { retry_helped, .. } => {
+                assert!(
+                    *retry_helped,
+                    "retry_helped should be true when the retry resolved the failure"
+                );
+            }
+            other => panic!("expected BlockVerificationError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_encryption_exhausts_retry_budget_then_fails_and_reports_metric() {
+        // The crypto failure is fatal before any block-upload HTTP call, so
+        // the mock client only needs responses through the verification-code
+        // fetch, plus one for the best-effort draft-cleanup call the failure
+        // triggers.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, delete_draft_ok_response()), // best-effort delete_draft
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let telemetry = Arc::new(RecordingTelemetry::new());
+        // Never succeeds: exhausts the encrypt-then-self-verify retry budget
+        // (1 initial attempt + MAX_BLOCK_ENCRYPTION_RETRIES=1 retry = 2 total).
+        let openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto> =
+            Arc::new(FlakyVerifyCrypto::new(usize::MAX, content));
+
+        let mut uploader =
+            make_test_uploader_with_crypto(http.clone(), openpgp, content.len() as u64, None);
+        uploader.telemetry = Some(telemetry.clone() as Arc<dyn Telemetry>);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            matches!(result, Err(Error::Integrity(_))),
+            "expected a fatal Integrity error once the retry budget is exhausted, got {:?}",
+            result.err()
+        );
+
+        let events = telemetry.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one BlockVerificationError metric, got {events:?}"
+        );
+        match &events[0] {
+            MetricEvent::BlockVerificationError { retry_helped, .. } => {
+                assert!(
+                    !*retry_helped,
+                    "retry_helped should be false when every attempt failed"
+                );
+            }
+            other => panic!("expected BlockVerificationError, got {other:?}"),
+        }
     }
 }

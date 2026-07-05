@@ -167,12 +167,18 @@ fn render_transfer_row(frame: &mut Frame<'_>, label_area: Rect, gauge_area: Rect
             }
         }
         TransferState::Completed => "completed".to_owned(),
+        // Data is intact (every block's ciphertext hash matched) but the
+        // manifest signature couldn't be verified against the signer's known
+        // keys — surfaced distinctly rather than looking identical to a
+        // fully authenticated download.
+        TransferState::CompletedUnverified => "completed (signature unverified)".to_owned(),
         TransferState::Cancelled => "cancelled".to_owned(),
         TransferState::Failed(msg) => format!("failed: {msg}"),
     };
 
     let label_style = match &t.state {
         TransferState::Completed => Style::default().fg(Color::Green),
+        TransferState::CompletedUnverified => Style::default().fg(Color::Yellow),
         TransferState::Failed(_) => Style::default().fg(Color::Red),
         TransferState::Cancelled => Style::default().fg(Color::DarkGray),
         _ => Style::default(),
@@ -186,13 +192,14 @@ fn render_transfer_row(frame: &mut Frame<'_>, label_area: Rect, gauge_area: Rect
 
     // Gauge — filled only while running; terminal states show full/empty bar.
     let ratio = match &t.state {
-        TransferState::Completed => 1.0,
+        TransferState::Completed | TransferState::CompletedUnverified => 1.0,
         TransferState::Cancelled | TransferState::Failed(_) => 0.0,
         _ => t.progress.fraction(),
     };
 
     let gauge_style = match &t.state {
         TransferState::Completed => Style::default().fg(Color::Green),
+        TransferState::CompletedUnverified => Style::default().fg(Color::Yellow),
         TransferState::Failed(_) => Style::default().fg(Color::Red),
         TransferState::Cancelled => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::Cyan),

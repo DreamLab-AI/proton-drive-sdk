@@ -22,7 +22,7 @@ Quantitative comparison at port time:
 The Rust port uses **TypeScript SDK v0.15.2** as the reference. Where the C# SDK has solved an adjacent problem we will not re-derive (notably: protobuf schemas in `cs/sdk/src/protos/`, the SQLite cache schema if pulled forward), reuse the C# artefact directly.
 
 ## Consequences
-- File-to-file mapping is `js/sdk/src/internal/{nodes,events,upload,download}/*` → `rust/crates/proton-drive-core/src/{nodes,events,upload,download}.rs`. Reviewers map by sibling.
+- File-to-file mapping is `client/js/src/internal/{nodes,events,upload,download}/*` → `rust/crates/proton-drive-core/src/{nodes,events,upload,download}.rs`. Reviewers map by sibling.
 - Async model translates 1:1: JS `AsyncGenerator` → Rust `Stream`, `AbortSignal` → `CancellationToken`, `ReadableStream` → `AsyncRead`.
 - We inherit the JS public-interface taxonomy and error names — easier to cross-reference, harder to invent our own.
 - C# crypto choices (BouncyCastle vs PGPCore vs whatever) do **not** constrain us.

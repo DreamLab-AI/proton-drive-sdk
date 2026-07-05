@@ -5,7 +5,7 @@
 __pycache__
 docs/build
 /public
-reference/js/public
+reference/client/js/public
 
 # JS
 node_modules
@@ -14,7 +14,7 @@ tsconfig.tsbuildinfo
 dist
 
 # JS CLI
-reference/js/cli/release
+reference/cli/release
 auth.txt
 auth-session.json
 cache*.sqlite
@@ -66,3 +66,4 @@ session.json
 *.keystore
 id_rsa
 id_rsa.pub
+.claude/

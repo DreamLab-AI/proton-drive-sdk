@@ -1,6 +1,6 @@
 //! OpenPGP crypto (ADR-0002) — rpgp v0.16 implementation.
 //!
-//! Mirrors `js/sdk/src/crypto/interface.ts`.
+//! Mirrors `client/js/src/crypto/interface.ts`.
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +28,10 @@ use pgp::{
         SymKeyEncryptedSessionKey,
     },
     ser::Serialize,
-    types::{EskType, KeyDetails, Password, PkeskVersion, PublicKeyTrait, StringToKey},
+    types::{
+        CompressionAlgorithm, EskType, KeyDetails, Password, PkeskVersion, PublicKeyTrait,
+        StringToKey,
+    },
 };
 
 /// Proton binds a signature to a purpose ("signature context") via a critical
@@ -77,13 +80,29 @@ impl From<proton_srp::MailboxHashError> for CryptoError {
 
 /// An unlocked PGP private key. `passphrase` is preserved so rpgp can re-derive
 /// the key material on every crypto operation (rpgp does not cache unlocked state).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (not derived) to avoid printing the armored private
+/// key or the cleartext passphrase — `Zeroizing<T>`'s own `Debug` impl just
+/// forwards to `T`'s and performs no redaction (it only scrubs memory on
+/// `Drop`), so a derived impl here would leak both secrets to any `{:?}`,
+/// `dbg!`, or panic message.
+#[derive(Clone)]
 pub struct PrivateKey {
     pub armored: String,
     pub fingerprint_hex: String,
     /// Passphrase used to lock/unlock this key. Empty for unencrypted keys.
     /// Wrapped in `Zeroizing` so the secret is wiped on drop (ADR-0011).
     pub passphrase: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateKey")
+            .field("armored", &"[redacted]")
+            .field("fingerprint_hex", &self.fingerprint_hex)
+            .field("passphrase", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +121,25 @@ pub enum AeadAlgorithm {
 
 /// Symmetric session key. `cipher_algorithm` is the OpenPGP numeric ID
 /// (9 = AES-256, 7 = AES-128).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written (not derived) — see [`PrivateKey`]'s impl for why:
+/// `Zeroizing<Vec<u8>>`'s derived `Debug` prints the raw key bytes verbatim.
+#[derive(Clone)]
 pub struct SessionKey {
     /// Raw key bytes. Wrapped in `Zeroizing` so the secret is wiped on drop (ADR-0011).
     pub data: Zeroizing<Vec<u8>>,
     pub cipher_algorithm: u8,
     pub aead: AeadAlgorithm,
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKey")
+            .field("data", &format!("[redacted {} bytes]", self.data.len()))
+            .field("cipher_algorithm", &self.cipher_algorithm)
+            .field("aead", &self.aead)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +259,15 @@ pub trait SrpModule: Send + Sync {
 
 #[async_trait]
 pub trait OpenPgpCrypto: Send + Sync {
-    fn generate_passphrase(&self) -> String;
+    /// Generate a fresh random passphrase for locking a new node key.
+    ///
+    /// Zeroize boundary (ADR-0011): this is credential/key material — the
+    /// passphrase locks a PGP private key — so it is wrapped in `Zeroizing`
+    /// end to end. Plain decrypted *content* (e.g. `decrypt_and_verify`'s
+    /// plaintext) is not key material and stays `Vec<u8>`; only secrets that
+    /// themselves protect or constitute key material (passphrases, session
+    /// keys, HMAC keys derived from them) cross this trait boundary zeroizing.
+    fn generate_passphrase(&self) -> Zeroizing<String>;
 
     /// Parse `armored` as a PGP private key and verify `passphrase` unlocks it.
     async fn decrypt_key(&self, armored: &str, passphrase: &str)
@@ -385,12 +425,12 @@ impl RpgpCrypto {
         Ok(())
     }
 
-    fn random_passphrase() -> String {
+    fn random_passphrase() -> Zeroizing<String> {
         use base64::Engine as _;
         use rand::RngCore as _;
-        let mut buf = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut buf);
-        base64::engine::general_purpose::STANDARD.encode(buf)
+        let mut buf = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut *buf);
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(*buf))
     }
 
     fn parse_sym_alg(id: u8) -> SymmetricKeyAlgorithm {
@@ -414,6 +454,34 @@ impl RpgpCrypto {
             SymmetricKeyAlgorithm::Camellia256 => 13,
             _ => 9,
         }
+    }
+
+    /// Explicit SEIPDv2/AEAD rejection guard (ADR-0006: v1 supports SEIPDv1
+    /// only). Walks the packet stream and inspects each
+    /// `SymEncryptedProtectedData` packet's own version tag directly, so
+    /// rejection is a deliberate, testable check rather than an incidental
+    /// side effect of `decrypt_and_verify` always building a
+    /// `PlainSessionKey::V3_4`: rpgp's SEIPDv2 decrypt arm does `bail!` on a
+    /// V3_4 key (pgp-0.16.0 composed/message/reader/sym_encrypted_protected.rs
+    /// `PlainSessionKey::V3_4 => bail!("mismatch between session key and
+    /// edata config")`), but that is a generic mismatch error, not a typed
+    /// `CryptoError::AeadNotSupported` the caller can rely on, and it would
+    /// silently stop being true if this crate ever passed a V6 session key.
+    fn reject_seipd_v2(binary: &[u8]) -> Result<(), CryptoError> {
+        let parser = PacketParser::new(std::io::BufReader::new(binary));
+        for packet_result in parser {
+            // A malformed packet stream is not this guard's concern — let
+            // the real decrypt path surface the parse error with full context.
+            let Ok(packet) = packet_result else {
+                continue;
+            };
+            if let pgp::packet::Packet::SymEncryptedProtectedData(seipd) = packet {
+                if seipd.version() != 1 {
+                    return Err(CryptoError::AeadNotSupported);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Decrypt a bare SEIPD payload (no preceding ESK) with a known session
@@ -492,9 +560,28 @@ impl RpgpCrypto {
     /// verdict against the supplied keys. Shared by both the composed
     /// (ESK + SEIPD) and bare-SEIPD decrypt paths.
     fn finalize_decrypted(
-        mut decrypted: pgp::composed::Message<'_>,
+        decrypted: pgp::composed::Message<'_>,
         verification_keys: &[PublicKey],
     ) -> Result<(Vec<u8>, VerificationStatus), CryptoError> {
+        // JS sets `compress: true` when encrypting ExtendedAttributes
+        // (reference/client/js/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
+        // -> openPGPCrypto.ts:124-132 `encryptAndSignArmored`, which forwards
+        // `compress: options.compress || false` into the encrypt call), so a
+        // SEIPD's inner plaintext can be an OpenPGP-compressed packet wrapping
+        // the signed literal. rpgp's own decrypt path can hand back a
+        // top-level `Message::Compressed { .. }` in that case (see pgp
+        // 0.16.0's own composed-message tests, e.g.
+        // `utf8_reader_partial_size_compression_zip_roundtrip_public_key_x25519_seipdv1_sign`,
+        // which asserts `is_compressed()` then calls `.decompress()` before
+        // `.verify_nested()`), and `verify_nested`/`as_data_vec` on an
+        // undecompressed `Compressed` message either bail with an error or
+        // silently return the still-compressed bytes. Decompress unconditionally
+        // before inspecting or verifying — a no-op for already-uncompressed
+        // messages.
+        let mut decrypted = decrypted
+            .decompress()
+            .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
+
         // Capture signature presence before draining; a bare literal payload
         // (no signature) must map to NoSignature, not a spurious verdict.
         let has_signature = matches!(
@@ -715,7 +802,7 @@ impl SrpModule for RpgpCrypto {
 
 #[async_trait]
 impl OpenPgpCrypto for RpgpCrypto {
-    fn generate_passphrase(&self) -> String {
+    fn generate_passphrase(&self) -> Zeroizing<String> {
         Self::random_passphrase()
     }
 
@@ -794,6 +881,11 @@ impl OpenPgpCrypto for RpgpCrypto {
         let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
         let binary = Self::to_binary_pgp(data)?;
 
+        // ADR-0006: v1 rejects SEIPDv2/AEAD explicitly rather than relying on
+        // rpgp's incidental session-key-type mismatch error (see
+        // `reject_seipd_v2` for the full citation).
+        Self::reject_seipd_v2(&binary)?;
+
         // Two payload shapes reach this function:
         //   1. ESK (PKESK/SKESK) + SEIPD — the standard composed message. The
         //      caller already extracted the session key, so we hand it to the
@@ -835,8 +927,15 @@ impl OpenPgpCrypto for RpgpCrypto {
 
         let sym_alg = Self::parse_sym_alg(session_key.cipher_algorithm);
 
-        // Unsigned literal message as the SEIPD plaintext.
-        let inner_bytes = MessageBuilder::from_bytes("", data.to_vec())
+        // Unsigned literal message as the SEIPD plaintext. `opts.compress`
+        // mirrors JS `compress` (see `encrypt_and_sign` below for the
+        // detailed JS citation); ZIP is RFC 4880 §9.3's mandatory-to-implement
+        // algorithm, so any compliant reader (OpenPGP.js, gopenpgp) decompresses it.
+        let mut inner_builder = MessageBuilder::from_bytes("", data.to_vec());
+        if opts.compress {
+            inner_builder.compression(CompressionAlgorithm::ZIP);
+        }
+        let inner_bytes = inner_builder
             .to_vec(rand::thread_rng())
             .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
 
@@ -875,11 +974,26 @@ impl OpenPgpCrypto for RpgpCrypto {
         let pw = Password::from(signing_key.passphrase.as_str());
 
         // Build a signed-but-unencrypted literal message as the SEIPD plaintext.
+        //
+        // `opts.compress` mirrors JS `compress` (reference/client/js/src/crypto/
+        // driveCrypto.ts:556 `encryptExtendedAttributes` -> openPGPCrypto.ts:
+        // 124-132 `encryptAndSignArmored`, which sets `compress: true` for
+        // ExtendedAttributes and forwards it straight to the encrypt call).
+        // When set, compress the signed literal before it is SEIP-encrypted —
+        // the counterpart to `finalize_decrypted`'s unconditional `decompress()`
+        // on the read path. ZIP is RFC 4880 §9.3's mandatory-to-implement
+        // compression algorithm (the exact algorithm the host-injected
+        // @proton/crypto CryptoProxy selects isn't vendored under reference/,
+        // so ZIP is the safe interoperable choice — decompression is
+        // algorithm-agnostic and doesn't require a byte-for-bit match).
         let inner_bytes = {
             let mut builder = MessageBuilder::from_bytes("", data.to_vec());
             builder.sign_binary();
             // primary_key implements SecretKeyTrait via the packet layer.
             builder.sign(&sec_key.primary_key, pw, HashAlgorithm::Sha256);
+            if opts.compress {
+                builder.compression(CompressionAlgorithm::ZIP);
+            }
             builder
                 .to_vec(rand::thread_rng())
                 .map_err(|e| CryptoError::Encrypt(e.to_string()))?
@@ -1349,6 +1463,67 @@ mod tests {
         );
     }
 
+    /// `EncryptOptions.compress` end to end: `encrypt_and_sign` with
+    /// `compress: true` must produce a message whose inner plaintext is
+    /// OpenPGP-compressed, and `decrypt_and_verify` must decompress it before
+    /// verifying (the `finalize_decrypted` fix) so the round trip still
+    /// yields the original plaintext and `VerificationStatus::Ok`. Mirrors
+    /// JS's `compress: true` path for ExtendedAttributes (driveCrypto.ts:556).
+    #[tokio::test]
+    async fn encrypt_sign_compressed_roundtrip() {
+        let crypto = RpgpCrypto::new();
+        let plaintext = b"{\"Common\":{\"Size\":123456}}";
+        let (signing_key, pub_armored) = crypto
+            .generate_key("compress-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let pub_key = PublicKey {
+            armored: pub_armored,
+            fingerprint_hex: signing_key.fingerprint_hex.clone(),
+        };
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let opts = EncryptOptions {
+            compress: true,
+            ..Default::default()
+        };
+        let encrypted = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                &[pub_key.clone()],
+                &signing_key,
+                opts,
+            )
+            .await
+            .unwrap();
+
+        let unlocked = crypto
+            .decrypt_key(&signing_key.armored, "compress-pass")
+            .await
+            .unwrap();
+        let recovered_sk = crypto
+            .decrypt_session_key(&encrypted, &[unlocked])
+            .await
+            .unwrap();
+        let (decrypted, status) = crypto
+            .decrypt_and_verify(&encrypted, &recovered_sk, &[pub_key])
+            .await
+            .unwrap();
+        assert_eq!(
+            decrypted, plaintext,
+            "must decompress before returning plaintext"
+        );
+        assert_eq!(
+            status,
+            VerificationStatus::Ok,
+            "must decompress before verify_nested, not just as_data_vec"
+        );
+    }
+
     #[tokio::test]
     async fn sign_verify_roundtrip() {
         let crypto = RpgpCrypto::new();
@@ -1560,5 +1735,87 @@ mod tests {
         let binary = RpgpCrypto::to_binary_pgp(armored.as_bytes()).unwrap();
         let recovered = RpgpCrypto::decrypt_session_key_with_password(&binary, password).unwrap();
         assert_eq!(recovered.data, session_key.data);
+    }
+
+    // ── SEIPDv2/AEAD rejection guard (ADR-0006) ──────────────────────────────
+
+    /// A bare SEIPDv2 (AEAD) packet must be rejected explicitly with
+    /// `CryptoError::AeadNotSupported`, not merely fail with some incidental
+    /// parse/mismatch error from deep inside rpgp.
+    #[tokio::test]
+    async fn decrypt_rejects_seipdv2_explicitly() {
+        use pgp::crypto::aead::{AeadAlgorithm as PgpAeadAlgorithm, ChunkSize};
+
+        let crypto = RpgpCrypto::new();
+        let raw_key = vec![0x42u8; 32];
+
+        let seipd = SymEncryptedProtectedData::encrypt_seipdv2(
+            rand::thread_rng(),
+            SymmetricKeyAlgorithm::AES256,
+            PgpAeadAlgorithm::Gcm,
+            ChunkSize::default(),
+            &raw_key,
+            b"top secret",
+        )
+        .unwrap();
+        let mut binary = Vec::new();
+        seipd.to_writer_with_header(&mut binary).unwrap();
+
+        let session_key = SessionKey {
+            data: Zeroizing::new(raw_key),
+            cipher_algorithm: 9,
+            aead: AeadAlgorithm::Gcm,
+        };
+
+        let result = crypto.decrypt_and_verify(&binary, &session_key, &[]).await;
+        assert!(
+            matches!(result, Err(CryptoError::AeadNotSupported)),
+            "expected AeadNotSupported, got {result:?}"
+        );
+    }
+
+    // ── Debug redaction (no secrets in `{:?}` output) ────────────────────────
+
+    #[tokio::test]
+    async fn private_key_debug_redacts_armored_and_passphrase() {
+        let crypto = RpgpCrypto::new();
+        let (priv_key, _pub_armored) = crypto
+            .generate_key("super-secret-passphrase", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let debug_output = format!("{priv_key:?}");
+        assert!(
+            !debug_output.contains("super-secret-passphrase"),
+            "Debug output must not leak the passphrase: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("PRIVATE KEY"),
+            "Debug output must not leak the armored private key: {debug_output}"
+        );
+        assert!(
+            debug_output.contains(&priv_key.fingerprint_hex),
+            "Debug output should still show the (non-secret) fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_key_debug_redacts_raw_bytes() {
+        let crypto = RpgpCrypto::new();
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let debug_output = format!("{session_key:?}");
+        let hex_bytes = hex::encode(&*session_key.data);
+        assert!(
+            !debug_output.contains(&hex_bytes),
+            "Debug output must not leak the raw session key bytes: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("redacted"),
+            "Debug output should indicate redaction: {debug_output}"
+        );
     }
 }

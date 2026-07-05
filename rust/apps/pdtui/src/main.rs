@@ -14,6 +14,7 @@
 mod account;
 mod app;
 mod auth;
+mod events_bridge;
 mod http;
 mod keymap;
 mod mvp;

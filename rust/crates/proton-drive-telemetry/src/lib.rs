@@ -1,4 +1,4 @@
-//! Telemetry sink trait. Mirrors `js/sdk/src/interface/telemetry.ts`.
+//! Telemetry sink trait. Mirrors `client/js/src/interface/telemetry.ts`.
 //!
 //! Variants chosen to cover what the JS SDK actually emits — the `pdtui`
 //! impl is `NullTelemetry` (drops everything) for personal use.
@@ -37,6 +37,11 @@ pub enum MetricEvent {
     },
     BlockVerificationError {
         detail: String,
+        /// Whether retrying the block encryption resolved the integrity
+        /// failure. Mirrors JS `UploadTelemetry.logBlockVerificationError`'s
+        /// `retryHelped` argument
+        /// (`client/js/src/internal/upload/telemetry.ts:29-41`).
+        retry_helped: bool,
     },
     ApiRetrySucceeded {
         attempts: u32,

@@ -1,7 +1,7 @@
 //! Account / Identity supporting subdomain.
 //!
 //! The SDK does not model users or sessions — the host supplies a
-//! [`ProtonDriveAccount`]. Mirrors `js/sdk/src/interface/account.ts`.
+//! [`ProtonDriveAccount`]. Mirrors `client/js/src/interface/account.ts`.
 
 use async_trait::async_trait;
 use proton_drive_crypto::{PrivateKey, PublicKey};

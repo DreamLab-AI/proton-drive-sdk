@@ -3,9 +3,13 @@
 //! Flow: auth/info → SRP exchange (via proton-drive-crypto) → auth →
 //! verify server proof → fetch key salts → derive mailbox password.
 //!
-//! Tokens are persisted in the OS keyring (secret-service on Linux,
-//! Keychain on macOS). A session.json is also written so the existing
-//! manual-bearer path keeps working without any changes.
+//! Tokens are persisted via [`SessionManager::from_login`], which writes to
+//! the OS keyring when a native backend is reachable (the kernel keyutils
+//! session keyring on Linux, Keychain on macOS, Credential Manager on
+//! Windows) and unconditionally to a 0600 secret file as the fallback
+//! actually exercised whenever no such backend is reachable (see
+//! `session.rs` module docs). A session.json is also written so the
+//! existing manual-bearer path keeps working without any changes.
 
 use std::io::{self, Write as _};
 use std::sync::Arc;
@@ -42,7 +46,12 @@ pub enum AuthError {
     Json(#[from] serde_json::Error),
     #[error("no non-empty key salt in /keys/salts response")]
     NoKeySalt,
-    #[error("2FA is enabled — not yet supported; use scripts/configure-session.sh instead")]
+    #[error(
+        "2FA is enabled — not yet supported by SRP login; use scripts/configure-session.sh \
+         to capture a bearer token for `pdtui probe` diagnostics only (it cannot unlock the \
+         encrypted TUI/list/upload/download flows, which need a key_password derived from a \
+         non-2FA login)"
+    )]
     TwoFactorRequired,
     #[error("session: {0}")]
     Session(#[from] SessionManagerError),
@@ -65,6 +74,11 @@ pub struct Credentials {
     pub refresh_token: Zeroizing<String>,
     /// 31-char bcrypt hash portion — passphrase for unlocking the user's PGP key.
     pub key_password: Zeroizing<String>,
+    /// Access-token lifetime in seconds. Taken from the server's `ExpiresIn`
+    /// field on `/core/v4/auth` when present (reference/client/js coreTypes.ts
+    /// documents it, deprecated but present); otherwise the previous
+    /// conservative 30-minute default.
+    pub expires_in_secs: u64,
 }
 
 /// Perform the full SRP login flow and return validated credentials.
@@ -97,7 +111,7 @@ pub async fn login(
         .await?;
 
     debug!("POST auth");
-    let auth_resp: AuthResponse = api_post(
+    let auth_body = api_post_bytes(
         http,
         "/core/v4/auth",
         &AuthRequest {
@@ -109,6 +123,10 @@ pub async fn login(
         &[],
     )
     .await?;
+    let auth_resp: AuthResponse = parse_envelope(&auth_body)?;
+    // Honour the server-supplied ExpiresIn (seconds) when present, falling
+    // back to the same conservative 30-minute default the refresh path uses.
+    let expires_in_secs = crate::session::extract_expires_in_secs(&auth_body).unwrap_or(30 * 60);
 
     // Constant-time comparison to avoid timing side-channel (ADR-0011).
     let proofs_match: bool = auth_resp
@@ -157,6 +175,7 @@ pub async fn login(
         access_token: Zeroizing::new(auth_resp.access_token),
         refresh_token: Zeroizing::new(auth_resp.refresh_token),
         key_password: Zeroizing::new(key_password),
+        expires_in_secs,
     })
 }
 
@@ -167,24 +186,28 @@ pub async fn login(
 /// created here can later be resumed via [`SessionManager::from_keyring`].
 pub async fn login_interactive(base_url: &str, app_version: &str) -> Result<(), AuthError> {
     let username = prompt("Email: ")?;
-    let password = rpassword::prompt_password("Password: ").map_err(AuthError::Io)?;
+    // Wrapped in `Zeroizing` like every other secret in this module (ADR-0011)
+    // so the mailbox password's heap buffer is wiped on drop rather than
+    // merely freed; `login()` still takes `&str` (see `password.as_str()`
+    // below), matching the convention already used by the TUI's login form.
+    let password: Zeroizing<String> =
+        Zeroizing::new(rpassword::prompt_password("Password: ").map_err(AuthError::Io)?);
 
     let http: Arc<dyn ProtonDriveHttpClient> = Arc::new(
         crate::http::ReqwestHttpClient::new(base_url, app_version).map_err(AuthError::Http)?,
     );
 
     eprintln!("Authenticating…");
-    let creds = login(&*http, &username, &password).await?;
+    let creds = login(&*http, &username, password.as_str()).await?;
     let username = creds.username.clone();
 
-    // Proton returns no explicit expiry on login; 30 min matches the refresh path.
     SessionManager::from_login(
         Arc::clone(&http),
         creds.uid,
         creds.access_token,
         creds.refresh_token,
         creds.key_password,
-        30 * 60,
+        creds.expires_in_secs,
     )
     .await?;
 
@@ -201,15 +224,19 @@ fn prompt(label: &str) -> Result<String, AuthError> {
     Ok(buf.trim().to_owned())
 }
 
-async fn api_post<Req, Resp>(
+/// POST `path` and return the raw response body, before envelope parsing.
+///
+/// Split out from [`api_post`] so callers that need to sniff an optional
+/// field the typed DTO doesn't carry (e.g. `login`'s `ExpiresIn` sniff) can
+/// do so without issuing a second HTTP request.
+async fn api_post_bytes<Req>(
     http: &dyn ProtonDriveHttpClient,
     path: &str,
     body: &Req,
     extra_headers: &[(String, String)],
-) -> Result<Resp, AuthError>
+) -> Result<bytes::Bytes, AuthError>
 where
     Req: Serialize,
-    Resp: DeserializeOwned,
 {
     let body_bytes = serde_json::to_vec(body)?;
     let req = JsonRequest {
@@ -220,7 +247,21 @@ where
         body: Some(body_bytes),
     };
     let resp = http.request_json(req).await.map_err(AuthError::Http)?;
-    parse_envelope(&resp.body)
+    Ok(resp.body)
+}
+
+async fn api_post<Req, Resp>(
+    http: &dyn ProtonDriveHttpClient,
+    path: &str,
+    body: &Req,
+    extra_headers: &[(String, String)],
+) -> Result<Resp, AuthError>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    let body_bytes = api_post_bytes(http, path, body, extra_headers).await?;
+    parse_envelope(&body_bytes)
 }
 
 async fn api_get<Resp>(

@@ -7,6 +7,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -14,6 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::account::PdtuiAccount;
 use crate::auth::{self, AuthError, Credentials};
+use crate::events_bridge;
 use crate::http::SessionAwareHttpClient;
 use crate::keymap::{Action, dispatch};
 use crate::panes::{Focus, PaneEntry, Panes};
@@ -22,8 +24,8 @@ use crate::transfer::{Transfer, spawn_download, spawn_upload};
 
 use futures::StreamExt as _;
 use proton_drive::{
-    FolderChildrenFilter, MaybeNode, NodeType, ProtonDriveClient, ProtonDriveClientOptions,
-    ProtonDriveConfig, ProtonDriveHttpClient, RpgpCrypto,
+    EventSubscription, FolderChildrenFilter, MaybeNode, NodeType, ProtonDriveClient,
+    ProtonDriveClientOptions, ProtonDriveConfig, ProtonDriveHttpClient, RpgpCrypto,
 };
 use proton_drive_cache::MemoryCache;
 
@@ -89,6 +91,15 @@ pub struct App {
     /// the client is in use.
     #[allow(dead_code)]
     session: Option<Arc<SessionManager>>,
+    /// Flips to a new value whenever the live-event bridge sees a relevant
+    /// drive event (node created/updated/trashed/restored/deleted/renamed,
+    /// or a tree refresh/removal). Polled — never awaited — from `tick`.
+    event_stale: Option<watch::Receiver<bool>>,
+    /// Keeps the background event subscription alive; dropping it cancels
+    /// the poll loop (`EventSubscription`'s `Drop` impl). Never read again
+    /// once stored, so `dead_code` is expected.
+    #[allow(dead_code)]
+    event_subscription: Option<EventSubscription>,
 }
 
 impl App {
@@ -107,6 +118,8 @@ impl App {
             transfers: Vec::new(),
             client: None,
             session: None,
+            event_stale: None,
+            event_subscription: None,
         }
     }
 
@@ -144,6 +157,9 @@ impl App {
     async fn tick(&mut self) -> io::Result<()> {
         self.check_auth_result().await;
         self.poll_transfers();
+        if self.take_stale_event() && self.client.is_some() {
+            self.refresh_remote().await;
+        }
 
         if !event::poll(Duration::from_millis(100))? {
             return Ok(());
@@ -181,6 +197,33 @@ impl App {
         // Remove completed/failed/cancelled entries once there are more than 8.
         if self.transfers.len() > 8 {
             self.transfers.retain(|t| !t.state.is_terminal());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Live events (background subscription -> remote-pane staleness)
+    // -----------------------------------------------------------------------
+
+    /// Consume a pending "remote changed" signal from the live-event bridge.
+    ///
+    /// Uses the `watch` channel's own change-tracking (not the carried
+    /// value — the bridge always sends `true`) so each relevant event is
+    /// reported at most once: `has_changed()` is `true` only if the sender
+    /// has sent since the last `borrow_and_update()`. Returns `false` (no
+    /// panic, no reconnect logic here) if the bridge was never wired up or
+    /// its subscription task has ended — the consumer's own backoff loop
+    /// owns reconnection; this method never polls the network itself.
+    fn take_stale_event(&mut self) -> bool {
+        let Some(rx) = self.event_stale.as_mut() else {
+            return false;
+        };
+        match rx.has_changed() {
+            Ok(true) => {
+                let _ = rx.borrow_and_update();
+                true
+            }
+            Ok(false) => false,
+            Err(_) => false,
         }
     }
 
@@ -532,6 +575,16 @@ impl App {
         self.client = Some(Arc::clone(&client));
         self.session = Some(session);
 
+        // Live sync (ADR-0001: event subscription, never polling in the
+        // client). A failed subscription (e.g. transient error resolving the
+        // My Files volume) only disables the live-refresh convenience —
+        // `events_bridge::subscribe` logs it and returns a receiver that
+        // never fires, so manual refresh (F5 / focus / navigate) is
+        // unaffected.
+        let (event_stale, event_subscription) = events_bridge::subscribe(&client).await;
+        self.event_stale = Some(event_stale);
+        self.event_subscription = event_subscription;
+
         self.refresh_remote().await;
         Ok(())
     }
@@ -692,5 +745,56 @@ mod tests {
             TransferDirection::Upload as u8,
             TransferDirection::Download as u8
         );
+    }
+
+    // ── live-event bridge: staleness flag handling ──────────────────────────
+
+    #[test]
+    fn take_stale_event_false_when_bridge_not_wired() {
+        let mut app = App::new();
+        assert!(app.event_stale.is_none());
+        assert!(!app.take_stale_event());
+    }
+
+    #[test]
+    fn take_stale_event_false_before_any_event_sent() {
+        let mut app = App::new();
+        let (_tx, rx) = watch::channel(false);
+        app.event_stale = Some(rx);
+
+        assert!(!app.take_stale_event(), "no event has arrived yet");
+    }
+
+    #[test]
+    fn take_stale_event_true_once_per_send_then_clears() {
+        let mut app = App::new();
+        let (tx, rx) = watch::channel(false);
+        app.event_stale = Some(rx);
+
+        tx.send(true).expect("receiver held by app");
+        assert!(
+            app.take_stale_event(),
+            "a relevant drive event must surface as stale exactly once"
+        );
+        assert!(
+            !app.take_stale_event(),
+            "the flag must not re-trigger until another event arrives"
+        );
+
+        // A second event re-arms the flag.
+        tx.send(true).expect("receiver held by app");
+        assert!(app.take_stale_event(), "a fresh send re-arms the flag");
+    }
+
+    #[test]
+    fn take_stale_event_false_after_sender_dropped() {
+        let mut app = App::new();
+        let (tx, rx) = watch::channel(false);
+        app.event_stale = Some(rx);
+        drop(tx);
+
+        // A dropped subscription (e.g. the bridge task ended) must not panic
+        // and must not spuriously trigger a refresh.
+        assert!(!app.take_stale_event());
     }
 }

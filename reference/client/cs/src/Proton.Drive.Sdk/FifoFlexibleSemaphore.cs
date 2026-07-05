@@ -1,0 +1,100 @@
+namespace Proton.Drive.Sdk;
+
+/// <summary>
+/// Acts as a semaphore that operates in a first in / first out manner, can increment and decrement its count by more than 1, and can be entered as long as the count before the increment is less than the maximum.
+/// </summary>
+internal sealed class FifoFlexibleSemaphore
+{
+    private readonly Queue<(int Increment, TaskCompletionSource TaskCompletionSource)> _waitingQueue = new();
+
+    public FifoFlexibleSemaphore(int maximumCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumCount);
+
+        MaximumCount = maximumCount;
+        CurrentCount = maximumCount;
+    }
+
+    public int MaximumCount { get; }
+    public int CurrentCount { get; private set; }
+
+    public bool TryEnter(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        lock (_waitingQueue)
+        {
+            if (CurrentCount <= 0)
+            {
+                return false;
+            }
+
+            CurrentCount -= count;
+            return true;
+        }
+    }
+
+    public async ValueTask EnterAsync(int count, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        TaskCompletionSource tcs;
+        lock (_waitingQueue)
+        {
+            if (CurrentCount > 0)
+            {
+                CurrentCount -= count;
+                return;
+            }
+
+            tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _waitingQueue.Enqueue((count, tcs));
+        }
+
+        var cancellationTokenRegistration = cancellationToken.Register(state => ((TaskCompletionSource)state!).TrySetCanceled(), tcs);
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            await cancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        await using (cancellationTokenRegistration.ConfigureAwait(false))
+        {
+            await tcs.Task.ConfigureAwait(false);
+        }
+    }
+
+    public void DecreaseCount(int count)
+    {
+        lock (_waitingQueue)
+        {
+            CurrentCount -= count;
+        }
+    }
+
+    public void Release(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        lock (_waitingQueue)
+        {
+            if (CurrentCount + count > MaximumCount)
+            {
+                throw new InvalidOperationException("Releasing would increase the count beyond the maximum.");
+            }
+
+            CurrentCount += count;
+
+            while (CurrentCount > 0 && _waitingQueue.TryDequeue(out var queuedEntry))
+            {
+                var (countToDecrement, taskCompletionSource) = queuedEntry;
+
+                if (taskCompletionSource.TrySetResult())
+                {
+                    CurrentCount -= countToDecrement;
+                }
+            }
+        }
+    }
+}

@@ -1,4 +1,4 @@
-//! Crate-wide error model. Mirrors `js/sdk/src/errors.ts` taxonomy.
+//! Crate-wide error model. Mirrors `client/js/src/errors.ts` taxonomy.
 
 use thiserror::Error;
 
@@ -26,6 +26,11 @@ pub enum Error {
 
     #[error("node with same name already exists: {name}")]
     NodeWithSameNameExists { name: String },
+
+    /// Proton API `Code` 2011 (`NOT_ENOUGH_PERMISSIONS`) — see
+    /// `map_api_error` in `nodes.rs` for the wire-code taxonomy citation.
+    #[error("insufficient permissions: {0}")]
+    PermissionDenied(String),
 
     #[error("revision draft conflict")]
     RevisionDraftConflict,

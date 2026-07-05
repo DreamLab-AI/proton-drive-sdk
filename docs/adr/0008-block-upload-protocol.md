@@ -5,7 +5,7 @@
 
 ## Decision
 
-Port `js/sdk/src/internal/upload/` happy path 1:1 into `proton-drive-core::upload`. No optimisation, no architectural reinterpretation. Files <16 MiB only for MVP; large-file streaming + thumbnails + photo-specific paths are out-of-scope.
+Port `client/js/src/internal/upload/` happy path 1:1 into `proton-drive-core::upload`. No optimisation, no architectural reinterpretation. Files <16 MiB only for MVP; large-file streaming + thumbnails + photo-specific paths are out-of-scope.
 
 ## The protocol (as derived from the JS SDK)
 
@@ -39,7 +39,7 @@ Port `js/sdk/src/internal/upload/` happy path 1:1 into `proton-drive-core::uploa
 ## Implementation constraints
 
 - **Concurrency: 1 block at a time.** JS does up to 4 parallel; MVP serialises. Reduce by changing one constant later.
-- **Manifest signature:** binary signature over concatenated block hashes in order. Uses the address signing key. Signature context = "drive.file.manifest".
+- **Manifest signature:** binary signature over concatenated block hashes in order. Uses the address signing key. **No signature context** — corrected 2026-07-05: the JS reference's `signManifest()` (`client/js/src/crypto/driveCrypto.ts`) calls `signArmored(manifest, signingKey)` with no context argument at all, and `upload.rs` signs the manifest the same way (`self.openpgp.sign(&manifest_payload, &address_priv, "")`, with an explicit code comment citing this). This ADR previously claimed a `"drive.file.manifest"` context that was never real; do not resurrect it.
 - **XAttr:** JSON `{ Common: { ModificationTime, Size, Digests: { SHA1: hex } } }` encrypted with node key + signed. Optional `ModificationTime` (already supported by the JS SDK).
 - **Content key vs node key:**
   - **Node key** encrypts the metadata (name, xattr). Generated per-node.
@@ -50,8 +50,19 @@ Port `js/sdk/src/internal/upload/` happy path 1:1 into `proton-drive-core::uploa
 - Thumbnail upload (`thumbnailUploader` paths)
 - Photos block protocol (`photos/`)
 - Resumable / multi-part / parallel-block upload
-- Verifier retry loop on hash mismatch
-- Telemetry (`upload/telemetry.ts`) — track later
+- Telemetry (`upload/telemetry.ts`) beyond the one metric below — track later
+
+**Update 2026-07-05 (wp/c2-resilience, js/v0.16.0 alignment):** the block
+"verify then retry on hash mismatch" loop that this ADR originally excluded
+*is* now ported — `upload.rs::encrypt_block_with_verify_retry` encrypts a
+block, self-verifies it by decrypting it back with the content session key
+(catches bitflips/bad hardware, mirroring JS `cryptoService.verifyBlock`),
+and retries the whole encrypt step once (`MAX_BLOCK_ENCRYPTION_RETRIES = 1`,
+matching `streamUploader.ts`) before giving up. Whether the retry helped is
+reported as `MetricEvent::BlockVerificationError { retry_helped }` through
+the existing (optional) `proton-drive-telemetry` sink — the one piece of
+`upload/telemetry.ts` this port implements; the rest (per-volume-type
+context, upload-outcome telemetry) remains out of scope.
 
 ## Rust API shape
 
@@ -87,8 +98,8 @@ pub struct UploadMetadata {
 
 ## References
 
-- `js/sdk/src/internal/upload/fileUploader.ts` — top-level driver
-- `js/sdk/src/internal/upload/apiService.ts` — endpoint shapes
-- `js/sdk/src/internal/upload/cryptoService.ts` — block encryption / encsig
-- `js/sdk/src/internal/upload/blockVerifier.ts` — server-side feedback handling
-- `js/sdk/src/internal/upload/digests.ts` — SHA1 digest assembly for XAttr
+- `client/js/src/internal/upload/fileUploader.ts` — top-level driver
+- `client/js/src/internal/upload/apiService.ts` — endpoint shapes
+- `client/js/src/internal/upload/cryptoService.ts` — block encryption / encsig
+- `client/js/src/internal/upload/blockVerifier.ts` — server-side feedback handling
+- `client/js/src/internal/upload/digests.ts` — SHA1 digest assembly for XAttr

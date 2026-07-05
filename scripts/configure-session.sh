@@ -4,6 +4,16 @@
 #
 # The session file is **never** committed (.gitignore excludes it). Tokens are
 # read into a variable then written via printf with restrictive perms.
+#
+# SCOPE: this only ever writes {"AccessToken", "UID"} — enough for the
+# unencrypted `pdtui probe` diagnostics (which is what `run-probes.sh` below
+# exercises). It deliberately does NOT and CANNOT populate `refresh_token` or
+# `key_password`, both of which require a full SRP exchange (what `pdtui
+# login` performs) against your account password. It therefore cannot unlock
+# the interactive TUI, `pdtui mvp`, or any other encrypted list/upload/
+# download path — those need a real `pdtui login` (which fails today if your
+# account has 2FA enabled; this script is the documented stand-in, but only
+# for `pdtui probe`).
 
 set -euo pipefail
 

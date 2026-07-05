@@ -1,5 +1,5 @@
-//! Event subscription aggregate. Mirrors `js/sdk/src/interface/events.ts` plus
-//! the volume polling loop in `js/sdk/src/internal/events/`.
+//! Event subscription aggregate. Mirrors `client/js/src/interface/events.ts` plus
+//! the volume polling loop in `client/js/src/internal/events/`.
 //!
 //! Sync is **event-based polling** (never recursive tree traversal): a
 //! background task repeatedly drains `GET drive/v2/volumes/{volumeID}/events/
@@ -8,6 +8,14 @@
 //! host's [`LatestEventIdProvider`]. The server's `Refresh` flag triggers a
 //! [`DriveEvent::TreeRefresh`] full-resync; `More` drives pagination within a
 //! single poll tick.
+//!
+//! This mirrors the *callback-based* subscription path
+//! (`subscribeToTreeEvents`/`EventManager`/`VolumeEventManager`) that upstream
+//! JS/C# now mark deprecated in favour of a host-driven pull iterator
+//! (`iterateEvents`/`EnumerateEventsAsync`). That newer surface is a
+//! deliberate, documented divergence — see "v0.19 alignment" in
+//! `docs/audit-2026-07-05.md` — not implemented here because it is a new
+//! public API shape, not a payload/naming tweak.
 
 use std::sync::Arc;
 
@@ -35,7 +43,20 @@ pub enum DriveEvent {
 #[derive(Debug, Clone)]
 pub struct NodeEvent {
     pub uid: NodeUid,
+    /// Parent of the affected node, when the server reports one. Mirrors JS
+    /// `NodeEvent.parentNodeUid` (`client/js/src/internal/events/apiService.ts`
+    /// `getVolumeEvents`, which sets it from `event.Link.ParentLinkID`);
+    /// `None` when the wire payload carries no `ParentLinkID`.
+    pub parent_uid: Option<NodeUid>,
     pub kind: NodeEventKind,
+    /// Mirrors JS `NodeEvent.isShared` (`event.Link.IsShared` on the same wire
+    /// entry) — previously parsed off the wire into [`EventLinkData`] but
+    /// dropped instead of surfaced on the domain event.
+    pub is_shared: bool,
+    /// The individual event's own id (`EventID` on the event entry), distinct
+    /// from the page cursor returned in [`DrainResult::cursor`]. Mirrors JS
+    /// `NodeEvent.eventId`.
+    pub event_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +72,11 @@ pub enum NodeEventKind {
 #[derive(Debug, Clone)]
 pub struct TreeRefreshEvent {
     pub root: NodeUid,
+    /// The event id the server advanced to when it signalled the refresh.
+    /// Mirrors JS `TreeRefreshEvent.eventId` / C# `EventsContinuityLostEvent`'s
+    /// carried id (`client/js/src/internal/events/volumeEventManager.ts`,
+    /// `Proton.Drive.Sdk/Volumes/VolumeOperations.cs` `EnumerateEventsAsync`).
+    pub new_event_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -144,9 +170,19 @@ const BACKOFF_FIB: [u64; 7] = [1, 1, 2, 3, 5, 8, 13];
 /// `0` = deleted, `1` = created, `2`/`3` = updated. The trashed/restored
 /// distinction is derived from the event's `IsTrashed` flag, matching how the
 /// JS listener interprets metadata updates.
+///
+/// Carries through `parent_uid`/`is_shared`/`event_id` — already parsed off
+/// the wire into [`EventLinkData`]/[`VolumeEventEntry`] but previously dropped
+/// here — so the domain event has the same payload fields as JS `NodeEvent`
+/// (`client/js/src/internal/events/apiService.ts` `getVolumeEvents`).
 #[must_use]
 pub fn map_volume_event(volume_id: &str, entry: &VolumeEventEntry) -> DriveEvent {
     let uid = make_node_uid(volume_id, entry.link.link_id.clone());
+    let parent_uid = entry
+        .link
+        .parent_link_id
+        .clone()
+        .map(|parent_id| make_node_uid(volume_id, parent_id));
     let kind = match entry.event_type {
         0 => NodeEventKind::Deleted,
         1 => NodeEventKind::Created,
@@ -155,7 +191,13 @@ pub fn map_volume_event(volume_id: &str, entry: &VolumeEventEntry) -> DriveEvent
         _ if entry.link.is_trashed => NodeEventKind::Trashed,
         _ => NodeEventKind::Updated,
     };
-    DriveEvent::Node(NodeEvent { uid, kind })
+    DriveEvent::Node(NodeEvent {
+        uid,
+        parent_uid,
+        kind,
+        is_shared: entry.link.is_shared,
+        event_id: entry.event_id.clone(),
+    })
 }
 
 /// Outcome of one full drain of a volume's event feed (one poll tick).
@@ -196,6 +238,7 @@ pub async fn drain_volume_events(
             listener
                 .on_event(DriveEvent::TreeRefresh(TreeRefreshEvent {
                     root: make_node_uid(volume_id, volume_id),
+                    new_event_id: cursor.clone(),
                 }))
                 .await;
             return Ok(DrainResult {
@@ -576,7 +619,7 @@ mod tests {
     fn maps_event_types_to_node_event_kinds() {
         let created = map_volume_event(VOLUME, &entry("e1", "n1", 1, false));
         match created {
-            DriveEvent::Node(NodeEvent { uid, kind }) => {
+            DriveEvent::Node(NodeEvent { uid, kind, .. }) => {
                 assert_eq!(uid, make_node_uid(VOLUME, "n1"));
                 assert_eq!(kind, NodeEventKind::Created);
             }
@@ -620,6 +663,62 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── payload fields: parent/shared/event-id carried through (v0.19 align) ──
+
+    /// `parent_uid`, `is_shared`, and the per-event `event_id` are parsed off
+    /// the wire (`EventLinkData`/`VolumeEventEntry`) but were previously
+    /// dropped by `map_volume_event`. Mirrors JS `NodeEvent.parentNodeUid` /
+    /// `.isShared` / `.eventId` (`client/js/src/internal/events/apiService.ts`
+    /// `getVolumeEvents`).
+    #[test]
+    fn maps_parent_uid_is_shared_and_event_id() {
+        let e = VolumeEventEntry {
+            event_id: "e42".to_owned(),
+            event_type: 2,
+            link: EventLinkData {
+                link_id: "child".to_owned(),
+                parent_link_id: Some("parent-1".to_owned()),
+                is_shared: true,
+                is_trashed: false,
+            },
+        };
+        match map_volume_event(VOLUME, &e) {
+            DriveEvent::Node(NodeEvent {
+                uid,
+                parent_uid,
+                is_shared,
+                event_id,
+                ..
+            }) => {
+                assert_eq!(uid, make_node_uid(VOLUME, "child"));
+                assert_eq!(parent_uid, Some(make_node_uid(VOLUME, "parent-1")));
+                assert!(is_shared);
+                assert_eq!(event_id, "e42");
+            }
+            other => panic!("expected Node event, got {other:?}"),
+        }
+    }
+
+    /// A missing `ParentLinkID` on the wire (e.g. a deleted top-level item)
+    /// maps to `parent_uid: None` rather than a fabricated uid.
+    #[test]
+    fn maps_missing_parent_link_id_to_none() {
+        let e = VolumeEventEntry {
+            event_id: "e43".to_owned(),
+            event_type: 0,
+            link: EventLinkData {
+                link_id: "gone".to_owned(),
+                parent_link_id: None,
+                is_shared: false,
+                is_trashed: false,
+            },
+        };
+        match map_volume_event(VOLUME, &e) {
+            DriveEvent::Node(NodeEvent { parent_uid, .. }) => assert!(parent_uid.is_none()),
+            other => panic!("expected Node event, got {other:?}"),
+        }
     }
 
     // ── drain: cursor advancement ─────────────────────────────────────────────
@@ -731,8 +830,9 @@ mod tests {
         let evs = captured.lock().unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            DriveEvent::TreeRefresh(TreeRefreshEvent { root }) => {
+            DriveEvent::TreeRefresh(TreeRefreshEvent { root, new_event_id }) => {
                 assert_eq!(*root, make_node_uid(VOLUME, VOLUME));
+                assert_eq!(new_event_id, "cursor-refresh");
             }
             other => panic!("expected TreeRefresh, got {other:?}"),
         }

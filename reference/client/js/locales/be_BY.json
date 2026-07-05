@@ -1,0 +1,281 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);",
+    "language": "be_BY"
+  },
+  "contexts": {
+    "Error": {
+      "A message is required when reporting copyright infringement or stolen data": [
+        "Паведамленне патрабуецца пры парушэнні аўтарскіх правоў або крадзяжы даных"
+      ],
+      "Bookmark password is not available": [
+        "Пароль закладкі недаступны"
+      ],
+      "Cannot add photo to album without a valid name": [
+        "Нельга дадаць фатаграфію ў альбом без сапраўднай назвы"
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "Немагчыма стварыць публічную спасылку для тома, які не належыць карыстальніку"
+      ],
+      "Cannot download a folder": [
+        "Немагчыма спампаваць папку"
+      ],
+      "Cannot share root folder": [
+        "Немагчыма абагуліць каранёвую папку"
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "Немагчыма абнавіць публічную спасылку для тома, які не належыць карыстальніку"
+      ],
+      "Content key packet is required for small revision upload": [
+        "Пакет ключа змесціва патрабуецца для запампоўвання невялікіх рэдакцый"
+      ],
+      "Copy operation aborted": [
+        "Аперацыя капіявання перарвана"
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "Капіяванне элементаў у асяроддзі, якое не належыць папкам забаронена"
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "Стварэнне дакументаў у асяроддзі, якое не належыць папкам забаронена"
+      ],
+      "Creating files in non-folders is not allowed": [
+        "Стварэнне файлаў у асяроддзі, якое не належыць папкам забаронена"
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "Стварэнне папак у асяроддзі, якое не належыць папкам забаронена"
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "Забаронена ствараць рэдакцыі ў файлах, якія не з'яўляюцца файламі"
+      ],
+      "Data integrity check failed": [
+        "Збой праверкі цэласнасці даных"
+      ],
+      "Data integrity check of one part failed": [
+        "Збой праверкі цэласнасці даных адной часткі"
+      ],
+      "Device not found": [
+        "Прылада не знойдзена"
+      ],
+      "Expiration date cannot be in the past": [
+        "Тэрмін дзеяння не можа быць у мінулым"
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Не ўдалося расшыфраваць актыўную рэдакцыю: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Не ўдалося расшыфраваць блок: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Не ўдалося расшыфраваць ключ закладкі: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Не ўдалося расшыфраваць назву закладкі: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Не ўдалося расшыфраваць пароль закладкі: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Не ўдалося расшыфраваць ключ змесціва: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Не ўдалося расшыфраваць назву элемента: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Не ўдалося расшыфраваць ключ вузла: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Не ўдалося расшыфраваць мініяцюру: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "Не ўдалося атрымаць ключы запрашальніка"
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "Не ўдалося атрымаць звесткі аб абагульванні для вузла ${ nodeUid }"
+      ],
+      "Failed to get verification keys": [
+        "Не ўдалося атрымаць ключы праверкі"
+      ],
+      "Failed to load some items": [
+        "Не ўдалося загрузіць некаторыя элементы"
+      ],
+      "Failed to load some nodes": [
+        "Не ўдалося загрузіць некаторыя вузлы"
+      ],
+      "Failed to verify invitation": [
+        "Не ўдалося спраўдзіць запрашэнне"
+      ],
+      "File download failed due to empty response": [
+        "Спампоўка файла не атрымалася па прычыне пустога адказу"
+      ],
+      "File has no active revision": [
+        "У файла адсутнічае актыўная рэдакцыя"
+      ],
+      "File has no content key": [
+        "Файл не мае ключа змесціва"
+      ],
+      "File has no revision": [
+        "У файла адсутнічае рэдакцыя"
+      ],
+      "File hash does not match expected hash": [
+        "Хэш файла не супадае з чаканым хэшам"
+      ],
+      "Invalid URL": [
+        "Памылковы URL-адрас"
+      ],
+      "Invitation not found": [
+        "Запрашэнне не знойдзена"
+      ],
+      "Item cannot be decrypted": [
+        "Немагчыма расшыфраваць элемент"
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "Немагчыма абнавіць старую публічную спасылку. Стварыце новую публічную спасылку."
+      ],
+      "Missing integrity signature": [
+        "Адсутнічае подпіс цэласнасці"
+      ],
+      "Missing inviter email": [
+        "Адсутнічае адрас электроннай пошты запрашальніка"
+      ],
+      "Missing signature": [
+        "Адсутнічае подпіс"
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Адсутнічае подпіс для ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "Аперацыя перамяшчэння перарвана"
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "Перамяшчэнне элементаў у асяроддзі, якое не належыць папка забаронена"
+      ],
+      "Moving root item is not allowed": [
+        "Перамяшчаць каранёвы элемент забаронена"
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "Назва не павінна перавышаць даўжыню ў ${ MAX_NODE_NAME_LENGTH } сімвал",
+        "Назва не павінна перавышаць даўжыню ў ${ MAX_NODE_NAME_LENGTH } сімвалы",
+        "Назва не павінна перавышаць даўжыню ў ${ MAX_NODE_NAME_LENGTH } сімвалаў",
+        "Назва не павінна перавышаць даўжыню ў ${ MAX_NODE_NAME_LENGTH } сімвалаў"
+      ],
+      "Name must not be empty": [
+        "Назва не можа быць пустой"
+      ],
+      "No available name found": [
+        "Даступная назва не знойдзена"
+      ],
+      "Node has no thumbnail": [
+        "У вузла адсутнічае мініяцюра"
+      ],
+      "Node is not accessible": [
+        "Вузел недаступны"
+      ],
+      "Node is not accessible via a share": [
+        "Вузел недаступны праз абагулены рэсурс"
+      ],
+      "Node is not shared": [
+        "Вузел не абагулены"
+      ],
+      "Node not found": [
+        "Вузел не знойдзены"
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Толькі адміністратары могуць пераўтвараць запрашэнні, якія не належаць Proton"
+      ],
+      "Operation aborted": [
+        "Аперацыя перарвана"
+      ],
+      "Operation failed, try again later": [
+        "Збой аперацыі. Паспрабуйце яшчэ раз пазней"
+      ],
+      "Parent cannot be decrypted": [
+        "Немагчыма расшыфраваць бацькоўскі вузел"
+      ],
+      "Photo is already in the target album": [
+        "Фатаграфіі ўжо знаходзяцца ў мэтавым альбоме"
+      ],
+      "Photo not found": [
+        "Фатаграфія не знойдзена"
+      ],
+      "Renaming root item is not allowed": [
+        "Перайменаванне каранёвага элемента забаронена"
+      ],
+      "Request aborted": [
+        "Запыт перарваны"
+      ],
+      "Signature is missing": [
+        "Подпіс адсутнічае"
+      ],
+      "Signature verification failed": [
+        "Не ўдалося спраўдзіць подпіс"
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Не ўдалося спраўдзіць подпіс: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "Збой спраўджання подпісу для ${ signatureType }"
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "Збой спраўджання подпісу для ${ signatureType }: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Збой запампоўвання некаторых байтаў файла"
+      ],
+      "Some file parts failed to upload": [
+        "Збой запампоўвання некаторых частак файла"
+      ],
+      "The node is not shared anymore": [
+        "Вузел больш не абагулены"
+      ],
+      "Thumbnail not found": [
+        "Мініяцюра не знойдзена"
+      ],
+      "Too many server errors, please try again later": [
+        "Занадта шмат памылак на серверы. Паўтарыце спробу пазней"
+      ],
+      "Too many server requests, please try again later": [
+        "Занадта шмат запытаў да сервера. Паўтарыце спробу пазней"
+      ],
+      "Unknown error": [
+        "Невядомая памылка"
+      ],
+      "Unknown error ${ code }": [
+        "Невядомая памылка ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Ключы спраўджання недаступны"
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Ключы спраўджання для ${ signatureType } недаступны"
+      ],
+      "You can leave only item that is shared with you": [
+        "Вы можаце пакінуць толькі элемент, які абагулены з вамі"
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "Аўтар не пазначаны ў публічнай спасылцы"
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "атрыбуты"
+      ],
+      "content key": [
+        "ключ змесціва"
+      ],
+      "hash key": [
+        "хэш-ключ"
+      ],
+      "key": [
+        "ключ"
+      ],
+      "membership": [
+        "членства"
+      ],
+      "name": [
+        "назва"
+      ]
+    }
+  }
+}
