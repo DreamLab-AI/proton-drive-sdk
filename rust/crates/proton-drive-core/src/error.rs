@@ -27,6 +27,11 @@ pub enum Error {
     #[error("node with same name already exists: {name}")]
     NodeWithSameNameExists { name: String },
 
+    /// Proton API `Code` 2011 (`NOT_ENOUGH_PERMISSIONS`) — see
+    /// `map_api_error` in `nodes.rs` for the wire-code taxonomy citation.
+    #[error("insufficient permissions: {0}")]
+    PermissionDenied(String),
+
     #[error("revision draft conflict")]
     RevisionDraftConflict,
 
