@@ -13,20 +13,31 @@
 //!
 //! | Secret | Storage |
 //! |---|---|
-//! | `refresh_token` + `key_password` | OS keyring (`pdtui-proton-drive`, UID as account) |
+//! | `refresh_token` + `key_password` | OS keyring when a native backend is compiled in and reachable (kernel keyutils session keyring on Linux, Keychain on macOS, Credential Manager on Windows), **falling back to a 0600 `session.secret.json` file** whenever the keyring write/read fails (no session keyring, headless host, keyring feature not compiled) |
 //! | `access_token` + `expires_at` | `session.json` (mode 0600) |
 //!
-//! On logout: keyring entry deleted, `session.json` truncated.
+//! The keyring write is always best-effort: the 0600 secret file is written
+//! unconditionally on every login/refresh and is the store `from_keyring`
+//! falls back to reading from, so it is the persistence path actually
+//! exercised whenever no native backend is reachable — not merely a rare
+//! contingency (ADR-0007, personal use only).
+//!
+//! On logout (or a confirmed-dead refresh, see [`SessionManagerError::SessionExpired`]):
+//! keyring entry deleted (best-effort), `session.secret.json` deleted,
+//! `session.json` truncated.
 //!
 //! # Backward compatibility
 //!
 //! The original [`Session`] struct is retained for `probe.rs` and `app.rs`
 //! which use it as a lightweight bearer-token container.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt as _;
+use futures::future::{BoxFuture, Shared};
 use proton_drive::{
     ProtonDriveHttpClient,
     http::{HttpMethod, JsonRequest},
@@ -67,6 +78,12 @@ pub enum SessionManagerError {
 
     #[error("no session stored in keyring for uid {0}")]
     NoKeyring(String),
+
+    /// Surfaced to a caller that coalesced onto another in-flight
+    /// `force_refresh` (see [`SessionManager::force_refresh`]) whose refresh
+    /// failed for a reason other than [`SessionManagerError::SessionExpired`].
+    #[error("refresh failed: {0}")]
+    Refresh(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -108,24 +125,53 @@ pub enum SessionError {
     Parse(#[from] serde_json::Error),
 }
 
-/// Per-process temp directory that session persistence is redirected to under
-/// `cfg(test)`, so unit tests never touch the developer's real session files.
+// Per-thread temp directory that session persistence is redirected to under
+// `cfg(test)`, so unit tests never touch the developer's real session files
+// *and* never race each other over the same file.
+//
+// This is `thread_local!`, not a single process-wide static: `cargo test`'s
+// default harness runs many test functions truly concurrently on different
+// OS threads (each `#[tokio::test]`'s `current_thread` runtime executes
+// entirely on the one worker thread libtest assigned it), and both
+// `session::tests` (this module) and `http::tests` (a different module in
+// the same crate, out of this work package's remit to modify) drive
+// `do_refresh`, which reads/writes/deletes these files. A single shared path
+// was previously keyed only by process ID — every concurrently-running test
+// thread in the process shared the exact same `session.json` /
+// `session.secret.json`, so one test's `delete_secret_file`/
+// `truncate_session_file`/`create_dir_all`+`write` sequence could race
+// another's and intermittently fail with a spurious I/O error (observed:
+// `session_aware_401_once_then_200` failing with "No such file or directory"
+// under concurrent test execution). Keying by thread ID as well gives every
+// concurrently-running test its own directory. The random suffix
+// additionally guards against PID reuse colliding with an unrelated
+// concurrent process sharing the same `$TMPDIR` (this environment runs
+// multiple worktree checkouts against a shared temp directory).
 #[cfg(test)]
-static TEST_CONFIG_DIR: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    let dir = std::env::temp_dir().join(format!("pdtui-test-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-});
+thread_local! {
+    static TEST_CONFIG_DIR: PathBuf = {
+        use rand::Rng as _;
+        let nonce: u64 = rand::thread_rng().r#gen();
+        let dir = std::env::temp_dir().join(format!(
+            "pdtui-test-{}-{:?}-{nonce:x}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    };
+}
 
 impl Session {
     pub fn config_path() -> PathBuf {
-        // In test builds, redirect all session persistence to a per-process
+        // In test builds, redirect all session persistence to a per-thread
         // temp directory. Unit tests exercise `do_refresh`/`from_login`, which
         // write the session + secret files; without this redirect they would
-        // clobber the developer's real `~/.config/pdtui/` session.
+        // clobber the developer's real `~/.config/pdtui/` session (and race
+        // each other — see `TEST_CONFIG_DIR` docs).
         #[cfg(test)]
         {
-            TEST_CONFIG_DIR.join("session.json")
+            TEST_CONFIG_DIR.with(|dir| dir.join("session.json"))
         }
         #[cfg(not(test))]
         {
@@ -140,9 +186,12 @@ impl Session {
     }
 
     /// Path to the 0600 secret-fallback file holding `refresh_token` +
-    /// `key_password`. Used when no OS secret store is available (e.g. headless
-    /// containers where the `keyring` crate degrades to an in-memory backend
-    /// that cannot persist across processes). Personal-use only (ADR-0007).
+    /// `key_password`. Written unconditionally on every login/refresh and
+    /// read whenever the OS keyring has no entry — this is the persistence
+    /// path that actually runs on any host with no reachable native
+    /// keyutils/Keychain/Credential-Manager backend (headless containers
+    /// with no session keyring, or a build with no keyring platform feature
+    /// enabled). Personal-use only (ADR-0007).
     pub fn secret_path() -> PathBuf {
         let mut p = Self::config_path();
         p.set_file_name("session.secret.json");
@@ -181,7 +230,18 @@ struct SessionFile {
     #[serde(rename = "AccessToken")]
     access_token: String,
     /// Unix timestamp (seconds) when the access token expires.
-    #[serde(rename = "ExpiresAt")]
+    ///
+    /// `#[serde(default)]` (-> `0`, i.e. already-expired) so a minimal,
+    /// hand-authored `session.json` — such as the one
+    /// `scripts/configure-session.sh` writes for the 2FA/`pdtui probe`
+    /// workaround, which only ever contains `AccessToken` + `UID` — still
+    /// deserializes instead of hard-failing with "missing field ExpiresAt".
+    /// Treating the missing field as already-expired is the safe default: it
+    /// makes `SessionManager::from_keyring` attempt an immediate refresh
+    /// rather than silently trusting an unknown expiry. See
+    /// `session_file_tolerates_missing_expires_at` below for the exact
+    /// script-output shape this must accept.
+    #[serde(rename = "ExpiresAt", default)]
     expires_at_unix: u64,
     #[serde(default = "default_app_version")]
     app_version: String,
@@ -349,6 +409,32 @@ fn load_session_file() -> Result<SessionFile, SessionManagerError> {
 }
 
 // ---------------------------------------------------------------------------
+// Server-supplied ExpiresIn (optional, deprecated-but-present on the wire)
+// ---------------------------------------------------------------------------
+
+/// Minimal local view of a `/core/v4/auth` or `/core/v4/auth/refresh` JSON
+/// body used solely to sniff the optional `ExpiresIn` (seconds) field.
+/// `proton_drive_api::auth::{AuthResponse, RefreshResponse}` do not carry it,
+/// so rather than extending those shared DTOs (outside this work package's
+/// `rust/apps/pdtui`-only remit) it is parsed directly from the raw body
+/// here. Unknown/extra top-level keys are ignored by serde by default.
+#[derive(Deserialize)]
+struct ExpiresInHint {
+    #[serde(rename = "ExpiresIn", default)]
+    expires_in: Option<u64>,
+}
+
+/// Extract a positive `ExpiresIn` (seconds) from a raw JSON response body, if
+/// present. Returns `None` on parse failure, a missing field, or a
+/// non-positive value (treated the same as absent).
+pub(crate) fn extract_expires_in_secs(body: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<ExpiresInHint>(body)
+        .ok()
+        .and_then(|hint| hint.expires_in)
+        .filter(|secs| *secs > 0)
+}
+
+// ---------------------------------------------------------------------------
 // SessionState
 // ---------------------------------------------------------------------------
 
@@ -373,8 +459,11 @@ pub(crate) struct SessionState {
 
 /// Issue `POST /core/v4/auth/refresh` and atomically replace session state.
 ///
-/// Returns [`SessionManagerError::SessionExpired`] on 401 or 422, clearing
-/// the keyring entry so the caller can detect the need to re-login.
+/// Returns [`SessionManagerError::SessionExpired`] on 401 or 422, scrubbing
+/// all three persistence layers (keyring entry, 0600 secret file,
+/// `session.json`) so the caller can detect the need to re-login and a
+/// confirmed-dead session cannot be silently resumed by a later
+/// `from_keyring()` call (mirrors [`SessionManager::logout`]).
 ///
 /// `pub(crate)` so `http.rs` tests can drive it directly.
 pub(crate) async fn do_refresh(
@@ -403,7 +492,18 @@ pub(crate) async fn do_refresh(
 
     if resp.status == 401 || resp.status == 422 {
         warn!(status = resp.status, "refresh rejected - session expired");
+        // Scrub every persistence layer, not just the (best-effort) keyring
+        // entry: the 0600 secret file and session.json are what actually
+        // survive process exit (see module docs), so leaving them untouched
+        // would let a later `from_keyring()` call resume with tokens the
+        // server has already rejected.
         let _ = delete_keyring(&state.uid); // best-effort
+        if let Err(e) = delete_secret_file() {
+            warn!("failed to delete secret file after session expiry: {e}");
+        }
+        if let Err(e) = truncate_session_file() {
+            warn!("failed to truncate session.json after session expiry: {e}");
+        }
         return Err(SessionManagerError::SessionExpired);
     }
 
@@ -421,9 +521,16 @@ pub(crate) async fn do_refresh(
     }
 
     let new_token = env.inner;
-    // Use 30 minutes as a conservative default; Proton does not currently
-    // return an ExpiresIn field in the refresh response.
-    let expires_at = Instant::now() + Duration::from_secs(30 * 60);
+    // Honour the server-supplied `ExpiresIn` (seconds) when present.
+    // reference/js/sdk/src/internal/apiService/coreTypes.ts documents
+    // `ExpiresIn?: number` (deprecated but present, e.g. on the
+    // `/core/v4/auth/refresh` 200 response) — `proton-drive-api`'s
+    // `RefreshResponse` DTO doesn't carry it (outside this work package's
+    // remit to extend), so it's sniffed directly from the raw body here.
+    // Fall back to the previous conservative 30-minute guess only when the
+    // field is absent or non-positive.
+    let expires_in_secs = extract_expires_in_secs(&resp.body).unwrap_or(30 * 60);
+    let expires_at = Instant::now() + Duration::from_secs(expires_in_secs);
 
     // Persist before updating in-memory state. Keyring is best-effort (it may
     // be an in-memory backend on headless hosts); the 0600 secret file is the
@@ -498,6 +605,52 @@ pub(crate) async fn proactive_refresh_loop(
 // SessionManager
 // ---------------------------------------------------------------------------
 
+/// Cloneable projection of a `do_refresh` outcome, used as the `Output` of
+/// the [`Shared`] future that coalesces concurrent [`SessionManager::force_refresh`]
+/// callers (`SessionManagerError` itself can't be `Clone`: several variants
+/// wrap non-`Clone` types like [`std::io::Error`]).
+#[derive(Clone)]
+enum SharedRefreshOutcome {
+    Ok,
+    SessionExpired,
+    Other(Arc<str>),
+}
+
+impl From<&SessionManagerError> for SharedRefreshOutcome {
+    fn from(e: &SessionManagerError) -> Self {
+        match e {
+            SessionManagerError::SessionExpired => SharedRefreshOutcome::SessionExpired,
+            other => SharedRefreshOutcome::Other(Arc::from(other.to_string())),
+        }
+    }
+}
+
+/// A single in-flight [`SessionManager::force_refresh`] refresh: the [`Shared`]
+/// future every coalescing caller awaits, alongside a [`Weak`] handle to the
+/// `SessionState` it belongs to (see [`REFRESH_COALESCE`] docs).
+type InFlightRefresh = (
+    Weak<RwLock<SessionState>>,
+    Shared<BoxFuture<'static, SharedRefreshOutcome>>,
+);
+
+/// Single-flight registry coalescing concurrent [`SessionManager::force_refresh`]
+/// callers into one in-flight `/core/v4/auth/refresh` request each, keyed by
+/// the identity (pointer address) of the session's `Arc<RwLock<SessionState>>`.
+/// A global static is used rather than a field on `SessionManager`/
+/// `SessionState` because both types are constructed via bare struct
+/// literals in `http.rs`'s test module, which this work package is not
+/// permitted to touch.
+///
+/// The map value also carries a [`Weak`] handle to the same `SessionState`
+/// so a lookup can confirm the entry really belongs to *this* live session,
+/// not a stale entry whose key happens to collide with a freed-and-reused
+/// address (the allocator can reuse an address once every strong `Arc` to
+/// it, including one held by an abandoned/never-driven-to-completion
+/// coalescing future, is gone). Without this check a collision could hand a
+/// caller someone else's in-flight refresh outcome.
+static REFRESH_COALESCE: LazyLock<StdMutex<HashMap<usize, InFlightRefresh>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
 /// Owns the session tuple, drives proactive refresh, and exposes auth headers.
 ///
 /// Construct via [`SessionManager::from_login`] or
@@ -516,8 +669,10 @@ impl SessionManager {
 
     /// Build a `SessionManager` from freshly-obtained credentials.
     ///
-    /// Persists `refresh_token + key_password` to the keyring and
-    /// `access_token + expiry` to `session.json`.
+    /// Persists `refresh_token + key_password` to the OS keyring
+    /// (best-effort — see module docs) and unconditionally to the 0600
+    /// `session.secret.json` fallback, and `access_token + expiry` to
+    /// `session.json`.
     ///
     /// Pass `expires_in_secs = 1800` if the server does not return an expiry.
     pub async fn from_login(
@@ -529,10 +684,11 @@ impl SessionManager {
         expires_in_secs: u64,
     ) -> Result<Self, SessionManagerError> {
         let expires_at = Instant::now() + Duration::from_secs(expires_in_secs);
-        // Best-effort keyring write. On headless hosts the `keyring` crate
-        // degrades to an in-memory backend that cannot persist across
-        // processes, so the 0600 secret file below is the authoritative
-        // fallback for `from_keyring` pickup (ADR-0007, personal use).
+        // Best-effort keyring write: even with a native backend compiled in,
+        // the write fails whenever there is no reachable session keyring
+        // (headless host) or no keyring platform feature was compiled in.
+        // The 0600 secret file below is the authoritative fallback
+        // `from_keyring` reads from in that case (ADR-0007).
         if let Err(e) = save_keyring(&uid, refresh_token.as_str(), key_password.as_str()) {
             warn!("keyring write failed ({e}); relying on 0600 secret-file fallback");
         }
@@ -548,15 +704,18 @@ impl SessionManager {
         Ok(Self::build(state, http))
     }
 
-    /// Resume a session by loading tokens from `session.json` and the OS
-    /// keyring.
+    /// Resume a session by loading `access_token` + expiry from
+    /// `session.json` and `refresh_token` + `key_password` from the OS
+    /// keyring, falling back to the 0600 secret file (see module docs).
     pub async fn from_keyring(
         http: Arc<dyn ProtonDriveHttpClient>,
     ) -> Result<Self, SessionManagerError> {
         let sf = load_session_file()?;
-        // Prefer the OS keyring; fall back to the 0600 secret file when the
-        // keyring has no entry (e.g. an in-memory backend on a headless host
-        // that did not survive the login process).
+        // Prefer the OS keyring; fall back to the 0600 secret file whenever
+        // the keyring has no entry — the normal case whenever there is no
+        // reachable native keyutils/Keychain/Credential-Manager backend
+        // (headless host with no session keyring, or a build with no
+        // keyring platform feature compiled in), not merely a rare edge case.
         let kp = match load_keyring(&sf.uid) {
             Ok(kp) => kp,
             Err(SessionManagerError::NoKeyring(_)) => load_secret_file(&sf.uid)?,
@@ -612,12 +771,69 @@ impl SessionManager {
 
     /// Force-refresh the access token (called on 401).
     ///
+    /// Concurrent callers on the same session are coalesced into a single
+    /// in-flight `/core/v4/auth/refresh` request: if a refresh is already
+    /// running when this is called, the caller awaits that refresh's result
+    /// instead of issuing a second one (parallel transfers that all 401
+    /// around the same moment must not each rotate the single-use refresh
+    /// token — see the WP5 audit finding on concurrent-401 coalescing).
+    ///
     /// Returns [`SessionManagerError::SessionExpired`] if the server rejects
     /// the refresh, after clearing the keyring.
     pub async fn force_refresh(&self) -> Result<(), SessionManagerError> {
-        debug!("force_refresh: acquiring write lock");
-        let mut guard = self.inner.write().await;
-        do_refresh(&mut guard, &*self.http).await
+        // Keyed by the `Arc<RwLock<SessionState>>` pointer identity so this
+        // manager's in-flight refresh is (ordinarily) never confused with
+        // another manager's; verified below via `Weak::upgrade` +
+        // `Arc::ptr_eq` against `self.inner` so an address collision with a
+        // stale entry can never be mistaken for a live match (see
+        // `REFRESH_COALESCE` docs).
+        let key = Arc::as_ptr(&self.inner) as usize;
+
+        let shared = {
+            let mut inflight = REFRESH_COALESCE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let existing = inflight.get(&key).and_then(|(weak, shared)| {
+                weak.upgrade()
+                    .filter(|arc| Arc::ptr_eq(arc, &self.inner))
+                    .map(|_| shared.clone())
+            });
+            if let Some(shared) = existing {
+                debug!("force_refresh: coalescing onto an in-flight refresh");
+                shared
+            } else {
+                let state = Arc::clone(&self.inner);
+                let http = Arc::clone(&self.http);
+                let fut: BoxFuture<'static, SharedRefreshOutcome> = Box::pin(async move {
+                    debug!("force_refresh: acquiring write lock");
+                    let mut guard = state.write().await;
+                    let result = do_refresh(&mut guard, &*http).await;
+                    drop(guard);
+                    // Remove our own entry now that the refresh has
+                    // completed (before the outcome becomes observable to
+                    // any awaiter — see `REFRESH_COALESCE` docs), so a later,
+                    // non-concurrent 401 starts a fresh single-flight group
+                    // instead of replaying this cached result forever.
+                    REFRESH_COALESCE
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&key);
+                    match &result {
+                        Ok(()) => SharedRefreshOutcome::Ok,
+                        Err(e) => SharedRefreshOutcome::from(e),
+                    }
+                });
+                let shared = fut.shared();
+                inflight.insert(key, (Arc::downgrade(&self.inner), shared.clone()));
+                shared
+            }
+        };
+
+        match shared.await {
+            SharedRefreshOutcome::Ok => Ok(()),
+            SharedRefreshOutcome::SessionExpired => Err(SessionManagerError::SessionExpired),
+            SharedRefreshOutcome::Other(msg) => Err(SessionManagerError::Refresh(msg.to_string())),
+        }
     }
 
     /// Return the key password for unlocking the user's PGP private key.
@@ -626,13 +842,20 @@ impl SessionManager {
         guard.key_password.clone()
     }
 
-    /// Delete the keyring entry, truncate `session.json`, and consume `self`.
+    /// Delete the keyring entry (best-effort), delete the 0600 secret file,
+    /// truncate `session.json`, and consume `self`.
     pub async fn logout(self) -> Result<(), SessionManagerError> {
         let uid = {
             let guard = self.inner.read().await;
             guard.uid.clone()
         };
-        delete_keyring(&uid)?;
+        // Best-effort, like everywhere else the keyring is touched: a native
+        // backend may be compiled in but unreachable (no session keyring on
+        // a headless host), and that must not prevent scrubbing the
+        // authoritative secret file + session.json below.
+        if let Err(e) = delete_keyring(&uid) {
+            warn!("keyring delete on logout failed ({e}); scrubbing secret-file fallback anyway");
+        }
         delete_secret_file()?;
         truncate_session_file()?;
         Ok(())
@@ -961,5 +1184,211 @@ mod tests {
         assert_eq!(back.uid, "uid-123");
         assert_eq!(back.access_token, "access-xyz");
         assert_eq!(back.expires_at_unix, 1_900_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2FA workaround (`scripts/configure-session.sh`) <-> `SessionFile`
+    // deserializer agreement.
+    //
+    // The script only ever writes `{"AccessToken": ..., "UID": ...}` (it
+    // cannot obtain `refresh_token`/`key_password` without a full SRP
+    // exchange). Before this fix, `SessionFile::expires_at_unix` had no
+    // `#[serde(default)]`, so `load_session_file` hard-failed with "missing
+    // field ExpiresAt" on exactly this shape instead of surfacing a clean
+    // "no session in keyring" error further down the resume path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_file_tolerates_missing_expires_at() {
+        // This literal must stay byte-for-byte in sync with the JSON heredoc
+        // `scripts/configure-session.sh` writes to session.json.
+        let script_output = r#"{
+  "AccessToken": "captured-access-token",
+  "UID": "captured-uid"
+}"#;
+        let sf: SessionFile = serde_json::from_str(script_output)
+            .expect("SessionFile must deserialize the script's minimal output, not hard-fail");
+        assert_eq!(sf.uid, "captured-uid");
+        assert_eq!(sf.access_token, "captured-access-token");
+        assert_eq!(
+            sf.expires_at_unix, 0,
+            "a missing ExpiresAt must default to 0 (already-expired), not panic or silently trust an unknown expiry"
+        );
+        // Defaults for the other back-compat fields still apply too.
+        assert_eq!(sf.base_url, "https://drive.proton.me/api");
+        assert!(sf.app_version.starts_with("external-drive-pdtui@"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionExpired scrubs every persistence layer, not just the keyring.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn session_expired_scrubs_secret_file_and_session_json() {
+        // Arrange: a prior successful login/refresh left both files behind.
+        save_secret_file("u1", "dead_refresh", "dead_key_password").expect("write secret file");
+        write_session_file(
+            "u1",
+            "dead_access",
+            Instant::now() + Duration::from_secs(1800),
+        )
+        .expect("write session file");
+        assert!(
+            Session::secret_path().exists(),
+            "precondition: secret file must exist before the expiry"
+        );
+        assert!(
+            Session::config_path().exists(),
+            "precondition: session.json must exist before the expiry"
+        );
+
+        let http = MockHttp::new(vec![(401, r#"{"Code":401,"Error":"Unauthorized"}"#)]);
+        let mut state = make_state(1800);
+        let result = do_refresh(&mut state, &http).await;
+        assert!(
+            matches!(result, Err(SessionManagerError::SessionExpired)),
+            "expected SessionExpired, got: {result:?}"
+        );
+
+        assert!(
+            !Session::secret_path().exists(),
+            "the 0600 secret file must be deleted on SessionExpired, mirroring logout()"
+        );
+        let remaining = std::fs::read(Session::config_path())
+            .expect("session.json must still exist (truncated), not deleted");
+        assert!(
+            remaining.is_empty(),
+            "session.json must be truncated on SessionExpired, not left with dead tokens"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent 401s coalesce into a single in-flight refresh.
+    // -----------------------------------------------------------------------
+
+    /// Mock transport that introduces a small delay before replying, so every
+    /// concurrently-spawned caller is guaranteed to have joined the same
+    /// single-flight group before the (one) refresh resolves.
+    struct SlowMockHttp {
+        call_count: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl SlowMockHttp {
+        fn new(delay: Duration) -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                delay,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for SlowMockHttp {
+        async fn request_json(&self, _req: JsonRequest) -> DriveResult<JsonResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            sleep(self.delay).await;
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body: Bytes::from(success_refresh_body().as_bytes().to_vec()),
+            })
+        }
+
+        async fn request_blob(&self, _req: BlobRequest) -> DriveResult<JsonResponse> {
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body: Bytes::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_401s_coalesce_into_single_refresh() {
+        let http = Arc::new(SlowMockHttp::new(Duration::from_millis(100)));
+        let manager = Arc::new(SessionManager::build(
+            make_state(1800),
+            Arc::clone(&http) as Arc<dyn ProtonDriveHttpClient>,
+        ));
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let mgr = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move { mgr.force_refresh().await }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("refresh task panicked");
+            assert!(
+                result.is_ok(),
+                "every coalesced caller must observe a successful refresh: {result:?}"
+            );
+        }
+
+        assert_eq!(
+            http.calls(),
+            1,
+            "{N} concurrent 401-triggered refreshes must coalesce into exactly one HTTP call"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-supplied ExpiresIn is honoured; 30 min is only the fallback.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_expires_in_secs_reads_positive_value() {
+        let body =
+            br#"{"Code":1000,"UID":"u1","AccessToken":"a","RefreshToken":"r","ExpiresIn":600}"#;
+        assert_eq!(extract_expires_in_secs(body), Some(600));
+    }
+
+    #[test]
+    fn extract_expires_in_secs_ignores_absent_or_non_positive() {
+        let absent = br#"{"Code":1000,"UID":"u1","AccessToken":"a","RefreshToken":"r"}"#;
+        assert_eq!(extract_expires_in_secs(absent), None);
+
+        let zero =
+            br#"{"Code":1000,"UID":"u1","AccessToken":"a","RefreshToken":"r","ExpiresIn":0}"#;
+        assert_eq!(extract_expires_in_secs(zero), None);
+    }
+
+    #[tokio::test]
+    async fn refresh_honours_server_expires_in() {
+        let body = r#"{"Code":1000,"UID":"u1","AccessToken":"new_access","RefreshToken":"new_refresh","ExpiresIn":90}"#;
+        let http = MockHttp::new(vec![(200, body)]);
+        let mut state = make_state(1800);
+
+        do_refresh(&mut state, &http)
+            .await
+            .expect("refresh should succeed");
+
+        let remaining = state.expires_at.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_secs(90) && remaining > Duration::from_secs(60),
+            "expires_at should reflect the server's ExpiresIn=90s, not the 30-minute fallback: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_falls_back_to_thirty_minutes_without_expires_in() {
+        let http = MockHttp::new(vec![(200, success_refresh_body())]);
+        let mut state = make_state(1800);
+
+        do_refresh(&mut state, &http)
+            .await
+            .expect("refresh should succeed");
+
+        let remaining = state.expires_at.saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::from_secs(29 * 60),
+            "with no ExpiresIn field, the 30-minute fallback must still apply: {remaining:?}"
+        );
     }
 }
