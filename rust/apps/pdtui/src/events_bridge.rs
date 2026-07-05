@@ -107,7 +107,10 @@ mod tests {
         listener
             .on_event(DriveEvent::Node(NodeEvent {
                 uid: uid(),
+                parent_uid: None,
                 kind: NodeEventKind::Created,
+                is_shared: false,
+                event_id: "e1".into(),
             }))
             .await;
 
@@ -124,6 +127,7 @@ mod tests {
         listener
             .on_event(DriveEvent::TreeRefresh(proton_drive::TreeRefreshEvent {
                 root: uid(),
+                new_event_id: "e1".into(),
             }))
             .await;
         assert!(rx.has_changed().unwrap());
@@ -170,11 +174,17 @@ mod tests {
         assert!(StaleOnRelevantEvent::is_relevant(&DriveEvent::Node(
             NodeEvent {
                 uid: uid(),
+                parent_uid: None,
                 kind: NodeEventKind::Updated,
+                is_shared: false,
+                event_id: "e0".into(),
             }
         )));
         assert!(StaleOnRelevantEvent::is_relevant(&DriveEvent::TreeRefresh(
-            proton_drive::TreeRefreshEvent { root: uid() }
+            proton_drive::TreeRefreshEvent {
+                root: uid(),
+                new_event_id: "e0".into(),
+            }
         )));
         assert!(StaleOnRelevantEvent::is_relevant(&DriveEvent::TreeRemoval(
             TreeRemovalEvent { root: uid() }
