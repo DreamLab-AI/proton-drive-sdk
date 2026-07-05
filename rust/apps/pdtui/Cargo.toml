@@ -24,7 +24,24 @@ async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 crossterm = "0.28"
-keyring = "3"
+
+# Real OS-native secret-store backends. Bare `keyring = "3"` has *no* default
+# feature group (see the vendored crate's own Cargo.toml `[features]` block):
+# with zero features enabled every platform silently falls back to the
+# crate's in-process `mock` store, which cannot persist across a process
+# restart. `linux-native` gives Linux the kernel keyutils retention service
+# (real, session-scoped, persists across processes) with no extra runtime
+# dependency — deliberately *not* `sync-secret-service`/D-Bus, which pulls in
+# `dbus-secret-service` -> `libdbus-sys`, a build-time dependency on the
+# system `libdbus-1-dev` + `pkg-config` that this dev/CI container does not
+# have (that combination fails to build here). `apple-native` gives
+# macOS/iOS Keychain, `windows-native` gives the Windows Credential Manager.
+# On hosts with no reachable native backend (e.g. no session keyring)
+# these calls fail at runtime and `session.rs` falls back to its 0600
+# secret-file store, which remains the persistence path of record
+# regardless of which keyring backend is compiled in (ADR-0007, personal
+# use).
+keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
 rand.workspace = true
 ratatui = "0.29"
 reqwest.workspace = true
