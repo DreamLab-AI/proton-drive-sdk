@@ -59,8 +59,18 @@ cargo build -p pdtui
   SKESK password session keys
 - ✅ M3: real `my_files_root` / `iter_folder_children` against the API
 - ✅ M4/M5: upload + download (byte-identical round-trip)
-- ✅ M6: event subscription (volume light-events v2 polling loop)
+- ✅ M6: event subscription (volume light-events v2 polling loop), wired into
+  `pdtui`'s remote pane (`apps/pdtui/src/events_bridge.rs`) with graceful
+  fallback to pull-on-focus refresh
 - ✅ M7: pdtui v0.1.0
 
-Known gaps: nested-file download (root-level only), and the items in the
-unaudited-MVP disclaimer above. See PRD §8 for the milestone table.
+Known gaps: uploading into a **nested** (non-root-parent) folder — the
+parent-hash-key resolution in `upload.rs::resolve_parent_context` only
+handles a share-root parent by design; nested-file **download** and listing
+are unaffected and live-verified at depth ≥ 3 against a 646 MB file. Core
+node-read/list calls still use the deprecated v1 share-scoped endpoints
+rather than the v2 volume-scoped ones the JS reference uses in production
+(functions today; flagged as a forward-compatibility risk). See
+[`../docs/IMPLEMENTATION-STATUS.md`](../docs/IMPLEMENTATION-STATUS.md) and
+[`../docs/audit-2026-07-05.md`](../docs/audit-2026-07-05.md) for detail, and
+PRD §8 for the milestone table.

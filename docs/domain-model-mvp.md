@@ -97,12 +97,15 @@ TUI                Transfer            Crypto            Client (Nodes)     Serv
  │                  │ get-revision ──────────────────────→ GET .../revision →│
  │                  │ ←──── { blocks[], content_key, manifest_sig, xattr }  │
  │                  │ decrypt content_key with node key ←─ Crypto           │
- │                  │ verify manifest signature                              │
+ │                  │ abort if manifest_sig is ABSENT (presence-only gate)   │
  │                  │ for each block (in order):                             │
  │                  │   GET bare_url ───────────────────────────────────────→│
  │                  │   assert hash matches                                  │
- │                  │   decrypt_and_verify → plaintext_i                     │
+ │                  │   decrypt (no per-block sig check — see ADR-0009)      │
  │                  │   write to async stream                                │
+ │                  │ verify manifest signature over all block hashes        │
+ │                  │   (present-but-invalid → signature_verified=false,     │
+ │                  │    data already delivered; matches JS)                 │
  │ ←── completed ───┤                  │                  │                  │
 ```
 
@@ -121,10 +124,10 @@ TUI                Transfer            Crypto            Client (Nodes)     Serv
 | File size ≤ 16 MiB for MVP | `FileUploader::upload_from_stream` checks `size_hint`; if `None`, accumulates and checks before commit |
 | Active revisions have at least one block | enforced by server, propagated as `Error::ProtocolViolation` if violated |
 | Block hash matches between client and server | per-block check after PUT response |
-| Manifest signature verifies on download | gates first block decryption |
-| Per-block signature verifies on decrypt | each block individually; one bad block fails the transfer |
+| Manifest signature *presence* gates download | a **missing** manifest signature aborts before any block is fetched; the cryptographic verification itself runs **after** all blocks are delivered (needs the full block-hash list), matching the JS SDK — see ADR-0009 |
+| Per-block ciphertext hash verifies on fetch | `sha256(ciphertext)` checked against the server-supplied `Hash` before decrypt; one mismatched block fails the transfer. Per-block *signatures* are deliberately never checked — see ADR-0009 / IMPLEMENTATION-STATUS.md B5 |
 
 ## What's still informal (no aggregate yet)
 
-- **Cache invalidation.** MemoryCache has no TTL. Upload invalidates by re-inserting the new Node, but cached folder listings get stale. For MVP: every TUI focus-change on the remote pane triggers a fresh `iter_folder_children`. Real cache coherence is a post-MVP concern.
-- **Events.** DTOs exist; no consumer wired. Folder listings are pull-only for MVP.
+- **Cache invalidation.** MemoryCache has no TTL. Upload invalidates by re-inserting the new Node, but cached folder listings get stale. TUI focus-change on the remote pane still triggers a fresh `iter_folder_children` as a fallback; a live drive-event now also marks the pane stale (see below). Real cache coherence is a post-MVP concern.
+- **Events.** A real consumer landed (`proton-drive-core::events::{drain_volume_events, spawn_volume_event_loop}`, exposed as `ProtonDriveClient::subscribe_drive_events`), and `pdtui` wires it into the remote pane (`apps/pdtui/src/events_bridge.rs`): a relevant drive event (node create/update/trash/restore/delete/rename, tree refresh, tree removal) flips a staleness flag the app checks once per redraw tick. Subscription failure degrades gracefully to the original pull-on-focus behaviour rather than erroring.

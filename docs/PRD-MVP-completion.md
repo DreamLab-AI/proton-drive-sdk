@@ -1,6 +1,12 @@
 # PRD — MVP Completion (log in → list → upload → download)
 
-**Status:** active. Supersedes M2-M7 of `PRD-rust-port-and-tui.md` for sequencing.
+**Status:** historical planning document — the milestones below (MA–MH) all
+shipped; kept for the sequencing rationale and mesh-agent file assignments.
+For **current** state, read `docs/IMPLEMENTATION-STATUS.md` and
+`docs/audit-2026-07-05.md` instead — in particular, the "Out of scope for
+MVP" events-sync line below is stale: M6 (events consumer + `pdtui` wiring)
+shipped after this PRD was written. Supersedes M2-M7 of
+`PRD-rust-port-and-tui.md` for sequencing.
 **Date opened:** 2026-05-28.
 **Acceptance:** the user can run `pdtui` against their own Proton Drive account, navigate the remote pane via SRP login, upload a small (<10 MiB) file, and download it back byte-identical.
 
@@ -19,7 +25,7 @@ Live SRP login confirmed end-to-end (`apps/pdtui/tests/auth_integration.rs` pass
 
 - Photos, sharing, public links (`internal/sharingPublic/`, `internal/photos/`)
 - Trash, restore, move/rename, copy
-- Events-driven sync (`internal/events/` — DTOs in place, no consumer wired)
+- ~~Events-driven sync (`internal/events/` — DTOs in place, no consumer wired)~~ — **shipped since this PRD was written**: see M6 in `docs/IMPLEMENTATION-STATUS.md`
 - AEAD-GCM / SEIPDv2 (per ADR-0006 — rejected at boundary)
 - Thumbnail generation/upload
 - Resumable upload, parallel block upload >4 in flight, retry orchestration

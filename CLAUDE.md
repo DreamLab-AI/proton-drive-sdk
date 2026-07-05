@@ -56,7 +56,13 @@ Moving `reference/cs` requires updating that path.
   `pgp` references outside `proton-drive-crypto` are a bug.
 - DTOs are JSON, not protobuf. The `reference/cs/sdk/src/protos/` files exist for
   C-ABI marshalling to kt/swift and as the Rust wire-type codegen source only.
-- No polling. Event subscription is the only sync mechanism.
+- No *ad hoc* polling of node/listing state outside the official Events API —
+  don't add a client that re-lists folders or re-fetches nodes on a timer.
+  Event subscription is the sync mechanism. The event-loop consumer's own
+  interval poll against the Events endpoint (`spawn_volume_event_loop`,
+  Fibonacci backoff) is a sanctioned exception, not a violation: it mirrors
+  the JS SDK's own `eventManager.ts` exactly, since Proton Drive has no
+  push/websocket transport for events (see `docs/audit-2026-07-05.md`).
 
 ## Operational constraints (apply to any Proton Drive client, including pdtui)
 - `x-pm-appversion` is `external-drive-pdtui@{semver}-stable`. Never spoof a
