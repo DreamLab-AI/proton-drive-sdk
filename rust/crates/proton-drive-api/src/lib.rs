@@ -488,6 +488,43 @@ pub mod upload {
         /// Only used for photos in the Photo volume; always `null` here.
         pub photo: Option<serde_json::Value>,
     }
+
+    /// `POST drive/v2/volumes/{volumeID}/delete_multiple` request body.
+    /// Mirrors JS `apiService.ts` `deleteDraft`'s `PostDeleteNodesRequest`
+    /// (`LinkIDsRequestDto`): a bare list of link ids to delete.
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct DeleteNodesRequest {
+        #[serde(rename = "LinkIDs")]
+        pub link_ids: Vec<String>,
+    }
+
+    /// `POST drive/v2/volumes/{volumeID}/delete_multiple` response —
+    /// `MultiResponsesPerLinkFactory` in the OpenAPI schema. The outer `Code`
+    /// is always the fixed multi-status marker `1001`; the real per-link
+    /// result lives in `Responses[i].Response.Code`. JS `deleteDraft` ignores
+    /// the outer code entirely and reads `response.Responses?.[0].Response.Code`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct DeleteNodesResponse {
+        pub responses: Vec<DeleteNodeResponseEntry>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct DeleteNodeResponseEntry {
+        #[serde(rename = "LinkID")]
+        pub link_id: String,
+        pub response: DeleteNodeResponseInner,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct DeleteNodeResponseInner {
+        pub code: u32,
+        #[serde(default)]
+        pub error: Option<String>,
+    }
 }
 
 pub mod download {
