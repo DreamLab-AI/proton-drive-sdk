@@ -1,0 +1,29 @@
+package me.proton.drive.sdk.internal
+
+import kotlinx.coroutines.CancellableContinuation
+import me.proton.drive.sdk.converter.AnyConverter
+import proton.drive.sdk.ProtonDriveSdk.Response.ResultCase.ERROR
+import proton.drive.sdk.ProtonDriveSdk.Response.ResultCase.RESULT_NOT_SET
+import proton.drive.sdk.ProtonDriveSdk.Response.ResultCase.VALUE
+import java.nio.ByteBuffer
+import kotlin.coroutines.Continuation
+
+class ContinuationValueOrNullResponse<T>(
+    continuation: CancellableContinuation<T?>,
+    private val anyConverter: AnyConverter<T>,
+) : BaseContinuationResponse<T?>(continuation) {
+    override fun invoke(data: ByteBuffer) = parse(data) { response ->
+        when (response.resultCase) {
+            VALUE -> {
+                if (response.value.typeUrl != anyConverter.typeUrl) {
+                    error("Wrong converter for ${response.value.typeUrl} (${anyConverter.typeUrl})")
+                }
+                anyConverter.convert(response.value)
+            }
+
+            RESULT_NOT_SET -> null
+            ERROR -> error(response.error)
+            null -> null
+        }
+    }
+}

@@ -1,0 +1,369 @@
+import { PrivateKey, SessionKey } from '../../crypto';
+import { AbortError, IntegrityError } from '../../errors';
+import { Logger, Thumbnail, ThumbnailType, UploadMetadata } from '../../interface';
+import { getErrorMessage } from '../errors';
+import { generateFileExtendedAttributes } from '../nodes';
+import { mergeUint8Arrays } from '../utils';
+import { SmallFileBlockVerifier } from './blockVerifier';
+import { UploadCryptoService } from './cryptoService';
+import { UploadDigests } from './digests';
+import { NodeCrypto } from './interface';
+import { UploadManager } from './manager';
+import { readStreamToUint8Array } from './streamReader';
+import { MAX_BLOCK_ENCRYPTION_RETRIES } from './streamUploader';
+import { UploadTelemetry } from './telemetry';
+
+export type NodeKeys = {
+    key: PrivateKey;
+    contentKeyPacket: Uint8Array<ArrayBuffer>;
+    contentKeyPacketSessionKey: SessionKey;
+    signingKeys: NodeCrypto['signingKeys'];
+};
+
+/**
+ * Base uploader for small file and small revision uploads.
+ * Shares the single-request flow: read content, get node crypto, encrypt, then call API.
+ */
+abstract class SmallUploader {
+    protected logger: Logger;
+    protected abortController: AbortController;
+
+    constructor(
+        protected telemetry: UploadTelemetry,
+        protected cryptoService: UploadCryptoService,
+        protected manager: UploadManager,
+        protected blockVerifier: SmallFileBlockVerifier,
+        protected metadata: UploadMetadata,
+        protected onFinish: () => void,
+        protected signal: AbortSignal | undefined,
+    ) {
+        this.logger = telemetry.getLoggerForSmallUpload();
+        this.abortController = new AbortController();
+    }
+
+    async upload(
+        stream: ReadableStream,
+        thumbnails: Thumbnail[],
+        onProgress?: (uploadedBytes: number) => void,
+    ): Promise<{ nodeRevisionUid: string; nodeUid: string }> {
+        try {
+            const result = await this.handleUpload(stream, thumbnails);
+
+            onProgress?.(this.metadata.expectedSize);
+            void this.telemetry.uploadFinished(result.nodeRevisionUid, this.metadata.expectedSize);
+            return result;
+        } catch (error) {
+            void this.telemetry.uploadInitFailed(this.getTelemetryContextUid(), error, this.metadata.expectedSize);
+            throw error;
+        } finally {
+            this.onFinish();
+        }
+    }
+
+    protected abstract getTelemetryContextUid(): string;
+
+    protected abstract handleUpload(
+        stream: ReadableStream,
+        thumbnails: Thumbnail[],
+    ): Promise<{
+        nodeUid: string;
+        nodeRevisionUid: string;
+    }>;
+
+    protected async buildPayloads(
+        nodeKeys: NodeKeys,
+        stream: ReadableStream,
+        thumbnails: Thumbnail[],
+    ): Promise<{
+        commitPayload: {
+            armoredManifestSignature: string;
+            armoredExtendedAttributes: string;
+            checksumVerified?: boolean;
+        };
+        encryptedBlock:
+            | {
+                  encryptedData: Uint8Array<ArrayBuffer>;
+                  armoredSignature: string;
+                  verificationToken: Uint8Array<ArrayBuffer>;
+              }
+            | undefined;
+        encryptedThumbnails: { type: ThumbnailType; encryptedData: Uint8Array<ArrayBuffer> }[];
+    }> {
+        const content = await this.readStreamContent(stream);
+
+        const [encryptedThumbnails, encryptedBlock] = await Promise.all([
+            this.encryptThumbnails(nodeKeys, thumbnails),
+            this.encryptContentBlock(nodeKeys, content.data),
+        ]);
+        const manifest = await this.getManifest(encryptedBlock, encryptedThumbnails);
+        const commitPayload = await this.encryptCommitPayload(nodeKeys, content.sha1, manifest);
+
+        return {
+            commitPayload,
+            encryptedBlock,
+            encryptedThumbnails,
+        };
+    }
+
+    private async readStreamContent(stream: ReadableStream): Promise<{
+        data: Uint8Array<ArrayBuffer>;
+        sha1: string;
+    }> {
+        const content = await readStreamToUint8Array(stream, this.abortController.signal);
+
+        if (content.length !== this.metadata.expectedSize) {
+            throw new IntegrityError(new Error('Stream size does not match expected size').message, {
+                actual: content.length,
+                expected: this.metadata.expectedSize,
+            });
+        }
+
+        const digests = new UploadDigests();
+        digests.update(content);
+        const contentSha1 = digests.digests().sha1;
+
+        if (this.metadata.expectedSha1 && contentSha1 !== this.metadata.expectedSha1) {
+            throw new IntegrityError(new Error('File hash does not match expected hash').message, {
+                uploadedSha1: contentSha1,
+                expectedSha1: this.metadata.expectedSha1,
+            });
+        }
+
+        return {
+            data: content,
+            sha1: contentSha1,
+        };
+    }
+
+    private async encryptThumbnails(
+        nodeKeys: NodeKeys,
+        thumbnails: Thumbnail[],
+    ): Promise<
+        {
+            type: ThumbnailType;
+            encryptedData: Uint8Array<ArrayBuffer>;
+            blockHash: Uint8Array<ArrayBuffer>;
+        }[]
+    > {
+        const result = [];
+        for (const thumbnail of thumbnails) {
+            if (thumbnail.thumbnail.length === 0) {
+                throw new Error(`Thumbnail content must not be empty`);
+            }
+            this.logger.debug(`Encrypting thumbnail ${thumbnail.type}`);
+            const enc = await this.cryptoService.encryptThumbnail(nodeKeys, thumbnail);
+            result.push({
+                type: thumbnail.type,
+                encryptedData: enc.encryptedData,
+                blockHash: await enc.hashPromise,
+            });
+        }
+        return result;
+    }
+
+    private async encryptContentBlock(
+        nodeKeys: NodeKeys,
+        content: Uint8Array<ArrayBuffer>,
+    ): Promise<
+        | {
+              encryptedData: Uint8Array<ArrayBuffer>;
+              armoredSignature: string;
+              verificationToken: Uint8Array<ArrayBuffer>;
+              blockHash: Uint8Array<ArrayBuffer>;
+          }
+        | undefined
+    > {
+        this.logger.debug(`Encrypting block`);
+
+        if (content.length === 0) {
+            return;
+        }
+
+        let attempt = 0;
+        let integrityError = false;
+        let encrypted;
+        while (!encrypted) {
+            attempt++;
+            try {
+                encrypted = await this.cryptoService.encryptBlock(
+                    (encryptedBlock) => this.blockVerifier.verifyBlock(encryptedBlock),
+                    nodeKeys,
+                    content,
+                    0,
+                );
+                if (integrityError) {
+                    void this.telemetry.logBlockVerificationError(this.getTelemetryContextUid(), true);
+                }
+            } catch (error: unknown) {
+                // Do not retry or report anything if the upload was aborted.
+                if (error instanceof AbortError) {
+                    throw error;
+                }
+
+                if (error instanceof IntegrityError) {
+                    integrityError = true;
+                }
+
+                if (attempt <= MAX_BLOCK_ENCRYPTION_RETRIES) {
+                    this.logger.warn(`Block encryption failed #${attempt}, retrying: ${getErrorMessage(error)}`);
+                    continue;
+                }
+
+                this.logger.error(`Failed to encrypt block`, error);
+                if (integrityError) {
+                    void this.telemetry.logBlockVerificationError(this.getTelemetryContextUid(), false);
+                }
+                throw error;
+            }
+        }
+
+        const blockHash = await encrypted.hashPromise;
+        return {
+            encryptedData: encrypted.encryptedData,
+            armoredSignature: encrypted.armoredSignature,
+            verificationToken: encrypted.verificationToken,
+            blockHash,
+        };
+    }
+
+    private async getManifest(
+        encryptedBlock:
+            | {
+                  blockHash: Uint8Array<ArrayBuffer>;
+              }
+            | undefined,
+        encryptedThumbnails: {
+            type: ThumbnailType;
+            blockHash: Uint8Array<ArrayBuffer>;
+        }[],
+    ): Promise<Uint8Array<ArrayBuffer>> {
+        encryptedThumbnails.sort((a, b) => a.type - b.type);
+        const hashes = [
+            ...(await Promise.all(encryptedThumbnails.map(({ blockHash }) => blockHash))),
+            ...(encryptedBlock ? [encryptedBlock.blockHash] : []),
+        ];
+        return mergeUint8Arrays(hashes);
+    }
+
+    private async encryptCommitPayload(
+        nodeKeys: NodeKeys,
+        contentSha1: string,
+        manifest: Uint8Array<ArrayBuffer>,
+    ): Promise<{
+        armoredManifestSignature: string;
+        armoredExtendedAttributes: string;
+        checksumVerified?: boolean;
+    }> {
+        this.logger.debug(`Preparing commit payload`);
+
+        const extendedAttributes = generateFileExtendedAttributes(
+            {
+                modificationTime: this.metadata.modificationTime,
+                size: this.metadata.expectedSize,
+                blockSizes: this.metadata.expectedSize > 0 ? [this.metadata.expectedSize] : [],
+                digests: { sha1: contentSha1 },
+            },
+            this.metadata.additionalMetadata,
+        );
+        const commitCrypto = await this.cryptoService.commitFile(nodeKeys, manifest, extendedAttributes);
+        return {
+            armoredManifestSignature: commitCrypto.armoredManifestSignature,
+            armoredExtendedAttributes: commitCrypto.armoredExtendedAttributes,
+            checksumVerified: !!(this.metadata.expectedSha1 && contentSha1 === this.metadata.expectedSha1),
+        };
+    }
+}
+
+/**
+ * Uploader for small new files using the single-request small file endpoint.
+ */
+export class SmallFileUploader extends SmallUploader {
+    constructor(
+        telemetry: UploadTelemetry,
+        cryptoService: UploadCryptoService,
+        manager: UploadManager,
+        blockVerifier: SmallFileBlockVerifier,
+        metadata: UploadMetadata,
+        onFinish: () => void,
+        signal: AbortSignal | undefined,
+        private parentFolderUid: string,
+        private name: string,
+    ) {
+        super(telemetry, cryptoService, manager, blockVerifier, metadata, onFinish, signal);
+        this.parentFolderUid = parentFolderUid;
+        this.name = name;
+    }
+
+    protected getTelemetryContextUid(): string {
+        return this.parentFolderUid;
+    }
+
+    protected async handleUpload(
+        stream: ReadableStream,
+        thumbnails: Thumbnail[],
+    ): Promise<{
+        nodeUid: string;
+        nodeRevisionUid: string;
+    }> {
+        const nodeCrypto = await this.manager.generateNewFileCrypto(this.parentFolderUid, this.name);
+        const nodeKeys = {
+            key: nodeCrypto.nodeKeys.decrypted.key,
+            contentKeyPacket: nodeCrypto.contentKey.encrypted.contentKeyPacket,
+            contentKeyPacketSessionKey: nodeCrypto.contentKey.decrypted.contentKeyPacketSessionKey,
+            signingKeys: nodeCrypto.signingKeys,
+        };
+        await this.blockVerifier.loadVerificationDataForNewSmallFile(nodeKeys.key, nodeKeys.contentKeyPacket);
+        const payloads = await this.buildPayloads(nodeKeys, stream, thumbnails);
+        return this.manager.uploadFile(
+            this.parentFolderUid,
+            nodeCrypto,
+            this.metadata,
+            payloads.commitPayload,
+            payloads.encryptedBlock,
+            payloads.encryptedThumbnails,
+        );
+    }
+}
+
+/**
+ * Uploader for small new revisions using the single-request small revision endpoint.
+ * Reuses the existing file's keys.
+ */
+export class SmallFileRevisionUploader extends SmallUploader {
+    constructor(
+        telemetry: UploadTelemetry,
+        cryptoService: UploadCryptoService,
+        manager: UploadManager,
+        blockVerifier: SmallFileBlockVerifier,
+        metadata: UploadMetadata,
+        onFinish: () => void,
+        signal: AbortSignal | undefined,
+        private nodeUid: string,
+    ) {
+        super(telemetry, cryptoService, manager, blockVerifier, metadata, onFinish, signal);
+        this.nodeUid = nodeUid;
+    }
+
+    protected getTelemetryContextUid(): string {
+        return this.nodeUid;
+    }
+
+    protected async handleUpload(
+        stream: ReadableStream,
+        thumbnails: Thumbnail[],
+    ): Promise<{
+        nodeUid: string;
+        nodeRevisionUid: string;
+    }> {
+        const nodeKeys = await this.manager.getExistingFileNodeCrypto(this.nodeUid);
+        await this.blockVerifier.loadVerificationDataForExistingSmallFile(this.nodeUid, nodeKeys.key);
+        const payloads = await this.buildPayloads(nodeKeys, stream, thumbnails);
+        return this.manager.uploadSmallRevision(
+            this.nodeUid,
+            nodeKeys,
+            payloads.commitPayload,
+            payloads.encryptedBlock,
+            payloads.encryptedThumbnails,
+        );
+    }
+}

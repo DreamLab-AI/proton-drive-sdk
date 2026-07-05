@@ -1,0 +1,447 @@
+import { MemoryCache } from './cache';
+import { getConfig } from './config';
+import { DriveCrypto, OpenPGPCrypto, PrivateKey, SessionKey, SRPModule } from './crypto';
+import { NullFeatureFlagProvider } from './featureFlags';
+import {
+    CachedCryptoMaterial,
+    FeatureFlagProvider,
+    FileDownloader,
+    FileUploader,
+    Logger,
+    MaybeMissingNode,
+    MemberRole,
+    NodeEntity,
+    NodeOrUid,
+    NodeResult,
+    NodeType,
+    ProtonDriveAccount,
+    ProtonDriveConfig,
+    ProtonDriveCryptoCache,
+    ProtonDriveEntitiesCache,
+    ProtonDriveHTTPClient,
+    ProtonDriveTelemetry,
+    ReportPublicLinkShareAbuseSettings,
+    SDKEvent,
+    ThumbnailResult,
+    ThumbnailType,
+    UploadMetadata,
+} from './interface';
+import { initDownloadModule } from './internal/download';
+import { SDKEvents } from './internal/sdkEvents';
+import { initSharingPublicModule, UnauthDriveAPIService } from './internal/sharingPublic';
+import { NodesSecurityScanResult } from './internal/sharingPublic/nodesSecurity';
+import { SharingPublicLinkSession } from './internal/sharingPublic/session';
+import { initUploadModule } from './internal/upload';
+import { Telemetry } from './telemetry';
+import {
+    convertInternalMissingNodeIterator,
+    convertInternalNodeIterator,
+    convertInternalNodePromise,
+    getUid,
+    getUids,
+} from './transformers';
+
+/**
+ * ProtonDrivePublicLinkClient is the interface for the public link client.
+ *
+ * The client provides high-level operations for managing nodes, and
+ * downloading/uploading files.
+ *
+ * Do not use this client direclty, use ProtonDriveClient instead.
+ * The main client handles public link sessions and provides access to
+ * public links.
+ *
+ * See `experimental.getPublicLinkInfo` and `experimental.authPublicLink`
+ * for more information.
+ */
+export class ProtonDrivePublicLinkClient {
+    private logger: Logger;
+    private sdkEvents: SDKEvents;
+    private sharingPublic: ReturnType<typeof initSharingPublicModule>;
+    private download: ReturnType<typeof initDownloadModule>;
+    private upload: ReturnType<typeof initUploadModule>;
+    private session: SharingPublicLinkSession;
+
+    public experimental: {
+        /**
+         * Experimental feature to return the URL of the node.
+         *
+         * Use it when you want to open the node in the ProtonDrive web app.
+         *
+         * It has hardcoded URLs to open in production client only.
+         */
+        getNodeUrl: (nodeUid: NodeOrUid) => Promise<string>;
+        /**
+         * Experimental feature to get the docs key for a node.
+         *
+         * This is used by Docs app to encrypt and decrypt document updates.
+         */
+        getDocsKey: (nodeUid: NodeOrUid) => Promise<SessionKey>;
+        /**
+         * Experimental feature to get the passphrase for a node.
+         *
+         * This is used by public link page to report abuse.
+         */
+        getNodePassphrase: (nodeUid: NodeOrUid) => Promise<string>;
+        /**
+         * Experimental feature to check if hashes match the malware database.
+         */
+        scanHashes: (hashes: string[]) => Promise<NodesSecurityScanResult>;
+        /**
+         * Experimental feature to create a document (Proton Docs or Proton Sheets) in the public link.
+         */
+        createDocument: (parentNodeUid: NodeOrUid, documentName: string, documentType: 1 | 2) => Promise<NodeEntity>;
+        /**
+         * Experimental feature to get the session info for the public link.
+         *
+         * This helper is used to set the session for metrics requests.
+         * Returns the session UID and access token that were obtained during
+         * authentication.
+         */
+        getSessionInfo: () => { uid: string; accessToken: string | undefined };
+    };
+
+    constructor({
+        httpClient,
+        account,
+        openPGPCryptoModule,
+        srpModule,
+        config,
+        telemetry,
+        featureFlagProvider,
+        url,
+        token,
+        publicShareKey,
+        publicSharePassphrase,
+        shareUrlPassword,
+        publicRootNodeUid,
+        isAnonymousContext,
+        publicRole,
+        session,
+        entitiesCache,
+        cryptoCache,
+    }: {
+        httpClient: ProtonDriveHTTPClient;
+        account: ProtonDriveAccount;
+        openPGPCryptoModule: OpenPGPCrypto;
+        srpModule: SRPModule;
+        config?: ProtonDriveConfig;
+        telemetry?: ProtonDriveTelemetry;
+        featureFlagProvider?: FeatureFlagProvider;
+        url: string;
+        token: string;
+        publicShareKey: PrivateKey;
+        publicSharePassphrase: string;
+        shareUrlPassword: string;
+        publicRootNodeUid: string;
+        isAnonymousContext: boolean;
+        publicRole: MemberRole;
+        session: SharingPublicLinkSession;
+        /**
+         * Optional caches to use instead of the default in-memory ones. Allows
+         * a caller to pre-seed crypto material (e.g. an import folder's root
+         * keys) before the client is used. Defaults to in-memory caches.
+         */
+        entitiesCache?: ProtonDriveEntitiesCache;
+        cryptoCache?: ProtonDriveCryptoCache;
+    }) {
+        if (!telemetry) {
+            telemetry = new Telemetry();
+        }
+        if (!featureFlagProvider) {
+            featureFlagProvider = new NullFeatureFlagProvider();
+        }
+        this.logger = telemetry.getLogger('publicLink-interface');
+        this.session = session;
+
+        // Default to in-memory caches for public links as there are no events
+        // to keep them up to date if persisted. A caller may pass its own cache
+        // instances to pre-seed crypto material before using the client.
+        const entitiesCacheInstance = entitiesCache ?? new MemoryCache<string>();
+        const cryptoCacheInstance = cryptoCache ?? new MemoryCache<CachedCryptoMaterial>();
+
+        const fullConfig = getConfig(config);
+        this.sdkEvents = new SDKEvents(telemetry);
+
+        const apiService = new UnauthDriveAPIService(
+            telemetry,
+            this.sdkEvents,
+            httpClient,
+            fullConfig.baseUrl,
+            fullConfig.language,
+        );
+        const cryptoModule = new DriveCrypto(telemetry, openPGPCryptoModule, srpModule);
+        this.sharingPublic = initSharingPublicModule(
+            telemetry,
+            apiService,
+            entitiesCacheInstance,
+            cryptoCacheInstance,
+            cryptoModule,
+            account,
+            url,
+            token,
+            publicShareKey,
+            publicSharePassphrase,
+            shareUrlPassword,
+            publicRootNodeUid,
+            publicRole,
+            isAnonymousContext,
+        );
+        this.download = initDownloadModule(
+            telemetry,
+            apiService,
+            cryptoModule,
+            account,
+            this.sharingPublic.shares,
+            this.sharingPublic.nodes.access,
+            this.sharingPublic.nodes.revisions,
+            // Ignore manifest integrity verifications for public links.
+            // Anonymous user on public page cannot load public keys of other users (yet).
+            true,
+        );
+        this.upload = initUploadModule(
+            telemetry,
+            apiService,
+            cryptoModule,
+            this.sharingPublic.shares,
+            this.sharingPublic.nodes.access,
+            featureFlagProvider,
+            fullConfig.clientUid,
+            // Public links do not support small file upload.
+            false,
+        );
+
+        this.experimental = {
+            getNodeUrl: async (nodeUid: NodeOrUid) => {
+                this.logger.debug(`Getting node URL for ${getUid(nodeUid)}`);
+                return this.sharingPublic.nodes.access.getNodeUrl(getUid(nodeUid));
+            },
+            getDocsKey: async (nodeUid: NodeOrUid) => {
+                this.logger.debug(`Getting docs keys for ${getUid(nodeUid)}`);
+                const keys = await this.sharingPublic.nodes.access.getNodeKeys(getUid(nodeUid));
+                if (!keys.contentKeyPacketSessionKey) {
+                    throw new Error('Node does not have a content key packet session key');
+                }
+                return keys.contentKeyPacketSessionKey;
+            },
+            getNodePassphrase: async (nodeUid: NodeOrUid) => {
+                this.logger.debug(`Getting node passphrase for ${getUid(nodeUid)}`);
+                const keys = await this.sharingPublic.nodes.access.getNodeKeys(getUid(nodeUid));
+                if (!keys.passphrase) {
+                    throw new Error('Node does not have a passphrase');
+                }
+                return keys.passphrase;
+            },
+            scanHashes: async (hashes: string[]): Promise<NodesSecurityScanResult> => {
+                this.logger.debug(`Scanning ${hashes.length} hashes`);
+                return this.sharingPublic.nodes.security.scanHashes(hashes);
+            },
+            createDocument: async (
+                parentNodeUid: NodeOrUid,
+                documentName: string,
+                documentType: 1 | 2,
+            ): Promise<NodeEntity> => {
+                this.logger.debug(`Creating document in ${getUid(parentNodeUid)}`);
+                return convertInternalNodePromise(
+                    this.sharingPublic.nodes.management.createDocument(
+                        getUid(parentNodeUid),
+                        documentName,
+                        documentType,
+                    ),
+                );
+            },
+            getSessionInfo: (): { uid: string; accessToken: string | undefined } => {
+                this.logger.debug(`Getting session info`);
+                return this.session.session;
+            },
+        };
+    }
+
+    /**
+     * Subscribes to the general SDK events.
+     *
+     * See `ProtonDriveClient.onMessage` for more information.
+     */
+    onMessage(eventName: SDKEvent, callback: () => void): () => void {
+        this.logger.debug(`Subscribing to event ${eventName}`);
+        return this.sdkEvents.addListener(eventName, callback);
+    }
+
+    /**
+     * @returns The root folder to the public link.
+     */
+    async getRootNode(): Promise<NodeEntity> {
+        this.logger.info(`Getting root node`);
+        const { rootNodeUid } = await this.sharingPublic.shares.getRootIDs();
+        return convertInternalNodePromise(this.sharingPublic.nodes.access.getNode(rootNodeUid));
+    }
+
+    /**
+     * Iterates the UIDs of the children of the given parent node.
+     *
+     * See `ProtonDriveClient.iterateFolderChildrenNodeUids` for more information.
+     */
+    async *iterateFolderChildrenNodeUids(
+        parentUid: NodeOrUid,
+        filterOptions?: { type?: NodeType },
+        signal?: AbortSignal,
+    ): AsyncGenerator<string> {
+        this.logger.info(`Iterating children of ${getUid(parentUid)}`);
+        yield* this.sharingPublic.nodes.access.iterateFolderChildrenNodeUids(getUid(parentUid), filterOptions, signal);
+    }
+
+    /**
+     * Iterates the children of the given parent node.
+     *
+     * See `ProtonDriveClient.iterateFolderChildren` for more information.
+     *
+     * @deprecated Use `iterateFolderChildrenNodeUids` instead.
+     */
+    async *iterateFolderChildren(
+        parentUid: NodeOrUid,
+        filterOptions?: { type?: NodeType },
+        signal?: AbortSignal,
+    ): AsyncGenerator<NodeEntity> {
+        this.logger.info(`Iterating children of ${getUid(parentUid)}`);
+        yield* convertInternalNodeIterator(
+            this.sharingPublic.nodes.access.iterateFolderChildren(getUid(parentUid), filterOptions, signal),
+        );
+    }
+
+    /**
+     * Iterates the nodes by their UIDs.
+     *
+     * See `ProtonDriveClient.iterateNodes` for more information.
+     */
+    async *iterateNodes(nodeUids: NodeOrUid[], signal?: AbortSignal): AsyncGenerator<MaybeMissingNode> {
+        this.logger.info(`Iterating ${nodeUids.length} nodes`);
+        yield* convertInternalMissingNodeIterator(
+            this.sharingPublic.nodes.access.iterateNodes(getUids(nodeUids), signal),
+        );
+    }
+
+    /**
+     * Get the node by its UID.
+     *
+     * See `ProtonDriveClient.getNode` for more information.
+     */
+    async getNode(nodeUid: NodeOrUid): Promise<NodeEntity> {
+        this.logger.info(`Getting node ${getUid(nodeUid)}`);
+        return convertInternalNodePromise(this.sharingPublic.nodes.access.getNode(getUid(nodeUid)));
+    }
+
+    /**
+     * Rename the node.
+     *
+     * See `ProtonDriveClient.renameNode` for more information.
+     */
+    async renameNode(nodeUid: NodeOrUid, newName: string): Promise<NodeEntity> {
+        this.logger.info(`Renaming node ${getUid(nodeUid)}`);
+        return convertInternalNodePromise(this.sharingPublic.nodes.management.renameNode(getUid(nodeUid), newName));
+    }
+
+    /**
+     * Delete own nodes permanently. It skips the trash and allows to delete
+     * only nodes that are owned by the user. For anonymous files, this method
+     * allows to delete them only in the same session.
+     *
+     * See `ProtonDriveClient.deleteNodes` for more information.
+     */
+    async *deleteNodes(nodeUids: NodeOrUid[], signal?: AbortSignal): AsyncGenerator<NodeResult> {
+        this.logger.info(`Deleting ${nodeUids.length} nodes`);
+        yield* this.sharingPublic.nodes.management.deleteMyNodes(getUids(nodeUids), signal);
+    }
+
+    /**
+     * Create a new folder.
+     *
+     * See `ProtonDriveClient.createFolder` for more information.
+     */
+    async createFolder(parentNodeUid: NodeOrUid, name: string, modificationTime?: Date): Promise<NodeEntity> {
+        this.logger.info(`Creating folder in ${getUid(parentNodeUid)}`);
+        return convertInternalNodePromise(
+            this.sharingPublic.nodes.management.createFolder(getUid(parentNodeUid), name, modificationTime),
+        );
+    }
+
+    /**
+     * Get the file downloader to download the node content.
+     *
+     * See `ProtonDriveClient.getFileDownloader` for more information.
+     */
+    async getFileDownloader(nodeUid: NodeOrUid, signal?: AbortSignal): Promise<FileDownloader> {
+        this.logger.info(`Getting file downloader for ${getUid(nodeUid)}`);
+        return this.download.getFileDownloader(getUid(nodeUid), signal);
+    }
+
+    /**
+     * Iterates the thumbnails of the given nodes.
+     *
+     * See `ProtonDriveClient.iterateThumbnails` for more information.
+     */
+    async *iterateThumbnails(
+        nodeUids: NodeOrUid[],
+        thumbnailType?: ThumbnailType,
+        signal?: AbortSignal,
+    ): AsyncGenerator<ThumbnailResult> {
+        this.logger.info(`Iterating ${nodeUids.length} thumbnails`);
+        yield* this.download.iterateThumbnails(getUids(nodeUids), thumbnailType, signal);
+    }
+
+    /**
+     * Get the file uploader to upload a new file. For uploading a new
+     * revision, use `getFileRevisionUploader` instead.
+     *
+     * See `ProtonDriveClient.getFileUploader` for more information.
+     */
+    async getFileUploader(
+        parentFolderUid: NodeOrUid,
+        name: string,
+        metadata: UploadMetadata,
+        signal?: AbortSignal,
+    ): Promise<FileUploader> {
+        this.logger.info(`Getting file uploader for parent ${getUid(parentFolderUid)}`);
+        return this.upload.getFileUploader(getUid(parentFolderUid), name, metadata, signal);
+    }
+
+    /**
+     * Same as `getFileUploader`, but for a uploading new revision of the file.
+     *
+     * See `ProtonDriveClient.getFileRevisionUploader` for more information.
+     */
+    async getFileRevisionUploader(
+        nodeUid: NodeOrUid,
+        metadata: UploadMetadata,
+        signal?: AbortSignal,
+    ): Promise<FileUploader> {
+        this.logger.info(`Getting file revision uploader for ${getUid(nodeUid)}`);
+        return this.upload.getFileRevisionUploader(getUid(nodeUid), metadata, signal);
+    }
+
+    /**
+     * Returns the available name for the file in the given parent folder.
+     *
+     * The function will return a name that includes the original name with the
+     * available index. The name is guaranteed to be unique in the parent folder.
+     *
+     * Example new name: `file (2).txt`.
+     */
+    async getAvailableName(parentFolderUid: NodeOrUid, name: string): Promise<string> {
+        this.logger.info(`Getting available name in folder ${getUid(parentFolderUid)}`);
+        return this.sharingPublic.nodes.management.findAvailableName(getUid(parentFolderUid), name);
+    }
+
+    /**
+     * Report the public link share for abuse.
+     *
+     * This reports a share (or a specific node and revision within it) that
+     * the caller is accessing via a public link. The `bonaFide` flag must be
+     * explicitly set to `true` as a legal acknowledgment per DSA requirements.
+     *
+     * @param settings - Report details including category and optional message.
+     */
+    async reportAbuse(settings: ReportPublicLinkShareAbuseSettings): Promise<void> {
+        this.logger.info('Reporting abuse for public link share');
+        await this.sharingPublic.reporting.reportAbuse(settings);
+    }
+}

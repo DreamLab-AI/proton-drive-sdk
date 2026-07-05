@@ -1,4 +1,4 @@
-//! Telemetry sink trait. Mirrors `js/sdk/src/interface/telemetry.ts`.
+//! Telemetry sink trait. Mirrors `client/js/src/interface/telemetry.ts`.
 //!
 //! Variants chosen to cover what the JS SDK actually emits — the `pdtui`
 //! impl is `NullTelemetry` (drops everything) for personal use.

@@ -1,0 +1,1305 @@
+import { ValidationError } from '../../errors';
+import {
+    AbuseCategory,
+    Logger,
+    Member,
+    MemberRole,
+    NonProtonInvitation,
+    NonProtonInvitationState,
+    ProtonDriveAccount,
+    ProtonInvitation,
+    PublicLink,
+    resultOk,
+} from '../../interface';
+import { getMockLogger } from '../../tests/logger';
+import { ErrorCode } from '../apiService';
+import { SharingAPIService } from './apiService';
+import { SharingCache } from './cache';
+import { SharingCryptoService } from './cryptoService';
+import { NodesService, SharesService } from './interface';
+import { SharingManagement } from './sharingManagement';
+
+const DEFAULT_SHARE_ID = 'shareId';
+
+describe('SharingManagement', () => {
+    let logger: Logger;
+    let apiService: SharingAPIService;
+    let cache: SharingCache;
+    let cryptoService: SharingCryptoService;
+    let accountService: ProtonDriveAccount;
+    let sharesService: SharesService;
+    let nodesService: NodesService;
+
+    let sharingManagement: SharingManagement;
+
+    beforeEach(() => {
+        logger = getMockLogger();
+
+        // @ts-expect-error No need to implement all methods for mocking
+        apiService = {
+            createStandardShare: jest.fn().mockReturnValue({ shareId: 'newShareId', editorsCanShare: false }),
+            getShareInvitations: jest.fn().mockResolvedValue([]),
+            getShareExternalInvitations: jest.fn().mockResolvedValue([]),
+            getShareMembers: jest.fn().mockResolvedValue([]),
+            inviteProtonUser: jest.fn().mockImplementation((_, invitation) => ({
+                ...invitation,
+                uid: 'created-invitation',
+            })),
+            updateInvitation: jest.fn(),
+            deleteInvitation: jest.fn(),
+            inviteExternalUser: jest.fn().mockImplementation((_, invitation) => ({
+                ...invitation,
+                uid: 'created-external-invitation',
+                state: NonProtonInvitationState.Pending,
+            })),
+            updateExternalInvitation: jest.fn(),
+            deleteExternalInvitation: jest.fn(),
+            updateMember: jest.fn(),
+            removeMember: jest.fn(),
+            getPublicLink: jest.fn().mockResolvedValue(undefined),
+            removePublicLink: jest.fn(),
+            deleteShare: jest.fn(),
+            resendInvitationEmail: jest.fn(),
+            resendExternalInvitationEmail: jest.fn(),
+            createPublicLink: jest.fn().mockResolvedValue({
+                uid: 'publicLinkUid',
+                publicUrl: 'publicLinkUrl',
+            }),
+            updatePublicLink: jest.fn(),
+            changeShareProperties: jest.fn(),
+        };
+        // @ts-expect-error No need to implement all methods for mocking
+        cache = {
+            hasSharedByMeNodeUidsLoaded: jest.fn().mockResolvedValue(true),
+            addSharedByMeNodeUid: jest.fn(),
+            removeSharedByMeNodeUid: jest.fn(),
+        };
+        // @ts-expect-error No need to implement all methods for mocking
+        cryptoService = {
+            generateShareKeys: jest.fn().mockResolvedValue({
+                shareKey: { encrypted: 'encrypted-key', decrypted: { passphraseSessionKey: 'pass-session-key' } },
+            }),
+            decryptShare: jest.fn().mockImplementation((share) => ({
+                passphraseSessionKey: share.passphraseSessionKey,
+            })),
+            decryptInvitation: jest.fn().mockImplementation((invitation) => invitation),
+            decryptExternalInvitation: jest.fn().mockImplementation((invitation) => invitation),
+            decryptMember: jest.fn().mockImplementation((member) => member),
+            encryptInvitation: jest.fn().mockImplementation(() => {}),
+            encryptExternalInvitation: jest.fn().mockImplementation((invitation) => ({
+                ...invitation,
+                base64ExternalInvitationSignature: 'external-signature',
+            })),
+            decryptPublicLink: jest.fn().mockImplementation((publicLink) => publicLink),
+            generatePublicLinkPassword: jest.fn().mockResolvedValue('generatedPassword'),
+            encryptPublicLink: jest.fn().mockImplementation(() => ({
+                crypto: 'publicLinkCrypto',
+                srp: 'publicLinkSrp',
+            })),
+        };
+        // @ts-expect-error No need to implement all methods for mocking
+        accountService = {
+            hasProtonAccount: jest.fn().mockResolvedValue(true),
+        };
+        // @ts-expect-error No need to implement all methods for mocking
+        sharesService = {
+            loadEncryptedShare: jest.fn().mockResolvedValue({
+                id: DEFAULT_SHARE_ID,
+                addressId: 'addressId',
+                creatorEmail: 'address@example.com',
+                passphraseSessionKey: 'sharePassphraseSessionKey',
+            }),
+            getRootIDs: jest.fn().mockResolvedValue({ volumeId: 'volumeId' }),
+        };
+        // @ts-expect-error No need to implement all methods for mocking
+        nodesService = {
+            getNode: jest.fn().mockImplementation((nodeUid) => ({
+                nodeUid,
+                shareId: DEFAULT_SHARE_ID,
+                name: { ok: true, value: 'name' },
+            })),
+            getNodeKeys: jest.fn().mockImplementation((nodeUid) => ({ key: 'node-key' })),
+            getNodePrivateAndSessionKeys: jest.fn().mockImplementation((nodeUid) => ({})),
+            getRootNode: jest.fn().mockImplementation((nodeUid) => Promise.resolve({ uid: nodeUid, shareId: DEFAULT_SHARE_ID })),
+            getRootNodeEmailKey: jest.fn().mockResolvedValue({ email: 'volume-email', addressKey: 'volume-key' }),
+            notifyNodeChanged: jest.fn(),
+        };
+
+        sharingManagement = new SharingManagement(
+            logger,
+            apiService,
+            cache,
+            cryptoService,
+            accountService,
+            sharesService,
+            nodesService,
+        );
+    });
+
+    describe('getSharingInfo', () => {
+        it('should return empty sharing info for unshared node', async () => {
+            nodesService.getNode = jest.fn().mockResolvedValue({ nodeUid: 'nodeUid', shareId: undefined });
+            const sharingInfo = await sharingManagement.getSharingInfo('nodeUid');
+
+            expect(sharingInfo).toEqual(undefined);
+            expect(apiService.getShareInvitations).not.toHaveBeenCalled();
+            expect(apiService.getShareExternalInvitations).not.toHaveBeenCalled();
+            expect(apiService.getShareMembers).not.toHaveBeenCalled();
+        });
+
+        it('should return invitations', async () => {
+            const invitation = { uid: 'invitaiton', addedByEmail: 'email' };
+            apiService.getShareInvitations = jest.fn().mockResolvedValue([invitation]);
+
+            const sharingInfo = await sharingManagement.getSharingInfo('volumeId~nodeUid');
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [invitation],
+                nonProtonInvitations: [],
+                members: [],
+                publicLink: undefined,
+            });
+            expect(cryptoService.decryptInvitation).toHaveBeenCalledWith(invitation);
+        });
+
+        it('should return external invitations', async () => {
+            const externalInvitation = { uid: 'external-invitation', addedByEmail: 'email' };
+            apiService.getShareExternalInvitations = jest.fn().mockResolvedValue([externalInvitation]);
+
+            const sharingInfo = await sharingManagement.getSharingInfo('volumeId~nodeUid');
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [],
+                nonProtonInvitations: [externalInvitation],
+                members: [],
+                publicLink: undefined,
+            });
+            expect(cryptoService.decryptExternalInvitation).toHaveBeenCalledWith(
+                externalInvitation,
+                'sharePassphraseSessionKey',
+            );
+        });
+
+        it('should return members', async () => {
+            const member = { uid: 'member', addedByEmail: 'email' };
+            apiService.getShareMembers = jest.fn().mockResolvedValue([member]);
+
+            const sharingInfo = await sharingManagement.getSharingInfo('volumeId~nodeUid');
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [],
+                nonProtonInvitations: [],
+                members: [member],
+                publicLink: undefined,
+            });
+            expect(cryptoService.decryptMember).toHaveBeenCalledWith(member);
+        });
+
+        it('should return public link', async () => {
+            const publicLink = {
+                uid: 'shared~publicLink',
+            };
+            apiService.getPublicLink = jest.fn().mockResolvedValue(publicLink);
+
+            const sharingInfo = await sharingManagement.getSharingInfo('volumeId~nodeUid');
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [],
+                nonProtonInvitations: [],
+                members: [],
+                publicLink: publicLink,
+            });
+            expect(cryptoService.decryptPublicLink).toHaveBeenCalledWith(publicLink);
+        });
+
+        it('should NOT return public link when volume ID does not match', async () => {
+            apiService.getPublicLink = jest.fn().mockResolvedValue(null);
+            const sharingInfo = await sharingManagement.getSharingInfo('zolumeId~nodeUid');
+            expect(sharingInfo).toEqual({
+                protonInvitations: [],
+                nonProtonInvitations: [],
+                members: [],
+                publicLink: undefined,
+            });
+            expect(apiService.getPublicLink).not.toHaveBeenCalled();
+            expect(cryptoService.decryptPublicLink).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('shareNode with share creation', () => {
+        const nodeUid = 'volumeId~nodeUid';
+
+        it('should create share if no exists', async () => {
+            nodesService.getNode = jest.fn().mockImplementation((nodeUid) => ({
+                nodeUid,
+                parentUid: 'parentUid',
+                name: { ok: true, value: 'name' },
+            }));
+            nodesService.notifyNodeChanged = jest.fn();
+
+            const sharingInfo = await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [
+                    {
+                        uid: 'created-invitation',
+                        addedByEmail: { ok: true, value: 'volume-email' },
+                        inviteeEmail: 'email',
+                        role: 'viewer',
+                    },
+                ],
+                nonProtonInvitations: [],
+                members: [],
+                publicLink: undefined,
+                editorsCanShare: false,
+            });
+            expect(apiService.updateInvitation).not.toHaveBeenCalled();
+            expect(apiService.inviteProtonUser).toHaveBeenCalled();
+            expect(nodesService.notifyNodeChanged).toHaveBeenCalledWith(nodeUid);
+            expect(cache.addSharedByMeNodeUid).toHaveBeenCalledWith(nodeUid);
+        });
+
+        it('should refresh node info if share already exists', async () => {
+            nodesService.getNode = jest
+                .fn()
+                .mockImplementationOnce((nodeUid) => ({
+                    nodeUid,
+                    parentUid: 'parentUid',
+                    name: { ok: true, value: 'name' },
+                }))
+                .mockImplementation((nodeUid) => ({
+                    nodeUid,
+                    shareId: 'shareId',
+                    parentUid: 'parentUid',
+                    name: { ok: true, value: 'name' },
+                }));
+            apiService.createStandardShare = jest
+                .fn()
+                .mockRejectedValue(new ValidationError('Share already exists', ErrorCode.ALREADY_EXISTS));
+
+            const sharingInfo = await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [
+                    {
+                        uid: 'created-invitation',
+                        addedByEmail: { ok: true, value: 'volume-email' },
+                        inviteeEmail: 'email',
+                        role: 'viewer',
+                    },
+                ],
+                nonProtonInvitations: [],
+                members: [],
+                publicLink: undefined,
+            });
+
+            expect(nodesService.notifyNodeChanged).toHaveBeenCalledWith(nodeUid);
+            expect(logger.debug).toHaveBeenCalledWith(
+                'Share already exists for node volumeId~nodeUid, refreshing node',
+            );
+            expect(apiService.inviteProtonUser).toHaveBeenCalledWith(
+                'shareId',
+                {
+                    addedByEmail: 'volume-email',
+                    inviteeEmail: 'email',
+                    role: 'viewer',
+                },
+                {
+                    message: undefined,
+                    nodeName: undefined,
+                },
+            );
+        });
+    });
+
+    describe('shareNode with share re-use', () => {
+        const nodeUid = 'volumeId~nodeUid';
+
+        let invitation: ProtonInvitation;
+        let externalInvitation: NonProtonInvitation;
+        let member: Member;
+
+        beforeEach(async () => {
+            invitation = {
+                uid: 'invitation',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'internal-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+            };
+            externalInvitation = {
+                uid: 'external-invitation',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'external-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+                state: NonProtonInvitationState.Pending,
+            };
+            member = {
+                uid: 'member',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'member-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+            };
+
+            apiService.getShareInvitations = jest.fn().mockResolvedValue([invitation]);
+
+            apiService.getShareExternalInvitations = jest.fn().mockResolvedValue([externalInvitation]);
+
+            apiService.getShareMembers = jest.fn().mockResolvedValue([member]);
+        });
+
+        describe('invitations', () => {
+            beforeEach(() => {
+                accountService.hasProtonAccount = jest.fn().mockResolvedValue(true);
+            });
+
+            it('should share node with proton email with default role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [
+                        invitation,
+                        {
+                            uid: 'created-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email',
+                            role: 'viewer',
+                        },
+                    ],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should share node with proton email with specific role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [
+                        invitation,
+                        {
+                            uid: 'created-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email',
+                            role: 'editor',
+                        },
+                    ],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should update existing role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'internal-email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [
+                        {
+                            ...invitation,
+                            role: 'editor',
+                        },
+                    ],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateInvitation).toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should update editorsCanChange', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    editorsCanShare: true,
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [
+                        {
+                            ...invitation,
+                            role: 'viewer',
+                        },
+                    ],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                    editorsCanShare: true,
+                });
+                expect(apiService.changeShareProperties).toHaveBeenCalledWith(DEFAULT_SHARE_ID, {
+                    editorsCanShare: true,
+                });
+            });
+
+            it('should be no-op if no change', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'internal-email', role: MemberRole.Viewer }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should use address from the root node context share', async () => {
+                nodesService.getRootNodeEmailKey = jest
+                    .fn()
+                    .mockResolvedValue({ email: 'my-volume-email', addressKey: 'my-volume-key' });
+
+                await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+                expect(apiService.inviteProtonUser).toHaveBeenCalledWith(
+                    'shareId',
+                    {
+                        addedByEmail: 'my-volume-email',
+                        inviteeEmail: 'email',
+                        role: 'viewer',
+                    },
+                    expect.anything(),
+                );
+            });
+        });
+
+        describe('external invitations', () => {
+            beforeEach(() => {
+                accountService.hasProtonAccount = jest.fn().mockResolvedValue(false);
+            });
+
+            it('should share node with external email with default role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [
+                        externalInvitation,
+                        {
+                            uid: 'created-external-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email',
+                            role: 'viewer',
+                            state: 'pending',
+                        },
+                    ],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateExternalInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteExternalUser).toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should share node with external email with specific role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [
+                        externalInvitation,
+                        {
+                            uid: 'created-external-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email',
+                            role: 'editor',
+                            state: 'pending',
+                        },
+                    ],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateExternalInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteExternalUser).toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should update existing role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'external-email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [
+                        {
+                            ...externalInvitation,
+                            role: 'editor',
+                        },
+                    ],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateExternalInvitation).toHaveBeenCalled();
+                expect(apiService.inviteExternalUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should be no-op if no change', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'external-email', role: MemberRole.Viewer }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateExternalInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteExternalUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should use address from the root node context share', async () => {
+                nodesService.getRootNodeEmailKey = jest.fn().mockResolvedValue({
+                    email: 'my-volume-email',
+                    addressId: 'my-volume-addressId',
+                    addressKey: 'my-volume-key',
+                });
+
+                await sharingManagement.shareNode(nodeUid, { users: ['email'] });
+
+                expect(apiService.inviteExternalUser).toHaveBeenCalledWith(
+                    'shareId',
+                    {
+                        inviterAddressId: 'my-volume-addressId',
+                        inviteeEmail: 'email',
+                        role: 'viewer',
+                        base64Signature: 'external-signature',
+                    },
+                    expect.anything(),
+                );
+            });
+        });
+
+        describe('mix of internal and external invitations', () => {
+            beforeEach(() => {
+                accountService.hasProtonAccount = jest.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+            });
+
+            it('should share node with proton and external email with default role', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, { users: ['email', 'email2'] });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [
+                        invitation,
+                        {
+                            uid: 'created-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email',
+                            role: 'viewer',
+                        },
+                    ],
+                    nonProtonInvitations: [
+                        externalInvitation,
+                        {
+                            uid: 'created-external-invitation',
+                            addedByEmail: { ok: true, value: 'volume-email' },
+                            inviteeEmail: 'email2',
+                            role: 'viewer',
+                            state: 'pending',
+                        },
+                    ],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).toHaveBeenCalledWith(
+                    'shareId',
+                    expect.objectContaining({
+                        inviteeEmail: 'email',
+                    }),
+                    expect.anything(),
+                );
+                expect(apiService.inviteExternalUser).toHaveBeenCalledWith(
+                    'shareId',
+                    expect.objectContaining({
+                        inviteeEmail: 'email2',
+                    }),
+                    expect.anything(),
+                );
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+        });
+
+        describe('members', () => {
+            it('should update member via proton user', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'member-email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [
+                        {
+                            ...member,
+                            role: 'editor',
+                        },
+                    ],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateMember).toHaveBeenCalled();
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should be no-op if no change via proton user', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'member-email', role: MemberRole.Viewer }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateMember).not.toHaveBeenCalled();
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should update member via non-proton user', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'member-email', role: MemberRole.Editor }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [
+                        {
+                            ...member,
+                            role: 'editor',
+                        },
+                    ],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateMember).toHaveBeenCalled();
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should be no-op if no change via non-proton user', async () => {
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    users: [{ email: 'member-email', role: MemberRole.Viewer }],
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: undefined,
+                });
+                expect(apiService.updateMember).not.toHaveBeenCalled();
+                expect(apiService.updateInvitation).not.toHaveBeenCalled();
+                expect(apiService.inviteProtonUser).not.toHaveBeenCalled();
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+        });
+
+        describe('public link', () => {
+            it('should share node with public link', async () => {
+                jest.useFakeTimers();
+                jest.setSystemTime(new Date('2025-01-01'));
+
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    publicLink: {
+                        role: MemberRole.Viewer,
+                        customPassword: undefined,
+                        expiration: undefined,
+                    },
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: {
+                        uid: 'publicLinkUid',
+                        role: MemberRole.Viewer,
+                        url: 'publicLinkUrl#generatedPassword',
+                        creationTime: new Date(),
+                        expirationTime: undefined,
+                        customPassword: undefined,
+                        creatorEmail: 'volume-email',
+                        numberOfInitializedDownloads: 0,
+                    },
+                });
+                expect(cryptoService.generatePublicLinkPassword).toHaveBeenCalled();
+                expect(cryptoService.encryptPublicLink).toHaveBeenCalledWith(
+                    'volume-email',
+                    'sharePassphraseSessionKey',
+                    'generatedPassword',
+                );
+                expect(apiService.createPublicLink).toHaveBeenCalledWith(
+                    'shareId',
+                    expect.objectContaining({
+                        role: MemberRole.Viewer,
+                        includesCustomPassword: false,
+                        expirationTime: undefined,
+                        crypto: 'publicLinkCrypto',
+                        srp: 'publicLinkSrp',
+                    }),
+                );
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should share node with custom password and expiration', async () => {
+                jest.useFakeTimers();
+                jest.setSystemTime(new Date('2025-01-01'));
+
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    publicLink: {
+                        role: MemberRole.Viewer,
+                        customPassword: 'customPassword',
+                        expiration: new Date('2025-01-02'),
+                    },
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: {
+                        uid: 'publicLinkUid',
+                        role: MemberRole.Viewer,
+                        url: 'publicLinkUrl#generatedPassword',
+                        creationTime: new Date(),
+                        expirationTime: new Date('2025-01-02'),
+                        customPassword: 'customPassword',
+                        creatorEmail: 'volume-email',
+                        numberOfInitializedDownloads: 0,
+                    },
+                });
+                expect(cryptoService.generatePublicLinkPassword).toHaveBeenCalled();
+                expect(cryptoService.encryptPublicLink).toHaveBeenCalledWith(
+                    'volume-email',
+                    'sharePassphraseSessionKey',
+                    'generatedPasswordcustomPassword',
+                );
+                expect(apiService.createPublicLink).toHaveBeenCalledWith(
+                    'shareId',
+                    expect.objectContaining({
+                        role: MemberRole.Viewer,
+                        includesCustomPassword: true,
+                        expirationTime: 1735776000,
+                        crypto: 'publicLinkCrypto',
+                        srp: 'publicLinkSrp',
+                    }),
+                );
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should update public link with custom password and expiration', async () => {
+                jest.useFakeTimers();
+                jest.setSystemTime(new Date('2025-01-01'));
+
+                const publicLink = {
+                    uid: 'publicLinkUid',
+                    url: 'publicLinkUrl#generatedpas', // Generated password must be 12 chararacters long.
+                    creationTime: new Date('2025-01-01'),
+                    role: MemberRole.Viewer,
+                    customPassword: undefined,
+                    expirationTime: undefined,
+                    creatorEmail: 'publicLinkCreatorEmail',
+                };
+                apiService.getPublicLink = jest.fn().mockResolvedValue(publicLink);
+
+                const sharingInfo = await sharingManagement.shareNode(nodeUid, {
+                    publicLink: {
+                        role: MemberRole.Editor,
+                        customPassword: 'customPassword',
+                        expiration: new Date('2025-01-02'),
+                    },
+                });
+
+                expect(sharingInfo).toEqual({
+                    protonInvitations: [invitation],
+                    nonProtonInvitations: [externalInvitation],
+                    members: [member],
+                    publicLink: {
+                        uid: 'publicLinkUid',
+                        role: MemberRole.Editor,
+                        url: 'publicLinkUrl#generatedpas',
+                        creationTime: new Date('2025-01-01'),
+                        expirationTime: new Date('2025-01-02'),
+                        customPassword: 'customPassword',
+                        creatorEmail: 'publicLinkCreatorEmail',
+                    },
+                });
+                expect(cryptoService.encryptPublicLink).toHaveBeenCalledWith(
+                    'publicLinkCreatorEmail',
+                    'sharePassphraseSessionKey',
+                    'generatedpascustomPassword',
+                );
+                expect(apiService.updatePublicLink).toHaveBeenCalledWith(
+                    'publicLinkUid',
+                    expect.objectContaining({
+                        role: MemberRole.Editor,
+                        includesCustomPassword: true,
+                        expirationTime: 1735776000,
+                        crypto: 'publicLinkCrypto',
+                        srp: 'publicLinkSrp',
+                    }),
+                );
+                expect(cache.addSharedByMeNodeUid).not.toHaveBeenCalled();
+            });
+
+            it('should not allow updating legacy public link', async () => {
+                apiService.getPublicLink = jest.fn().mockResolvedValue({
+                    uid: 'publicLinkUid',
+                    url: 'publicLinkUrl#aaa', // Legacy public links doesn't have 12 chars.
+                });
+
+                await expect(
+                    sharingManagement.shareNode(nodeUid, {
+                        publicLink: true,
+                    }),
+                ).rejects.toThrow('Legacy public link cannot be updated. Please re-create a new public link.');
+            });
+
+            it('should not allow updating legacy public link without generated password', async () => {
+                apiService.getPublicLink = jest.fn().mockResolvedValue({
+                    uid: 'publicLinkUid',
+                    url: 'publicLinkUrl',
+                });
+
+                await expect(
+                    sharingManagement.shareNode(nodeUid, {
+                        publicLink: true,
+                    }),
+                ).rejects.toThrow('Legacy public link cannot be updated. Please re-create a new public link.');
+            });
+
+            it('should not allow creating public link with expiration in the past', async () => {
+                jest.useFakeTimers();
+                jest.setSystemTime(new Date('2025-01-01'));
+
+                await expect(
+                    sharingManagement.shareNode(nodeUid, {
+                        publicLink: {
+                            role: MemberRole.Viewer,
+                            expiration: new Date('2024-01-01'),
+                        },
+                    }),
+                ).rejects.toThrow('Expiration date cannot be in the past');
+                expect(apiService.createStandardShare).not.toHaveBeenCalled();
+                expect(apiService.createPublicLink).not.toHaveBeenCalled();
+            });
+
+            it('should not allow creating public link for volume not owned by user', async () => {
+                sharesService.getRootIDs = jest.fn().mockResolvedValue({ volumeId: 'differentVolumeId' });
+                await expect(
+                    sharingManagement.shareNode(nodeUid, {
+                        publicLink: {
+                            role: MemberRole.Viewer,
+                        },
+                    }),
+                ).rejects.toThrow('Cannot create public link for volume not owned by the user');
+
+                expect(apiService.createPublicLink).not.toHaveBeenCalled();
+            });
+        });
+    });
+
+    describe('unshareNode', () => {
+        const nodeUid = 'volumeId~nodeUid';
+
+        let invitation: ProtonInvitation;
+        let externalInvitation: NonProtonInvitation;
+        let member: Member;
+        let publicLink: PublicLink;
+
+        beforeEach(async () => {
+            invitation = {
+                uid: 'invitation',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'internal-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+            };
+            externalInvitation = {
+                uid: 'external-invitation',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'external-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+                state: NonProtonInvitationState.Pending,
+            };
+            member = {
+                uid: 'member',
+                addedByEmail: resultOk('added-email'),
+                inviteeEmail: 'member-email',
+                role: MemberRole.Viewer,
+                invitationTime: new Date(),
+            };
+            publicLink = {
+                uid: 'publicLink',
+                creationTime: new Date(),
+                role: MemberRole.Viewer,
+                url: 'url',
+                numberOfInitializedDownloads: 0,
+            };
+
+            apiService.getShareInvitations = jest.fn().mockResolvedValue([invitation]);
+            apiService.getShareExternalInvitations = jest.fn().mockResolvedValue([externalInvitation]);
+            apiService.getShareMembers = jest.fn().mockResolvedValue([member]);
+            apiService.getPublicLink = jest.fn().mockResolvedValue(publicLink);
+        });
+
+        it('should delete invitation', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, { users: ['internal-email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [],
+                nonProtonInvitations: [externalInvitation],
+                members: [member],
+                publicLink,
+            });
+            expect(apiService.deleteShare).not.toHaveBeenCalled();
+            expect(apiService.deleteInvitation).toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).not.toHaveBeenCalled();
+            expect(apiService.removeMember).not.toHaveBeenCalled();
+            expect(apiService.removePublicLink).not.toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).not.toHaveBeenCalled();
+        });
+
+        it('should delete external invitation', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, { users: ['external-email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [invitation],
+                nonProtonInvitations: [],
+                members: [member],
+                publicLink,
+            });
+            expect(apiService.deleteShare).not.toHaveBeenCalled();
+            expect(apiService.deleteInvitation).not.toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).toHaveBeenCalled();
+            expect(apiService.removeMember).not.toHaveBeenCalled();
+            expect(apiService.removePublicLink).not.toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).not.toHaveBeenCalled();
+        });
+
+        it('should remove member', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, { users: ['member-email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [invitation],
+                nonProtonInvitations: [externalInvitation],
+                members: [],
+                publicLink,
+            });
+            expect(apiService.deleteShare).not.toHaveBeenCalled();
+            expect(apiService.deleteInvitation).not.toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).not.toHaveBeenCalled();
+            expect(apiService.removeMember).toHaveBeenCalled();
+            expect(apiService.removePublicLink).not.toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).not.toHaveBeenCalled();
+        });
+
+        it('should be no-op if not shared with email', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, { users: ['non-existing-email'] });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [invitation],
+                nonProtonInvitations: [externalInvitation],
+                members: [member],
+                publicLink,
+            });
+            expect(apiService.deleteShare).not.toHaveBeenCalled();
+            expect(apiService.deleteInvitation).not.toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).not.toHaveBeenCalled();
+            expect(apiService.removeMember).not.toHaveBeenCalled();
+            expect(apiService.removePublicLink).not.toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).not.toHaveBeenCalled();
+        });
+
+        it('should remove public link', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, { publicLink: 'remove' });
+
+            expect(sharingInfo).toEqual({
+                protonInvitations: [invitation],
+                nonProtonInvitations: [externalInvitation],
+                members: [member],
+                publicLink: undefined,
+            });
+            expect(apiService.deleteShare).not.toHaveBeenCalled();
+            expect(apiService.deleteInvitation).not.toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).not.toHaveBeenCalled();
+            expect(apiService.removeMember).not.toHaveBeenCalled();
+            expect(apiService.removePublicLink).toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).not.toHaveBeenCalled();
+        });
+
+        it('should remove share if all is removed', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid);
+
+            expect(sharingInfo).toEqual(undefined);
+            expect(apiService.deleteShare).toHaveBeenCalled();
+            expect(apiService.deleteInvitation).not.toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).not.toHaveBeenCalled();
+            expect(apiService.removeMember).not.toHaveBeenCalled();
+            expect(apiService.removePublicLink).not.toHaveBeenCalled();
+            expect(nodesService.notifyNodeChanged).toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).toHaveBeenCalledWith(nodeUid);
+        });
+
+        it('should remove share if everything is manually removed', async () => {
+            const sharingInfo = await sharingManagement.unshareNode(nodeUid, {
+                users: ['internal-email', 'external-email', 'member-email'],
+                publicLink: 'remove',
+            });
+
+            expect(sharingInfo).toEqual(undefined);
+            expect(apiService.deleteShare).toHaveBeenCalled();
+            expect(apiService.deleteInvitation).toHaveBeenCalled();
+            expect(apiService.deleteExternalInvitation).toHaveBeenCalled();
+            expect(apiService.removeMember).toHaveBeenCalled();
+            expect(apiService.removePublicLink).toHaveBeenCalled();
+            expect(cache.removeSharedByMeNodeUid).toHaveBeenCalledWith(nodeUid);
+        });
+    });
+
+    describe('resendInvitationEmail', () => {
+        const nodeUid = 'volumeId~nodeUid';
+
+        const invitation: ProtonInvitation = {
+            uid: 'invitation',
+            addedByEmail: resultOk('added-email'),
+            inviteeEmail: 'internal-email',
+            role: MemberRole.Viewer,
+            invitationTime: new Date(),
+        };
+        const externalInvitation: NonProtonInvitation = {
+            uid: 'external-invitation',
+            addedByEmail: resultOk('added-email'),
+            inviteeEmail: 'external-email',
+            role: MemberRole.Viewer,
+            invitationTime: new Date(),
+            state: NonProtonInvitationState.Pending,
+        };
+
+        beforeEach(() => {
+            apiService.getShareInvitations = jest.fn().mockResolvedValue([invitation]);
+            apiService.getShareExternalInvitations = jest.fn().mockResolvedValue([externalInvitation]);
+            apiService.getShareMembers = jest.fn().mockResolvedValue([]);
+            apiService.getPublicLink = jest.fn().mockResolvedValue(undefined);
+        });
+
+        it('should resend email for proton invitation', async () => {
+            await sharingManagement.resendInvitationEmail(nodeUid, invitation.uid);
+
+            expect(apiService.resendInvitationEmail).toHaveBeenCalledWith(invitation.uid);
+            expect(apiService.resendExternalInvitationEmail).not.toHaveBeenCalled();
+        });
+
+        it('should resend email for external invitation', async () => {
+            await sharingManagement.resendInvitationEmail(nodeUid, externalInvitation.uid);
+
+            expect(apiService.resendExternalInvitationEmail).toHaveBeenCalledWith(externalInvitation.uid);
+            expect(apiService.resendInvitationEmail).not.toHaveBeenCalled();
+        });
+
+        it('should throw error when no sharing found for node', async () => {
+            nodesService.getNode = jest.fn().mockResolvedValue({ nodeUid, shareId: undefined });
+
+            await expect(sharingManagement.resendInvitationEmail(nodeUid, invitation.uid)).rejects.toThrow(
+                'Node is not shared',
+            );
+
+            expect(apiService.resendInvitationEmail).not.toHaveBeenCalled();
+            expect(apiService.resendExternalInvitationEmail).not.toHaveBeenCalled();
+        });
+
+        it('should log when no invitation found', async () => {
+            await expect(sharingManagement.resendInvitationEmail(nodeUid, 'non-existent-uid')).rejects.toThrow(
+                'Invitation not found',
+            );
+
+            expect(apiService.resendInvitationEmail).not.toHaveBeenCalled();
+            expect(apiService.resendExternalInvitationEmail).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('convertNonProtonInvitation', () => {
+        const nodeUid = 'volumeId~nodeId';
+        const externalInvitationId = 'inv123';
+        const externalInvitationUid = `${DEFAULT_SHARE_ID}~${externalInvitationId}`;
+        const externalInvitation: NonProtonInvitation = {
+            uid: externalInvitationUid,
+            inviteeEmail: 'external@example.com',
+            addedByEmail: resultOk('inviter@example.com'),
+            role: MemberRole.Viewer,
+            invitationTime: new Date(),
+            state: NonProtonInvitationState.Pending,
+        };
+
+        beforeEach(() => {
+            nodesService.getNode = jest.fn().mockResolvedValue({
+                nodeUid,
+                shareId: DEFAULT_SHARE_ID,
+                directRole: MemberRole.Admin,
+                name: { ok: true, value: 'name' },
+            });
+            apiService.getShareExternalInvitations = jest.fn().mockResolvedValue([externalInvitation]);
+        });
+
+        it('should throw if caller is not admin', async () => {
+            nodesService.getNode = jest.fn().mockResolvedValue({
+                nodeUid,
+                shareId: DEFAULT_SHARE_ID,
+                directRole: MemberRole.Viewer,
+                name: { ok: true, value: 'name' },
+            });
+
+            await expect(
+                sharingManagement.convertNonProtonInvitation(nodeUid, externalInvitationUid),
+            ).rejects.toThrow(ValidationError);
+        });
+
+        it('should throw if no sharing info found', async () => {
+            nodesService.getNode = jest.fn().mockResolvedValue({
+                nodeUid,
+                shareId: undefined,
+                directRole: MemberRole.Admin,
+                name: { ok: true, value: 'name' },
+            });
+
+            await expect(
+                sharingManagement.convertNonProtonInvitation(nodeUid, externalInvitationUid),
+            ).rejects.toThrow(ValidationError);
+        });
+
+        it('should throw if external invitation ID is not found', async () => {
+            await expect(
+                sharingManagement.convertNonProtonInvitation(nodeUid, 'unknownShareId~unknownInvId'),
+            ).rejects.toThrow(ValidationError);
+        });
+
+        it('should invite proton user with force-refreshed keys and the external invitation ID', async () => {
+            await sharingManagement.convertNonProtonInvitation(nodeUid, externalInvitationUid);
+
+            expect(cryptoService.encryptInvitation).toHaveBeenCalledWith(
+                expect.anything(),
+                expect.anything(),
+                externalInvitation.inviteeEmail,
+                true,
+            );
+            expect(apiService.inviteProtonUser).toHaveBeenCalledWith(
+                DEFAULT_SHARE_ID,
+                expect.objectContaining({ inviteeEmail: externalInvitation.inviteeEmail, role: externalInvitation.role }),
+                {},
+                externalInvitationId,
+            );
+        });
+    });
+
+    describe('reportAbuse', () => {
+        const nodeUid = 'volumeId~nodeId';
+
+        beforeEach(() => {
+            sharesService.loadEncryptedShare = jest.fn().mockResolvedValue({
+                id: DEFAULT_SHARE_ID,
+                addressId: 'addressId',
+                creatorEmail: 'address@example.com',
+                membership: { memberUid: 'memberUid', base64KeyPacket: 'keyPacket' },
+            });
+            cryptoService.decryptShare = jest.fn().mockResolvedValue({ passphrase: 'sharePassphrase' });
+            cryptoService.getMemberSessionKey = jest.fn().mockResolvedValue('base64MemberSessionKey');
+            apiService.reportAbuse = jest.fn().mockResolvedValue(undefined);
+        });
+
+        it('should report abuse with the member session key for a direct member', async () => {
+            await sharingManagement.reportAbuse({ nodeUid, abuseCategory: AbuseCategory.Spam, bonaFide: true });
+
+            expect(cryptoService.getMemberSessionKey).toHaveBeenCalledWith('keyPacket');
+            expect(apiService.reportAbuse).toHaveBeenCalledWith({
+                sharePassphrase: 'sharePassphrase',
+                memberSessionKey: 'base64MemberSessionKey',
+                shareId: DEFAULT_SHARE_ID,
+                abuseCategory: AbuseCategory.Spam,
+                bonaFide: true,
+                reporterMessage: undefined,
+                reporterEmail: undefined,
+                linkId: 'nodeId',
+                revisionId: undefined,
+            });
+        });
+
+        it('should report abuse without a member session key when there is no membership (owner)', async () => {
+            sharesService.loadEncryptedShare = jest.fn().mockResolvedValue({
+                id: DEFAULT_SHARE_ID,
+                addressId: 'addressId',
+                creatorEmail: 'address@example.com',
+                membership: undefined,
+            });
+
+            await sharingManagement.reportAbuse({ nodeUid, abuseCategory: AbuseCategory.Spam, bonaFide: true });
+
+            expect(cryptoService.getMemberSessionKey).not.toHaveBeenCalled();
+            expect(apiService.reportAbuse).toHaveBeenCalledWith(
+                expect.objectContaining({ memberSessionKey: undefined }),
+            );
+        });
+
+        it('should include the revision id when reporting a specific revision', async () => {
+            await sharingManagement.reportAbuse({
+                nodeUid,
+                abuseCategory: AbuseCategory.Spam,
+                bonaFide: true,
+                revisionUid: 'volumeId~nodeId~revisionId',
+            });
+
+            expect(apiService.reportAbuse).toHaveBeenCalledWith(
+                expect.objectContaining({ linkId: 'nodeId', revisionId: 'revisionId' }),
+            );
+        });
+
+        it('should throw and not call the API when a required message is missing', async () => {
+            await expect(
+                sharingManagement.reportAbuse({ nodeUid, abuseCategory: AbuseCategory.Copyright, bonaFide: true }),
+            ).rejects.toThrow(ValidationError);
+            expect(apiService.reportAbuse).not.toHaveBeenCalled();
+        });
+
+        it('should report abuse for a child node inside a directly shared folder', async () => {
+            const parentNodeUid = 'volumeId~parentNodeId';
+            const childNodeUid = 'volumeId~childNodeId';
+
+            nodesService.getRootNode = jest.fn().mockResolvedValue({ uid: parentNodeUid, shareId: DEFAULT_SHARE_ID });
+
+            await sharingManagement.reportAbuse({ nodeUid: childNodeUid, abuseCategory: AbuseCategory.Spam, bonaFide: true });
+
+            expect(nodesService.getNodeKeys).toHaveBeenCalledWith(parentNodeUid);
+            expect(sharesService.loadEncryptedShare).toHaveBeenCalledWith(DEFAULT_SHARE_ID);
+            expect(apiService.reportAbuse).toHaveBeenCalledWith(
+                expect.objectContaining({ shareId: DEFAULT_SHARE_ID, linkId: 'childNodeId' }),
+            );
+        });
+    });
+});

@@ -537,7 +537,7 @@ impl ProtonFileUploader {
             .collect();
 
         // No signature context: JS signManifest → signArmored signs with no
-        // context (js/sdk/src/crypto/driveCrypto.ts), and verifyManifest →
+        // context (client/js/src/crypto/driveCrypto.ts), and verifyManifest →
         // verifyArmored reads it back with no context. A non-empty context here
         // would embed a critical notation that OpenPGP.js verification rejects.
         let manifest_sig = self

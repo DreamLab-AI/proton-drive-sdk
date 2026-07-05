@@ -1,8 +1,11 @@
 //! Build-time protobuf code generation for the cross-language wire types.
 //!
-//! The two `.proto` files live in the upstream C# reference tree
-//! (`reference/cs/sdk/src/protos/`) and are the source of truth for the wire
-//! format used by the C#/Kotlin/Swift implementations. They declare
+//! The `.proto` file lives in the upstream C# reference tree
+//! (`reference/client/cs/src/protos/`) and is the source of truth for the wire
+//! format used by the C#/Kotlin/Swift implementations. Upstream merged the
+//! former two-file layout (`proton.sdk.proto` imported by
+//! `proton.drive.sdk.proto`) into this single file, entirely under
+//! `package proton.drive.sdk;` (see `reference/VENDORED.md`). It declares
 //! `edition = "2023"` (protobuf editions), which
 //! creates two constraints this script handles:
 //!
@@ -34,8 +37,8 @@ use std::path::Path;
 use prost::Message;
 use prost_types::FileDescriptorSet;
 
-const PROTO_INCLUDE: &str = "../../../reference/cs/sdk/src/protos";
-const PROTO_FILES: [&str; 2] = ["proton.drive.sdk.proto", "proton.sdk.proto"];
+const PROTO_INCLUDE: &str = "../../../reference/client/cs/src/protos";
+const PROTO_FILES: [&str; 1] = ["proton.drive.sdk.proto"];
 
 fn main() {
     let include = Path::new(PROTO_INCLUDE);
@@ -46,8 +49,8 @@ fn main() {
     if !include.is_dir() {
         panic!(
             "proto include directory not found: {} (resolved from crate dir {}). \
-             The cross-language wire `.proto` sources are expected at \
-             `reference/cs/sdk/src/protos` relative to the repository root.",
+             The cross-language wire `.proto` source is expected at \
+             `reference/client/cs/src/protos` relative to the repository root.",
             include.display(),
             env!("CARGO_MANIFEST_DIR"),
         );

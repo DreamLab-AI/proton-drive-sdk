@@ -1,5 +1,5 @@
-//! Event subscription aggregate. Mirrors `js/sdk/src/interface/events.ts` plus
-//! the volume polling loop in `js/sdk/src/internal/events/`.
+//! Event subscription aggregate. Mirrors `client/js/src/interface/events.ts` plus
+//! the volume polling loop in `client/js/src/internal/events/`.
 //!
 //! Sync is **event-based polling** (never recursive tree traversal): a
 //! background task repeatedly drains `GET drive/v2/volumes/{volumeID}/events/

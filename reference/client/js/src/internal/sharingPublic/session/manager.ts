@@ -1,0 +1,130 @@
+import { DriveCrypto, PrivateKey, SRPModule } from '../../../crypto';
+import { Logger, MemberRole, ProtonDriveHTTPClient, ProtonDriveTelemetry } from '../../../interface';
+import { DriveAPIService, permissionsToMemberRole } from '../../apiService';
+import { SharingPublicSessionAPIService } from './apiService';
+import { SharingPublicSessionHttpClient } from './httpClient';
+import { EncryptedShareCrypto, PublicLinkInfo } from './interface';
+import { SharingPublicLinkSession } from './session';
+
+/**
+ * Manages sessions for public links.
+ *
+ * It can be used to get access to multiple public links.
+ */
+export class SharingPublicSessionManager {
+    private api: SharingPublicSessionAPIService;
+
+    private infosPerToken: Map<string, PublicLinkInfo> = new Map();
+
+    private logger: Logger;
+
+    constructor(
+        telemetry: ProtonDriveTelemetry,
+        private httpClient: ProtonDriveHTTPClient,
+        private driveCrypto: DriveCrypto,
+        private srpModule: SRPModule,
+        apiService: DriveAPIService,
+    ) {
+        this.logger = telemetry.getLogger('sharingPublicSession');
+        this.httpClient = httpClient;
+        this.driveCrypto = driveCrypto;
+        this.srpModule = srpModule;
+
+        this.api = new SharingPublicSessionAPIService(telemetry.getLogger('sharingPublicSession'), apiService);
+    }
+
+    /**
+     * Get the info for a public link.
+     *
+     * It returns the info for the public link, including if it is custom
+     * password protected, if it is legacy (not supported anymore), and
+     * the vendor type (whether it is Proton Docs, for example, and should
+     * be redirected to the public Docs app).
+     *
+     * @param token - The public link token.
+     */
+    async getInfo(token: string): Promise<{
+        isCustomPasswordProtected: boolean;
+        isLegacy: boolean;
+        vendorType: number;
+        directAccess?: {
+            nodeUid: string;
+            directRole: MemberRole;
+            publicRole: MemberRole;
+        };
+    }> {
+
+        const info = await this.api.initPublicLinkSession(token);
+        this.infosPerToken.set(token, info);
+
+        return {
+            isCustomPasswordProtected: info.isCustomPasswordProtected,
+            isLegacy: info.isLegacy,
+            vendorType: info.vendorType,
+            directAccess: info.directAccess,
+        };
+    }
+
+    /**
+     * Authenticate a public link session.
+     *
+     * It returns HTTP client that must be used for the endpoints to access the
+     * public link data.
+     *
+     * It returnes parsed token and full password (password from the URL +
+     * custom password) that can be used for decrypting the share key.
+     *
+     * @param token - The public link token.
+     * @param customPassword - The custom password for the public link, if it is
+     * custom password protected.
+     */
+    async auth(
+        token: string,
+        urlPassword: string,
+        customPassword?: string,
+    ): Promise<{
+        httpClient: SharingPublicSessionHttpClient;
+        shareKey: PrivateKey;
+        sharePassphrase: string;
+        shareUrlPassword: string;
+        rootUid: string;
+        publicRole: MemberRole;
+        session: SharingPublicLinkSession;
+    }> {
+        let info = this.infosPerToken.get(token);
+        if (!info) {
+            info = await this.api.initPublicLinkSession(token);
+        }
+
+        const password = `${urlPassword}${customPassword || ''}`;
+
+        const session = new SharingPublicLinkSession(this.api, this.srpModule, token, password);
+        const { encryptedShare, rootUid } = await session.auth(info.srp);
+
+        const { shareKey, sharePassphrase } = await this.decryptShareKey(encryptedShare, password);
+
+        return {
+            httpClient: new SharingPublicSessionHttpClient(this.httpClient, session),
+            shareKey,
+            sharePassphrase,
+            // Full password (URL + custom), needed for abuse reports.
+            shareUrlPassword: password,
+            rootUid,
+            publicRole: permissionsToMemberRole(this.logger, encryptedShare.publicPermissions),
+            session,
+        };
+    }
+
+    private async decryptShareKey(
+        encryptedShare: EncryptedShareCrypto,
+        password: string,
+    ): Promise<{ shareKey: PrivateKey; sharePassphrase: string }> {
+        const { key, passphrase } = await this.driveCrypto.decryptKeyWithSrpPassword(
+            password,
+            encryptedShare.base64UrlPasswordSalt,
+            encryptedShare.armoredKey,
+            encryptedShare.armoredPassphrase,
+        );
+        return { shareKey: key, sharePassphrase: passphrase };
+    }
+}

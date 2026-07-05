@@ -1,7 +1,7 @@
 //! Drive event-subscription wire DTOs.
 //!
 //! Mirrors the Proton "light events" v2 surface consumed by
-//! `js/sdk/src/internal/events/apiService.ts`:
+//! `client/js/src/internal/events/apiService.ts`:
 //! - `GET drive/volumes/{volumeID}/events/latest` → [`GetLatestEventIdResponse`]
 //! - `GET drive/v2/volumes/{volumeID}/events/{eventID}` → [`GetVolumeEventsResponse`]
 //!   (`ListEventsV2ResponseDto` in the generated OpenAPI types)

@@ -1,4 +1,4 @@
-//! Crate-wide error model. Mirrors `js/sdk/src/errors.ts` taxonomy.
+//! Crate-wide error model. Mirrors `client/js/src/errors.ts` taxonomy.
 
 use thiserror::Error;
 

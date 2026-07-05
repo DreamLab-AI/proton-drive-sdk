@@ -1,0 +1,279 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=2; plural=(n != 1);",
+    "language": "es_ES"
+  },
+  "contexts": {
+    "Error": {
+      "A message is required when reporting copyright infringement or stolen data": [
+        "Se requiere un mensaje al denunciar una infracción de derechos de autor o el robo de datos"
+      ],
+      "Bookmark password is not available": [
+        "La contraseña del marcador no está disponible"
+      ],
+      "Cannot add photo to album without a valid name": [
+        "No se puede añadir una foto a un álbum sin un nombre válido"
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "No puedes crear un enlace público de un volumen que no te pertenece"
+      ],
+      "Cannot download a folder": [
+        "No se puede descargar una carpeta."
+      ],
+      "Cannot share root folder": [
+        "No se puede compartir la carpeta principal."
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "No puedes actualizar el enlace público de un volumen que no te pertenece"
+      ],
+      "Content key packet is required for small revision upload": [
+        "Se requiere el paquete de claves de contenido para subir una revisión pequeña"
+      ],
+      "Copy operation aborted": [
+        "Se ha cancelado la copia."
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "No está permitido copiar un elemento a una ubicación que no sea una carpeta."
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "No está permitido crear documentos en elementos que no sean carpetas."
+      ],
+      "Creating files in non-folders is not allowed": [
+        "No está permitido crear archivos en ubicaciones que no sean carpetas."
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "No está permitido crear carpetas en elementos que no sean carpetas."
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "No está permitido crear revisiones en elementos que no son archivos."
+      ],
+      "Data integrity check failed": [
+        "Error en verificar la integridad de los datos"
+      ],
+      "Data integrity check of one part failed": [
+        "Error en verificar la integridad de los datos de una parte"
+      ],
+      "Device not found": [
+        "No se ha encontrado el dispositivo."
+      ],
+      "Expiration date cannot be in the past": [
+        "La fecha de expiración no puede estar en el pasado."
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Error al descifrar revisión activa: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Error al descifrar el bloque: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Error al descifrar la clave del marcador: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Error al descifrar el nombre del marcador: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Error al descifrar la contraseña del marcador: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Error al descifrar la clave del contenido: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Error al descifrar el nombre del elemento: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Error al descifrar la clave del nodo: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Error al descifrar la miniatura: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "Fallo al obtener las claves de quien invita"
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "No se pudo obtener la información para compartir del nodo ${ nodeUid }"
+      ],
+      "Failed to get verification keys": [
+        "Error al obtener las claves de verificación"
+      ],
+      "Failed to load some items": [
+        "No se han podido cargar algunos elementos"
+      ],
+      "Failed to load some nodes": [
+        "Error al cargar algunos nodos"
+      ],
+      "Failed to verify invitation": [
+        "Fallo al verificar la invitación"
+      ],
+      "File download failed due to empty response": [
+        "Error con la descarga del archivo debido a una respuesta vacía"
+      ],
+      "File has no active revision": [
+        "El archivo no tiene una revisión activa."
+      ],
+      "File has no content key": [
+        "El archivo no tiene clave de contenido."
+      ],
+      "File has no revision": [
+        "El archivo no tiene revisiones"
+      ],
+      "File hash does not match expected hash": [
+        "El hash del archivo no coincide con el valor esperado"
+      ],
+      "Invalid URL": [
+        "La URL no es válida."
+      ],
+      "Invitation not found": [
+        "No se ha encontrado la invitación."
+      ],
+      "Item cannot be decrypted": [
+        "No se puede descifrar el elemento."
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "El enlace público de origen no se puede actualizar. Vuelve a crear un nuevo enlace público."
+      ],
+      "Missing integrity signature": [
+        "Falta la firma de integridad."
+      ],
+      "Missing inviter email": [
+        "Falta el correo electrónico de quien invita"
+      ],
+      "Missing signature": [
+        "Falta la firma."
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Falta la firma para ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "Se ha cancelado el traslado."
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "No está permitido mover un elemento a una ubicación que no sea una carpeta."
+      ],
+      "Moving root item is not allowed": [
+        "No se permite mover el elemento principal."
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "El nombre debe tener como máximo ${ MAX_NODE_NAME_LENGTH } carácter.",
+        "El nombre debe tener como máximo ${ MAX_NODE_NAME_LENGTH } caracteres."
+      ],
+      "Name must not be empty": [
+        "El nombre no debe estar vacío."
+      ],
+      "No available name found": [
+        "No se encontró ningún nombre disponible"
+      ],
+      "Node has no thumbnail": [
+        "El nodo no tiene miniatura."
+      ],
+      "Node is not accessible": [
+        "El nodo no es accesible."
+      ],
+      "Node is not accessible via a share": [
+        "No se puede acceder al nodo a través de un elemento compartido"
+      ],
+      "Node is not shared": [
+        "El nodo no está compartido"
+      ],
+      "Node not found": [
+        "Nodo no encontrado"
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Solo los administradores pueden convertir invitaciones externas a Proton"
+      ],
+      "Operation aborted": [
+        "Operación cancelada"
+      ],
+      "Operation failed, try again later": [
+        "Operación fallida, inténtalo de nuevo más tarde"
+      ],
+      "Parent cannot be decrypted": [
+        "No se puede descifrar el elemento principal."
+      ],
+      "Photo is already in the target album": [
+        "La foto ya está en el álbum de destino"
+      ],
+      "Photo not found": [
+        "Foto no encontrada"
+      ],
+      "Renaming root item is not allowed": [
+        "No se permite cambiar el nombre del elemento principal."
+      ],
+      "Request aborted": [
+        "Solicitud cancelada"
+      ],
+      "Signature is missing": [
+        "Falta la firma"
+      ],
+      "Signature verification failed": [
+        "Error al verificar la firma"
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Fallo en la verificación de firma: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "Error en la verificación de la firma para ${ signatureType }"
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "Fallo en la verificación de firma para ${ signatureType }: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Algunos bytes del archivo no se han podido cargar."
+      ],
+      "Some file parts failed to upload": [
+        "Algunas partes del archivo no se han podido cargar."
+      ],
+      "The node is not shared anymore": [
+        "Este elemento ya no está compartido"
+      ],
+      "Thumbnail not found": [
+        "Miniatura no encontrada"
+      ],
+      "Too many server errors, please try again later": [
+        "Demasiados errores del servidor. Inténtalo de nuevo más tarde."
+      ],
+      "Too many server requests, please try again later": [
+        "Demasiadas solicitudes del servidor. Inténtalo de nuevo más tarde."
+      ],
+      "Unknown error": [
+        "Error desconocido"
+      ],
+      "Unknown error ${ code }": [
+        "Error desconocido ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Las claves de verificación no están disponibles."
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Las claves de verificación para ${ signatureType } no están disponibles."
+      ],
+      "You can leave only item that is shared with you": [
+        "Solo puedes abandonar el elemento que se comparte contigo."
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "El autor no se proporciona en el enlace público"
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "atributos"
+      ],
+      "content key": [
+        "clave de contenido"
+      ],
+      "hash key": [
+        "clave hash"
+      ],
+      "key": [
+        "clave"
+      ],
+      "membership": [
+        "membresía"
+      ],
+      "name": [
+        "nombre"
+      ]
+    }
+  }
+}

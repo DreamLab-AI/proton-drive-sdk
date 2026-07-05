@@ -1,0 +1,686 @@
+import { IntegrityError } from '../../errors';
+import { Logger, Thumbnail, ThumbnailType, UploadMetadata } from '../../interface';
+import { getMockLogger } from '../../tests/logger';
+import { APIHTTPError, HTTPErrorCode } from '../apiService';
+import { UploadAPIService } from './apiService';
+import { BlockVerifier } from './blockVerifier';
+import { UploadController } from './controller';
+import { UploadCryptoService } from './cryptoService';
+import { NodeRevisionDraft } from './interface';
+import { UploadManager } from './manager';
+import { FILE_CHUNK_SIZE, StreamUploader } from './streamUploader';
+import { UploadTelemetry } from './telemetry';
+
+const BLOCK_ENCRYPTION_OVERHEAD = 10000;
+
+async function mockEncryptBlock(
+    verifyBlock: (block: Uint8Array) => Promise<void>,
+    _: any,
+    block: Uint8Array,
+    index: number,
+) {
+    await verifyBlock(block);
+    return {
+        index,
+        encryptedData: block,
+        armoredSignature: 'signature',
+        verificationToken: 'verificationToken',
+        originalSize: block.length,
+        encryptedSize: block.length + BLOCK_ENCRYPTION_OVERHEAD,
+        hashPromise: Promise.resolve('blockHash'),
+    };
+}
+
+function mockUploadBlock(
+    _: string,
+    __: string,
+    encryptedBlock: Uint8Array,
+    onProgress: (uploadedBytes: number) => void,
+) {
+    onProgress(encryptedBlock.length);
+}
+
+describe('StreamUploader', () => {
+    let logger: Logger;
+    let telemetry: UploadTelemetry;
+    let apiService: jest.Mocked<UploadAPIService>;
+    let cryptoService: UploadCryptoService;
+    let uploadManager: UploadManager;
+    let blockVerifier: BlockVerifier;
+    let revisionDraft: NodeRevisionDraft;
+    let metadata: UploadMetadata;
+    let controller: UploadController;
+    let onFinish: () => Promise<void>;
+    let abortController: AbortController;
+
+    let uploader: StreamUploader;
+
+    beforeEach(() => {
+        logger = getMockLogger();
+
+        // @ts-expect-error No need to implement all methods for mocking
+        telemetry = {
+            getLoggerForRevision: jest.fn().mockReturnValue(logger),
+            logBlockVerificationError: jest.fn(),
+            uploadFailed: jest.fn(),
+            uploadFinished: jest.fn(),
+        };
+
+        // @ts-expect-error No need to implement all methods for mocking
+        apiService = {
+            requestBlockUpload: jest.fn().mockImplementation((_, __, blocks) => ({
+                blockTokens: blocks.contentBlocks.map((block: { index: number }) => ({
+                    index: block.index,
+                    bareUrl: `bareUrl/block:${block.index}`,
+                    token: `token/block:${block.index}`,
+                })),
+                thumbnailTokens: (blocks.thumbnails || []).map((thumbnail: { type: number }) => ({
+                    type: thumbnail.type,
+                    bareUrl: `bareUrl/thumbnail:${thumbnail.type}`,
+                    token: `token/thumbnail:${thumbnail.type}`,
+                })),
+            })),
+            uploadBlock: jest.fn().mockImplementation(mockUploadBlock),
+        };
+
+        // @ts-expect-error No need to implement all methods for mocking
+        cryptoService = {
+            encryptThumbnail: jest.fn().mockImplementation(async (_, thumbnail) => ({
+                type: thumbnail.type,
+                encryptedData: thumbnail.thumbnail,
+                originalSize: thumbnail.thumbnail.length,
+                encryptedSize: thumbnail.thumbnail + 1000,
+                hashPromise: Promise.resolve('thumbnailHash'),
+            })),
+            encryptBlock: jest.fn().mockImplementation(mockEncryptBlock),
+        };
+
+        // @ts-expect-error No need to implement all methods for mocking
+        uploadManager = {
+            commitDraft: jest.fn().mockResolvedValue(undefined),
+        };
+
+        // @ts-expect-error No need to implement all methods for mocking
+        blockVerifier = {
+            verifyBlock: jest.fn().mockResolvedValue(undefined),
+        };
+
+        revisionDraft = {
+            nodeRevisionUid: 'testVol~testNode~testRev',
+            nodeUid: 'testVol~testNode',
+            nodeKeys: {
+                signingKeys: {
+                    addressId: 'addressId',
+                },
+            },
+        } as NodeRevisionDraft;
+
+        metadata = {
+            // 3 blocks: 4 + 4 + 2 MB
+            expectedSize: 10 * 1024 * 1024,
+        } as UploadMetadata;
+
+        controller = new UploadController();
+        onFinish = jest.fn();
+        abortController = new AbortController();
+
+        uploader = new StreamUploader(
+            telemetry,
+            apiService,
+            cryptoService,
+            uploadManager,
+            blockVerifier,
+            revisionDraft,
+            metadata,
+            onFinish,
+            controller,
+            abortController,
+        );
+    });
+
+    describe('start', () => {
+        let thumbnails: Thumbnail[];
+        let thumbnailSize: number;
+
+        let onProgress: (uploadedBytes: number) => void;
+        let stream: ReadableStream<Uint8Array>;
+
+        const verifySuccess = async () => {
+            const result = await uploader.start(stream, thumbnails, onProgress);
+
+            expect(result).toEqual({
+                nodeRevisionUid: 'testVol~testNode~testRev',
+                nodeUid: 'testVol~testNode',
+            });
+
+            const numberOfExpectedBlocks = Math.ceil(metadata.expectedSize / FILE_CHUNK_SIZE);
+            expect(uploadManager.commitDraft).toHaveBeenCalledTimes(1);
+            expect(uploadManager.commitDraft).toHaveBeenCalledWith(
+                revisionDraft,
+                expect.anything(),
+                {
+                    size: metadata.expectedSize,
+                    blockSizes: metadata.expectedSize
+                        ? [
+                              ...Array(numberOfExpectedBlocks - 1).fill(FILE_CHUNK_SIZE),
+                              metadata.expectedSize % FILE_CHUNK_SIZE,
+                          ]
+                        : [],
+                    modificationTime: undefined,
+                    digests: {
+                        sha1: expect.anything(),
+                    },
+                },
+                metadata.additionalMetadata,
+                {
+                    checksumVerified: !!metadata.expectedSha1,
+                },
+            );
+            expect(telemetry.uploadFinished).toHaveBeenCalledTimes(1);
+            expect(telemetry.uploadFinished).toHaveBeenCalledWith('testVol~testNode~testRev', metadata.expectedSize + thumbnailSize);
+            expect(telemetry.uploadFailed).not.toHaveBeenCalled();
+            expect(onFinish).toHaveBeenCalledTimes(1);
+            expect(onFinish).toHaveBeenCalledWith(false);
+        };
+
+        const verifyFailure = async (
+            error: string,
+            uploadedBytes: number | undefined,
+            expectedSize = metadata.expectedSize,
+        ) => {
+            const promise = uploader.start(stream, thumbnails, onProgress);
+            await expect(promise).rejects.toThrow(error);
+
+            expect(telemetry.uploadFinished).not.toHaveBeenCalled();
+            expect(telemetry.uploadFailed).toHaveBeenCalledTimes(1);
+            expect(telemetry.uploadFailed).toHaveBeenCalledWith(
+                'testVol~testNode~testRev',
+                new Error(error),
+                uploadedBytes === undefined ? expect.anything() : uploadedBytes,
+                expectedSize,
+            );
+            expect(onFinish).toHaveBeenCalledTimes(1);
+            expect(onFinish).toHaveBeenCalledWith(true);
+        };
+
+        const verifyOnProgress = async (uploadedBytes: number[]) => {
+            expect(onProgress).toHaveBeenCalledTimes(uploadedBytes.length);
+            let fileProgress = 0;
+            for (let i = 0; i < uploadedBytes.length; i++) {
+                fileProgress += uploadedBytes[i];
+                expect(onProgress).toHaveBeenNthCalledWith(i + 1, fileProgress);
+            }
+        };
+
+        beforeEach(() => {
+            onProgress = jest.fn();
+            thumbnails = [
+                {
+                    type: ThumbnailType.Type1,
+                    thumbnail: new Uint8Array(1024),
+                },
+            ];
+            thumbnailSize = thumbnails.reduce((acc, thumbnail) => acc + thumbnail.thumbnail.length, 0);
+            stream = new ReadableStream({
+                start(controller) {
+                    const chunkSize = 1024;
+                    const chunkCount = metadata.expectedSize / chunkSize;
+                    for (let i = 1; i <= chunkCount; i++) {
+                        controller.enqueue(new Uint8Array(chunkSize));
+                    }
+                    controller.close();
+                },
+            });
+        });
+
+        it('should upload successfully', async () => {
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(1);
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(4); // 3 blocks + 1 thumbnail
+            expect(blockVerifier.verifyBlock).toHaveBeenCalledTimes(3); // 3 blocks
+            expect(telemetry.logBlockVerificationError).not.toHaveBeenCalled();
+            await verifyOnProgress([thumbnailSize, 4 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024]);
+        });
+
+        it('should upload successfully empty file without thumbnail', async () => {
+            metadata = {
+                expectedSize: 0,
+            } as UploadMetadata;
+            stream = new ReadableStream({
+                start(controller) {
+                    controller.close();
+                },
+            });
+            thumbnails = [];
+            thumbnailSize = 0;
+            uploader = new StreamUploader(
+                telemetry,
+                apiService,
+                cryptoService,
+                uploadManager,
+                blockVerifier,
+                revisionDraft,
+                metadata,
+                onFinish,
+                controller,
+                abortController,
+            );
+
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(0);
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(0);
+            expect(blockVerifier.verifyBlock).toHaveBeenCalledTimes(0);
+            await verifyOnProgress([]);
+        });
+
+        it('should upload successfully empty file with thumbnail', async () => {
+            metadata = {
+                expectedSize: 0,
+            } as UploadMetadata;
+            stream = new ReadableStream({
+                start(controller) {
+                    controller.close();
+                },
+            });
+            uploader = new StreamUploader(
+                telemetry,
+                apiService,
+                cryptoService,
+                uploadManager,
+                blockVerifier,
+                revisionDraft,
+                metadata,
+                onFinish,
+                controller,
+                abortController,
+            );
+
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(1);
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(1);
+            expect(blockVerifier.verifyBlock).toHaveBeenCalledTimes(0);
+            await verifyOnProgress([thumbnailSize]);
+        });
+
+        it('should throw when thumbnail content is empty', async () => {
+            thumbnails = [{ type: ThumbnailType.Type1, thumbnail: new Uint8Array(0) }];
+
+            await verifyFailure('Thumbnail content must not be empty', 0);
+            expect(cryptoService.encryptThumbnail).not.toHaveBeenCalled();
+        });
+
+        it('should handle failure when encrypting thumbnails', async () => {
+            cryptoService.encryptThumbnail = jest.fn().mockImplementation(async function () {
+                throw new Error('Failed to encrypt thumbnail');
+            });
+
+            await verifyFailure('Failed to encrypt thumbnail', 0);
+            expect(cryptoService.encryptThumbnail).toHaveBeenCalledTimes(1);
+        });
+
+        it('should handle failure when encrypting block', async () => {
+            cryptoService.encryptBlock = jest.fn().mockImplementation(async function () {
+                throw new Error('Failed to encrypt block');
+            });
+
+            // Thumbnail are uploaded with the first content block. If the
+            // content block fails to encrypt, nothing is uploaded.
+            await verifyFailure('Failed to encrypt block', 0);
+            // 1 block + 1 retry, others are skipped
+            expect(cryptoService.encryptBlock).toHaveBeenCalledTimes(2);
+        });
+
+        it('should handle one time-off failure when encrypting block', async () => {
+            let count = 0;
+            cryptoService.encryptBlock = jest.fn().mockImplementation(async function (verifyBlock, keys, block, index) {
+                if (count === 0) {
+                    count++;
+                    throw new Error('Failed to encrypt block');
+                }
+                return mockEncryptBlock(verifyBlock, keys, block, index);
+            });
+
+            await verifySuccess();
+            // 1 block + 1 retry + 2 other blocks without retry
+            expect(cryptoService.encryptBlock).toHaveBeenCalledTimes(4);
+            await verifyOnProgress([thumbnailSize, 4 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024]);
+        });
+
+        it('should handle failure when requesting tokens', async () => {
+            apiService.requestBlockUpload = jest.fn().mockImplementation(async function () {
+                throw new Error('Failed to request tokens');
+            });
+
+            await verifyFailure('Failed to request tokens', 0);
+        });
+
+        it('should handle failure when uploading thumbnail', async () => {
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/thumbnail:1') {
+                    throw new Error('Failed to upload thumbnail');
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            // 10 MB uploaded as blocks still uploaded
+            await verifyFailure('Failed to upload thumbnail', 10 * 1024 * 1024);
+        });
+
+        it('should handle one time-off failure when uploading thubmnail', async () => {
+            let count = 0;
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/thumbnail:1' && count === 0) {
+                    count++;
+                    throw new Error('Failed to upload thumbnail');
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(1);
+            // 3 blocks + 1 retry + 1 thumbnail
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(5);
+            await verifyOnProgress([4 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024]);
+        });
+
+        it('should handle failure when uploading block', async () => {
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:3') {
+                    throw new Error('Failed to upload block');
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            // ~8 MB uploaded as 2 first blocks + 1 thumbnail still uploaded
+            await verifyFailure('Failed to upload block', 8 * 1024 * 1024 + 1024);
+        });
+
+        it('should handle one time-off failure when uploading block', async () => {
+            let count = 0;
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:2' && count === 0) {
+                    count++;
+                    throw new Error('Failed to upload block');
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(1);
+            // 3 blocks + 1 retry + 1 thumbnail
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(5);
+            await verifyOnProgress([1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024]);
+        });
+
+        it('should handle timeout when uploading block', async () => {
+            const error = new Error('TimeoutError');
+            error.name = 'TimeoutError';
+
+            let count = 0;
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:1' && count === 0) {
+                    count++;
+                    throw error;
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            expect((uploader as any).maxUploadingBlocks).toEqual(5);
+            await verifySuccess();
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(1);
+            // 3 blocks + 1 timeout retry + 1 thumbnail
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(5);
+            expect(logger.warn).toHaveBeenCalledTimes(2);
+            expect(logger.warn).toHaveBeenCalledWith(
+                'block 1:token/block:1: Upload timeout, limiting upload capacity to 1 block',
+            );
+            expect(logger.warn).toHaveBeenCalledWith('block 1:token/block:1: Upload timeout, retrying');
+            expect((uploader as any).maxUploadingBlocks).toEqual(1);
+        });
+
+        it('should not call onProgress after upload has failed', async () => {
+            let firstBlockPromise;
+
+            // Block 1 delays before reporting progress; block 2 fails immediately.
+            // This simulates block 1's progress callback firing after we've already
+            // entered the catch block.
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:1') {
+                    firstBlockPromise = new Promise((resolve) => setTimeout(resolve, 100));
+                    await firstBlockPromise;
+                    return mockUploadBlock(bareUrl, token, block, onProgress);
+                }
+                if (token === 'token/block:2') {
+                    throw new Error('Failed to upload block');
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            const startPromise = uploader.start(stream, thumbnails, onProgress);
+            await expect(startPromise).rejects.toThrow('Failed to upload block');
+
+            expect(firstBlockPromise).toBeDefined();
+            await firstBlockPromise!;
+
+            // Mocked file has 3 blocks - 2x 4 MB blocks and 1x 2 MB block
+            // First block is delayed - should not be reported.
+            // Second block is failed - should not be reported.
+            // Third block is successfull before second block is failed - should be reported.
+            await verifyOnProgress([thumbnailSize, 2 * 1024 * 1024]);
+        });
+
+        it('limitUploadCapacity should wait for the previous blocks to finish', async () => {
+            const error = new Error('TimeoutError');
+            error.name = 'TimeoutError';
+
+            const events: string[] = [];
+            let block1Resolver: (() => void) | undefined;
+            let block2FirstAttempt = true;
+
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:1') {
+                    events.push('block1:upload:start');
+                    await new Promise<void>((resolve) => {
+                        block1Resolver = resolve;
+                    });
+                    events.push('block1:upload:end');
+                    return mockUploadBlock(bareUrl, token, block, onProgress);
+                }
+                if (token === 'token/block:2') {
+                    if (block2FirstAttempt) {
+                        block2FirstAttempt = false;
+                        events.push('block2:timeout');
+                        // Resolve block 1 after a small delay to simulate real-world conditions
+                        setTimeout(() => block1Resolver?.(), 100);
+                        throw error;
+                    }
+                    events.push('block2:retry');
+                    return mockUploadBlock(bareUrl, token, block, onProgress);
+                }
+                // Block 3 and thumbnails proceed normally
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            await verifySuccess();
+
+            expect(events).toMatchObject([
+                'block1:upload:start',
+                'block2:timeout',
+                'block1:upload:end',
+                'block2:retry',
+            ]);
+
+            // Also verify the warning messages were logged
+            expect(logger.warn).toHaveBeenCalledWith(
+                'block 2:token/block:2: Upload timeout, limiting upload capacity to 1 block',
+            );
+            expect(logger.warn).toHaveBeenCalledWith('block 2:token/block:2: Upload timeout, retrying');
+        });
+
+        it('should handle expired token when uploading block', async () => {
+            let count = 0;
+            apiService.uploadBlock = jest.fn().mockImplementation(async function (bareUrl, token, block, onProgress) {
+                if (token === 'token/block:2' && count === 0) {
+                    count++;
+                    throw new APIHTTPError('Expired token', HTTPErrorCode.NOT_FOUND);
+                }
+                return mockUploadBlock(bareUrl, token, block, onProgress);
+            });
+
+            await verifySuccess();
+            // 1 for first try + 1 for retry
+            expect(apiService.requestBlockUpload).toHaveBeenCalledTimes(2);
+            expect(apiService.requestBlockUpload).toHaveBeenCalledWith(
+                revisionDraft.nodeRevisionUid,
+                revisionDraft.nodeKeys.signingKeys.addressId,
+                {
+                    contentBlocks: [
+                        {
+                            index: 2,
+                            armoredSignature: 'signature',
+                            verificationToken: 'verificationToken',
+                        },
+                    ],
+                },
+            );
+            // 3 blocks + 1 retry + 1 thumbnail
+            expect(apiService.uploadBlock).toHaveBeenCalledTimes(5);
+            await verifyOnProgress([1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024]);
+        });
+
+        describe('verifyIntegrity', () => {
+            it('should report block verification error', async () => {
+                blockVerifier.verifyBlock = jest.fn().mockRejectedValue(new IntegrityError('Block verification error'));
+                await verifyFailure('Block verification error', 0);
+                expect(telemetry.logBlockVerificationError).toHaveBeenCalledWith('testVol~testNode', false);
+            });
+
+            it('should report block verification error when retry helped', async () => {
+                blockVerifier.verifyBlock = jest
+                    .fn()
+                    .mockRejectedValueOnce(new IntegrityError('Block verification error'))
+                    .mockResolvedValue({
+                        verificationToken: new Uint8Array(),
+                    });
+                await verifySuccess();
+                expect(telemetry.logBlockVerificationError).toHaveBeenCalledWith('testVol~testNode', true);
+            });
+
+            it('should throw an error if block count does not match', async () => {
+                uploader = new StreamUploader(
+                    telemetry,
+                    apiService,
+                    cryptoService,
+                    uploadManager,
+                    blockVerifier,
+                    revisionDraft,
+                    {
+                        // Fake expected size to break verification
+                        expectedSize: 1 * 1024 * 1024 + 1024,
+                    } as UploadMetadata,
+                    onFinish,
+                    controller,
+                    abortController,
+                );
+
+                await verifyFailure(
+                    'Some file parts failed to upload',
+                    10 * 1024 * 1024 + 1024,
+                    1 * 1024 * 1024 + 1024,
+                );
+            });
+
+            it('should throw an error if file size does not match', async () => {
+                cryptoService.encryptBlock = jest.fn().mockImplementation(async (_, __, block, index) => ({
+                    index,
+                    encryptedData: block,
+                    armoredSignature: 'signature',
+                    verificationToken: 'verificationToken',
+                    originalSize: 0, // Fake original size to break verification
+                    encryptedSize: block.length + 10000,
+                    hash: 'blockHash',
+                }));
+
+                await verifyFailure('Some file bytes failed to upload', 10 * 1024 * 1024 + 1024);
+            });
+
+            it('should succeed with matching expectedSha1', async () => {
+                metadata.expectedSha1 = '8c206a1a87599f532ce68675536f0b1546900d7a';
+
+                uploader = new StreamUploader(
+                    telemetry,
+                    apiService,
+                    cryptoService,
+                    uploadManager,
+                    blockVerifier,
+                    revisionDraft,
+                    metadata,
+                    onFinish,
+                    controller,
+                    abortController,
+                );
+
+                await verifySuccess();
+            });
+
+            it('should throw an error if SHA1 does not match', async () => {
+                metadata.expectedSha1 = 'wrong_sha1_hash_that_will_not_match';
+
+                uploader = new StreamUploader(
+                    telemetry,
+                    apiService,
+                    cryptoService,
+                    uploadManager,
+                    blockVerifier,
+                    revisionDraft,
+                    metadata,
+                    onFinish,
+                    controller,
+                    abortController,
+                );
+
+                await verifyFailure('File hash does not match expected hash', 10 * 1024 * 1024 + 1024);
+            });
+        });
+    });
+
+    describe('abort', () => {
+        const thumbnails: Thumbnail[] = [];
+        let stream: ReadableStream<Uint8Array>;
+        let streamController: ReadableStreamDefaultController<Uint8Array>;
+
+        beforeEach(() => {
+            stream = new ReadableStream({
+                start(controller) {
+                    streamController = controller;
+                },
+            });
+        });
+
+        it('should abort at the start', async () => {
+            const promise = uploader.start(stream, thumbnails);
+            abortController.abort();
+            await expect(promise).rejects.toThrow('Operation aborted');
+        });
+
+        it('should abort when encrypting blocks', async () => {
+            const promise = uploader.start(stream, thumbnails);
+            streamController.enqueue(new Uint8Array(FILE_CHUNK_SIZE));
+            streamController.enqueue(new Uint8Array(FILE_CHUNK_SIZE));
+            streamController.enqueue(new Uint8Array(FILE_CHUNK_SIZE));
+            abortController.abort();
+            await expect(promise).rejects.toThrow('Operation aborted');
+        });
+
+        it('should abort when uploading block', async () => {
+            apiService.uploadBlock = jest.fn().mockImplementation(async function () {
+                abortController.abort();
+            });
+
+            const promise = uploader.start(stream, thumbnails);
+            streamController.enqueue(new Uint8Array(FILE_CHUNK_SIZE));
+
+            await expect(promise).rejects.toThrow('Operation aborted');
+        });
+    });
+});

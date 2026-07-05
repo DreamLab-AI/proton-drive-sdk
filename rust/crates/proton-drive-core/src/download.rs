@@ -1,4 +1,4 @@
-//! Block-download protocol. Ports `js/sdk/src/internal/download/` happy path.
+//! Block-download protocol. Ports `client/js/src/internal/download/` happy path.
 //!
 //! Implements ADR-0009: sequential block fetch, SHA-256 ciphertext integrity
 //! check, per-revision manifest signature verification, per-block decryption,

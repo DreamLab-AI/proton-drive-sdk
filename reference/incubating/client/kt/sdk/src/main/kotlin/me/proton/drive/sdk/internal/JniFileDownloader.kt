@@ -1,0 +1,64 @@
+package me.proton.drive.sdk.internal
+
+import me.proton.drive.sdk.entity.FileDownloaderRequest
+import me.proton.drive.sdk.extension.LongResponseCallback
+import me.proton.drive.sdk.extension.toLongResponse
+import me.proton.drive.sdk.extension.toProtobuf
+import proton.drive.sdk.ProtonDriveSdk
+import proton.drive.sdk.downloadToStreamRequest
+import proton.drive.sdk.fileDownloaderFreeRequest
+import proton.drive.sdk.request
+import java.nio.ByteBuffer
+
+class JniFileDownloader internal constructor() : JniBaseProtonDriveSdk() {
+
+    suspend fun getFileDownloader(
+        clientHandle: Long,
+        cancellationTokenSourceHandle: Long,
+        request: FileDownloaderRequest,
+    ): Long = executeOnce("create", LongResponseCallback) {
+        driveClientGetFileDownloader = request.toProtobuf(clientHandle, cancellationTokenSourceHandle)
+    }
+
+    suspend fun downloadToStream(
+        handle: Long,
+        cancellationTokenSourceHandle: Long,
+        onWrite: suspend (ByteBuffer) -> Unit,
+        onSeek: ((Long, Int) -> Long)? = null,
+        onProgress: suspend (ProtonDriveSdk.ProgressUpdate) -> Unit,
+        coroutineScopeProvider: CoroutineScopeProvider,
+    ): Long = executePersistent(
+        clientBuilder = { continuation ->
+            ProtonDriveSdkNativeClient(
+                name = method("downloadToStream"),
+                response = continuation.toLongResponse().asClientResponseCallback(),
+                write = onWrite,
+                seek = onSeek,
+                progress = onProgress,
+                logger = internalLogger,
+                coroutineScopeProvider = coroutineScopeProvider,
+            )
+        },
+        requestBuilder = { client ->
+            request {
+                downloadToStream = downloadToStreamRequest {
+                    this.downloaderHandle = handle
+                    this.cancellationTokenSourceHandle = cancellationTokenSourceHandle
+                    writeAction = ProtonDriveSdkNativeClient.getWritePointer()
+                    progressAction = ProtonDriveSdkNativeClient.getProgressPointer()
+                    cancelAction = JniJob.getCancelPointer()
+                    if (onSeek != null) {
+                        seekAction = ProtonDriveSdkNativeClient.getSeekPointer()
+                    }
+                }
+            }
+        }
+    )
+
+    fun free(handle: Long) {
+        dispatch("free") {
+            fileDownloaderFree = fileDownloaderFreeRequest { fileDownloaderHandle = handle }
+        }
+        releaseAll()
+    }
+}

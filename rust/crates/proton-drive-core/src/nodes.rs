@@ -1,4 +1,4 @@
-//! Node aggregate. Mirrors `js/sdk/src/interface/nodes.ts`.
+//! Node aggregate. Mirrors `client/js/src/interface/nodes.ts`.
 
 use crate::account::Author;
 use crate::error::Error;

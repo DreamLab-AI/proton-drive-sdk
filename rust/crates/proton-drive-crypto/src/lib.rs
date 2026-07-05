@@ -1,6 +1,6 @@
 //! OpenPGP crypto (ADR-0002) — rpgp v0.16 implementation.
 //!
-//! Mirrors `js/sdk/src/crypto/interface.ts`.
+//! Mirrors `client/js/src/crypto/interface.ts`.
 
 #![forbid(unsafe_code)]
 

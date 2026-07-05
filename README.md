@@ -65,11 +65,11 @@ Set `PDTUI_LOG=info` (or `debug`) for structured logs.
 | [`docs/`](./docs/) | PRDs, domain model, and [ADRs](./docs/adr/README.md) for the port |
 | [`tests/`](./tests/) | Cross-language wire-format fixtures consumed by the crypto tests |
 | [`scripts/`](./scripts/) | Dev tooling — session config, JS cross-check probes |
-| [`reference/`](./reference/) | Upstream Proton SDKs (JS / C# / Kotlin / Swift) — wire-format source of truth |
+| [`reference/`](./reference/) | Vendored upstream Proton SDKs monorepo (JS / C# / Kotlin / Swift) — wire-format source of truth. See [`reference/VENDORED.md`](./reference/VENDORED.md) for the pinned commit |
 | [`HANDOFF.md`](./HANDOFF.md) | Engineering handoff and current status |
 
 The Rust API crate generates its cross-language wire types at build time from
-the protobufs in [`reference/cs/sdk/src/protos/`](./reference/cs/sdk/src/protos/).
+the protobuf in [`reference/client/cs/src/protos/`](./reference/client/cs/src/protos/).
 
 ## Operational requirements
 
@@ -91,9 +91,9 @@ interoperate after it lands.
 
 The upstream native SDKs under [`reference/`](./reference/):
 
-- **TypeScript** — [`reference/js/sdk/`](./reference/js/sdk/) ([changelog](./reference/js/CHANGELOG.md)), published as [`@protontech/drive-sdk`](https://www.npmjs.com/package/@protontech/drive-sdk).
-- **C#** — [`reference/cs/sdk/`](./reference/cs/sdk/) ([changelog](./reference/cs/CHANGELOG.md)).
-- **Kotlin** & **Swift** — bindings wrapping the C# SDK ([`reference/kt/`](./reference/kt/), [`reference/swift/ProtonDriveSDK/`](./reference/swift/ProtonDriveSDK/)).
+- **TypeScript** — [`reference/client/js/`](./reference/client/js/) ([changelog](./reference/client/js/CHANGELOG.md)), published as [`@protontech/drive-sdk`](https://www.npmjs.com/package/@protontech/drive-sdk).
+- **C#** — [`reference/client/cs/`](./reference/client/cs/) ([changelog](./reference/client/cs/CHANGELOG.md)).
+- **Kotlin** & **Swift** — bindings wrapping the C# SDK ([`reference/incubating/client/kt/`](./reference/incubating/client/kt/), [`reference/incubating/client/swift/ProtonDriveSDK/`](./reference/incubating/client/swift/ProtonDriveSDK/)).
 
 ## License
 

@@ -1,0 +1,320 @@
+import SwiftProtobuf
+import CProtonDriveSDK
+
+extension Message {
+    func serializedIntoRequest() throws -> ByteArray {
+        try packIntoRequest().serialisedByteArray()
+    }
+
+    func serializedIntoResponse() throws -> ByteArray {
+        try packIntoResponse().serialisedByteArray()
+    }
+
+    /// Packs any request into a Proton_Drive_Sdk_Request.
+    func packIntoRequest() throws -> Message {
+        switch self {
+
+        case let request as Proton_Drive_Sdk_CancellationTokenSourceCreateRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .cancellationTokenSourceCreate(request)
+            }
+
+        case let request as Proton_Drive_Sdk_CancellationTokenSourceCancelRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .cancellationTokenSourceCancel(request)
+            }
+
+        case let request as Proton_Drive_Sdk_CancellationTokenSourceFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .cancellationTokenSourceFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_StreamReadRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .streamRead(request)
+            }
+
+        case let request as Proton_Drive_Sdk_LoggerProviderCreate:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .loggerProviderCreate(request)
+            }
+
+            // MARK: - Drive Client
+
+        case let request as Proton_Drive_Sdk_DriveClientCreateRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientCreate(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientCreateFolderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientCreateFolder(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientGetFileUploaderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientGetFileUploader(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientGetFileRevisionUploaderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientGetFileRevisionUploader(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientGetFileDownloaderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientGetFileDownloader(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientGetAvailableNameRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientGetAvailableName(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientRenameRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientRename(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientTrashNodesRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientTrashNodes(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientEnumerateThumbnailsRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientEnumerateThumbnails(request)
+            }
+
+            // MARK: - Uploads
+
+        case let request as Proton_Drive_Sdk_UploadFromFileRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadFromFile(request)
+            }
+
+        case let request as Proton_Drive_Sdk_FileUploaderFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .fileUploaderFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerIsPausedRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerIsPaused(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerAwaitCompletionRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerAwaitCompletion(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerPauseRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerPause(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerResumeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerResume(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerDisposeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerDispose(request)
+            }
+
+        case let request as Proton_Drive_Sdk_UploadControllerFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .uploadControllerFree(request)
+            }
+
+            // MARK: - Downloads
+
+        case let request as Proton_Drive_Sdk_DownloadToFileRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadToFile(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadToStreamRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadToStream(request)
+            }
+
+        case let request as Proton_Drive_Sdk_FileDownloaderFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .fileDownloaderFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerIsPausedRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerIsPaused(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerIsDownloadCompleteWithVerificationIssueRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerIsDownloadCompleteWithVerificationIssue(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerAwaitCompletionRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerAwaitCompletion(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerPauseRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerPause(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerResumeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerResume(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DownloadControllerFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .downloadControllerFree(request)
+            }
+
+            // MARK: - Photo Client
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientCreateRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientCreate(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientEnumerateThumbnailsRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientEnumerateThumbnails(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientEnumerateTimelineRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientEnumerateTimeline(request)
+            }
+
+            // MARK: - Photo Downloads
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientGetPhotoDownloaderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientGetPhotoDownloader(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientDownloadToFileRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientDownloadToFile(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientDownloadToStreamRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientDownloadToStream(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientDownloaderFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientDownloaderFree(request)
+            }
+
+            // MARK: - Photo Uploads
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientGetPhotoUploaderRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientGetPhotoUploader(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientUploadFromFileRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientUploadFromFile(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientUploadFromStreamRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientUploadFromStream(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DrivePhotosClientUploaderFreeRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .drivePhotosClientUploaderFree(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientCreateDeviceRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientCreateDevice(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientRenameDeviceRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientRenameDevice(request)
+            }
+
+        case let request as Proton_Drive_Sdk_DriveClientDeleteDeviceRequest:
+            Proton_Drive_Sdk_Request.with {
+                $0.payload = .driveClientDeleteDevice(request)
+            }
+
+        default:
+            assertionFailure("Unknown request")
+            throw ProtonDriveSDKError(interopError: .wrongProto(message: "Unknown request type: \(self)"))
+        }
+    }
+
+    private func packIntoResponse() throws -> Message {
+        if let error = self as? Proton_Drive_Sdk_Error {
+            return Proton_Drive_Sdk_Response.with {
+                $0.error = error
+            }
+        }
+        switch self {
+        case let httpResponse as Proton_Drive_Sdk_HttpResponse:
+            let value = try Google_Protobuf_Any.init(message: httpResponse)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        case let repeatedBytes as Proton_Drive_Sdk_RepeatedBytesValue:
+            let value = try Google_Protobuf_Any.init(message: repeatedBytes)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        case let bytesValue as Google_Protobuf_BytesValue:
+            let value = try Google_Protobuf_Any.init(message: bytesValue)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        case let address as Proton_Drive_Sdk_Address:
+            let value = try Google_Protobuf_Any.init(message: address)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        case let error as Proton_Drive_Sdk_Error:
+            return Proton_Drive_Sdk_Response.with {
+                $0.error = error
+            }
+        case let intValue as Google_Protobuf_Int64Value:
+            let value = try Google_Protobuf_Any.init(message: intValue)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        case let intValue as Google_Protobuf_Int32Value:
+            let value = try Google_Protobuf_Any.init(message: intValue)
+            return Proton_Drive_Sdk_Response.with {
+                $0.value = value
+            }
+        default:
+            assertionFailure("Unknown response type: \(self)")
+            throw ProtonDriveSDKError(interopError: .wrongProto(message: "Unknown response type: \(self)"))
+        }
+    }
+
+    private func serialisedByteArray() throws -> ByteArray {
+        ByteArray(data: try serializedData())
+    }
+}
