@@ -66,6 +66,22 @@ struct EnvelopeProbe {
     error: Option<String>,
 }
 
+/// Name hash: `HMAC-SHA256(parent_hash_key, name_bytes)` → hex. Mirrors JS
+/// `generateLookupHash` (`reference/js/sdk/src/crypto/driveCrypto.ts:439-443`:
+/// `computeHmacSignature(importHmacKey(parentHashKey), utf8(newName)).toHex()`).
+/// The key is the parent folder's decrypted `NodeHashKey` bytes; the message
+/// is the UTF-8 file name. Pulled out to a standalone, pure function so a
+/// known-answer test (`name_hash_hex_matches_known_answer`) can pin the exact
+/// byte-for-byte computation without driving the full upload protocol — B1
+/// (see `docs/IMPLEMENTATION-STATUS.md`) was this same computation done as
+/// plain SHA-256 instead of HMAC-SHA256, and previously blocked every upload.
+fn compute_name_hash_hex(parent_hash_key: &[u8], name: &str) -> Result<String> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(parent_hash_key)
+        .map_err(|e| Error::Internal(format!("HMAC key init: {e}")))?;
+    mac.update(name.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
 /// Truncated, lossy view of a response body for error diagnostics.
 fn body_snippet(body: &[u8]) -> String {
     const MAX: usize = 512;
@@ -316,12 +332,7 @@ impl ProtonFileUploader {
         // parent folder's decrypted NodeHashKey bytes; the message is the
         // UTF-8 file name. The server validates this against the parent's
         // hash-key namespace, so a wrong key yields HTTP 422.
-        let name_hash_hex = {
-            let mut mac = <Hmac<Sha256>>::new_from_slice(&parent_hash_key)
-                .map_err(|e| Error::Internal(format!("HMAC key init: {e}")))?;
-            mac.update(self.name.as_bytes());
-            hex::encode(mac.finalize().into_bytes())
-        };
+        let name_hash_hex = compute_name_hash_hex(&parent_hash_key, &self.name)?;
 
         // ── step 2: POST create file node ─────────────────────────────────────
         let create_req = CreateFileRequest {
@@ -1217,6 +1228,32 @@ mod tests {
         assert!(json.contains("\"BlockSizes\":[5678]"));
     }
 
+    /// Known-answer test locking `compute_name_hash_hex`'s exact byte output
+    /// against an independent HMAC-SHA256 computation. Provenance: Node's
+    /// built-in `crypto` module (standard HMAC-SHA256 — the same primitive
+    /// JS's `@protontech/crypto/subtle/hmac.ts` `importKey`/`signData` wraps
+    /// for `generateLookupHash`, `reference/js/sdk/src/crypto/driveCrypto.ts:439-443`;
+    /// `@protontech/crypto` itself isn't vendored under `reference/`, so this
+    /// cross-checks the algorithm rather than shelling out to their exact lib):
+    /// ```text
+    /// node -e 'console.log(require("crypto")
+    ///   .createHmac("sha256", Buffer.from("my-hash-key", "utf8"))
+    ///   .update("test-file.txt", "utf8").digest("hex"))'
+    /// ```
+    /// computed 2026-07-05, matching the `key`/`name` pair
+    /// `mock_upload_protocol_flow` below drives through the real upload path.
+    /// Regression class: B1 (name hash computed as plain SHA-256 instead of
+    /// HMAC-SHA256) previously blocked every upload with HTTP 422 — see
+    /// `docs/IMPLEMENTATION-STATUS.md`.
+    const NAME_HASH_KAT_HEX: &str =
+        "57926179833b9813451381f9e7af89dec9f49ddc5b8bc0cabae1079805ee77ca";
+
+    #[test]
+    fn name_hash_hex_matches_known_answer() {
+        let got = compute_name_hash_hex(b"my-hash-key", "test-file.txt").unwrap();
+        assert_eq!(got, NAME_HASH_KAT_HEX);
+    }
+
     // ── Mock-HTTP protocol flow test ──────────────────────────────────────────
     // This test exercises the 9-step protocol using in-process fakes for the
     // HTTP client, crypto module, and account — without hitting the real API.
@@ -1657,6 +1694,24 @@ mod tests {
         );
         // paths[6] is the blob upload path (bare_url)
         assert!(paths[7].contains("/revisions/"), "8 commit: {}", paths[7]);
+
+        // Regression pin for B1 (name hash computed as plain SHA-256 instead
+        // of HMAC-SHA256 — see docs/IMPLEMENTATION-STATUS.md): the recorded
+        // create-file POST body's Hash field must be the known-answer
+        // HMAC-SHA256 value for key=b"my-hash-key" (FakeCrypto strips the
+        // "FAKE_ENC:" prefix from the FolderProperties.NodeHashKey fixture
+        // above, leaving "my-hash-key") and name="test-file.txt" —
+        // see `name_hash_hex_matches_known_answer` for how NAME_HASH_KAT_HEX
+        // was independently derived.
+        let create_body = http
+            .json_body_containing("/files")
+            .expect("create-file POST body must be recorded");
+        assert_eq!(
+            create_body["Hash"].as_str(),
+            Some(NAME_HASH_KAT_HEX),
+            "CreateFile request's Hash must be the HMAC-SHA256 name hash, not a \
+             regression (e.g. plain SHA-256 — the historical B1 bug)"
+        );
     }
 
     // ── Draft-cleanup / checksum-verification tests ───────────────────────────

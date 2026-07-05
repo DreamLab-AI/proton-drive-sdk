@@ -615,3 +615,306 @@ pub use async_trait::async_trait as _async_trait;
 #[async_trait]
 trait _AssertSendSync: Send + Sync {}
 impl _AssertSendSync for ProtonDriveClient {}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+mod tests {
+    use super::*;
+    use crate::http::JsonResponse;
+    use bytes::Bytes;
+    use proton_drive_crypto::{EncryptOptions, RpgpCrypto, SrpModule};
+
+    /// Account fake for tests that never actually call it: the chain-walk
+    /// tests below leave every link's `SignatureEmail` as `None`, so
+    /// `resolve_node_key_via_chain`'s verification-key resolution always
+    /// takes the `openpgp.public_key(parent_ref)` fallback path, never
+    /// `account.address_public_keys`.
+    struct UnusedAccount;
+
+    #[async_trait]
+    impl crate::account::ProtonDriveAccount for UnusedAccount {
+        fn user_id(&self) -> &str {
+            "unused"
+        }
+        fn primary_email(&self) -> &str {
+            "unused@example.com"
+        }
+        async fn address_private_key(&self, _email: &str) -> Result<PrivateKey> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+        async fn address_public_keys(&self, _email: &str) -> Result<Vec<PublicKey>> {
+            Ok(Vec::new())
+        }
+        async fn address_id(&self, _email: &str) -> Result<String> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+        async fn key_password(&self) -> Result<String> {
+            Err(Error::Internal("account not used in this test".into()))
+        }
+    }
+
+    /// Responses keyed by a path substring, matched via `contains` (mirrors
+    /// `download.rs`'s `MockHttpClient`) — sufficient for the chain-walk's
+    /// repeated `GET /drive/shares/{share}/links/{id}` calls, which differ
+    /// only by the trailing link id.
+    struct ChainMockHttpClient {
+        responses: std::collections::HashMap<String, Bytes>,
+    }
+
+    impl ChainMockHttpClient {
+        fn new() -> Self {
+            Self {
+                responses: Default::default(),
+            }
+        }
+        fn add(&mut self, path_substr: impl Into<String>, body: impl Into<Bytes>) {
+            self.responses.insert(path_substr.into(), body.into());
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for ChainMockHttpClient {
+        async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
+            let body = self
+                .responses
+                .iter()
+                .find(|(k, _)| req.path.contains(k.as_str()))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| Bytes::from(r#"{"Code":2501,"Error":"not found"}"#));
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+        }
+
+        async fn request_blob(&self, _req: crate::http::BlobRequest) -> Result<JsonResponse> {
+            Err(Error::Internal("blob requests unused in this test".into()))
+        }
+    }
+
+    fn test_client(http: ChainMockHttpClient, crypto: Arc<RpgpCrypto>) -> ProtonDriveClient {
+        ProtonDriveClient::new(ProtonDriveClientOptions {
+            http_client: Arc::new(http),
+            entities_cache: Arc::new(proton_drive_cache::MemoryCache::<String>::new()),
+            crypto_cache: Arc::new(proton_drive_cache::MemoryCache::<CachedCryptoMaterial>::new()),
+            account: Arc::new(UnusedAccount),
+            openpgp: Arc::clone(&crypto) as Arc<dyn OpenPgpCrypto>,
+            srp: crypto as Arc<dyn SrpModule>,
+            config: ProtonDriveConfig::default(),
+            telemetry: None,
+            latest_event_id: None,
+        })
+    }
+
+    /// Builds a `GetLinkResponse` JSON body for the chain walk. All fields
+    /// unrelated to key derivation are filled with harmless placeholders.
+    fn link_json(
+        link_id: &str,
+        parent_link_id: Option<&str>,
+        node_key_armored: &str,
+        node_passphrase_b64: &str,
+    ) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": link_id,
+                "ParentLinkID": parent_link_id,
+                "Type": 1,
+                "Name": "irrelevant",
+                "NameSignatureEmail": null,
+                "Hash": null,
+                "MIMEType": null,
+                "State": 1,
+                "Size": 0,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "Trashed": null,
+                "NodeKey": node_key_armored,
+                "NodePassphrase": node_passphrase_b64,
+                "NodePassphraseSignature": "",
+                "SignatureEmail": null,
+                "FileProperties": null,
+                "FolderProperties": null,
+            }
+        })
+        .to_string()
+    }
+
+    /// Encrypt `passphrase` to `parent_pub` the way node passphrases are
+    /// encrypted on the wire: a plain PGP-encrypted message (PKESK + SEIPD),
+    /// base64 on the wire. The detached `NodePassphraseSignature` is a
+    /// separate field checked non-fatally, so no signing key is needed here.
+    async fn encrypt_passphrase_b64(
+        crypto: &RpgpCrypto,
+        passphrase: &[u8],
+        parent_pub: &PublicKey,
+    ) -> String {
+        use base64::Engine as _;
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let message = crypto
+            .encrypt(
+                passphrase,
+                &session_key,
+                std::slice::from_ref(parent_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(message)
+    }
+
+    /// Deterministic 3-deep parent-chain derivation: share root (L1) → mid
+    /// folder (L2) → target leaf (L3), each level's `NodePassphrase`
+    /// encrypted to the *previous* level's public key (L1's directly to the
+    /// share key, matching the "only the share root's passphrase is
+    /// encrypted to the share key directly" rule). Regression test for the
+    /// exact logic behind the historical B2 nested-download bug (see
+    /// `docs/IMPLEMENTATION-STATUS.md`) — no live credentials, no network.
+    #[tokio::test]
+    async fn resolve_node_key_via_chain_unlocks_three_level_nesting() {
+        let crypto = RpgpCrypto::new();
+
+        let (share_priv, share_pub_armored) = crypto
+            .generate_key("share-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let share_pub = PublicKey {
+            armored: share_pub_armored,
+            fingerprint_hex: share_priv.fingerprint_hex.clone(),
+        };
+
+        let (root_priv, root_pub_armored) = crypto
+            .generate_key("root-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let root_pub = PublicKey {
+            armored: root_pub_armored,
+            fingerprint_hex: root_priv.fingerprint_hex.clone(),
+        };
+
+        let (mid_priv, mid_pub_armored) = crypto
+            .generate_key("mid-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let mid_pub = PublicKey {
+            armored: mid_pub_armored,
+            fingerprint_hex: mid_priv.fingerprint_hex.clone(),
+        };
+
+        let (leaf_priv, leaf_pub_armored) = crypto
+            .generate_key("leaf-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let leaf_pub = PublicKey {
+            armored: leaf_pub_armored,
+            fingerprint_hex: leaf_priv.fingerprint_hex.clone(),
+        };
+
+        let root_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"root-pass", &share_pub).await;
+        let mid_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"mid-pass", &root_pub).await;
+        let leaf_passphrase_b64 = encrypt_passphrase_b64(&crypto, b"leaf-pass", &mid_pub).await;
+
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/link-root",
+            link_json("link-root", None, &root_priv.armored, &root_passphrase_b64),
+        );
+        http.add(
+            "links/link-mid",
+            link_json(
+                "link-mid",
+                Some("link-root"),
+                &mid_priv.armored,
+                &mid_passphrase_b64,
+            ),
+        );
+        http.add(
+            "links/link-leaf",
+            link_json(
+                "link-leaf",
+                Some("link-mid"),
+                &leaf_priv.armored,
+                &leaf_passphrase_b64,
+            ),
+        );
+
+        let client = test_client(http, Arc::new(crypto));
+
+        let unlocked = client
+            .resolve_node_key_via_chain("share-1", "link-leaf", &share_priv)
+            .await
+            .unwrap();
+
+        assert_eq!(unlocked.fingerprint_hex, leaf_priv.fingerprint_hex);
+
+        // Prove the returned key is functionally the leaf key, not merely
+        // fingerprint-equal: round-trip a message through it.
+        let rt_crypto = RpgpCrypto::new();
+        let session_key = rt_crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = rt_crypto
+            .encrypt(
+                b"nested file content",
+                &session_key,
+                &[leaf_pub],
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let recovered_session_key = rt_crypto
+            .decrypt_session_key(&ciphertext, std::slice::from_ref(&unlocked))
+            .await
+            .unwrap();
+        let (plaintext, _) = rt_crypto
+            .decrypt_and_verify(&ciphertext, &recovered_session_key, &[])
+            .await
+            .unwrap();
+        assert_eq!(plaintext, b"nested file content");
+    }
+
+    /// A cyclic `ParentLinkID` chain must never hang the walk:
+    /// `MAX_CHAIN_DEPTH` (64) caps the number of hops and surfaces
+    /// `Error::Internal` instead of looping forever.
+    #[tokio::test]
+    async fn resolve_node_key_via_chain_cyclic_parent_hits_depth_guard() {
+        let crypto = RpgpCrypto::new();
+        let (share_priv, _) = crypto
+            .generate_key("share-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        // A link that is its own parent — every fetch returns the identical
+        // body, so the walk can only terminate via the depth guard.
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/link-cycle",
+            link_json(
+                "link-cycle",
+                Some("link-cycle"),
+                "unused-node-key",
+                "unused-passphrase",
+            ),
+        );
+
+        let client = test_client(http, Arc::new(crypto));
+
+        let err = client
+            .resolve_node_key_via_chain("share-1", "link-cycle", &share_priv)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::Internal(ref msg) if msg.contains("exceeded depth")),
+            "expected depth-guard Internal error, got {err:?}"
+        );
+    }
+}
