@@ -140,10 +140,24 @@ impl ProtonDriveClient {
     /// Iterate all children of a folder.
     ///
     /// Uses `GET drive/shares/{shareID}/folders/{linkID}/children` with
-    /// page-based pagination (Page=0..N, PageSize=page_size). Iterates until
-    /// `More == 0`. Returns a `Vec` rather than a stream; for MVP a single
-    /// collected result is sufficient. Streams would be preferable for large
-    /// folders — see TODO below.
+    /// page-based pagination (Page=0..N, PageSize=page_size). Returns a `Vec`
+    /// rather than a stream; for MVP a single collected result is sufficient.
+    /// Streams would be preferable for large folders — see TODO below.
+    ///
+    /// Termination is **not** driven by the wire's `More` field: the
+    /// deprecated legacy endpoint's response shape in the vendored OpenAPI
+    /// spec (`get_drive-shares-{shareID}-folders-{linkID}-children` in
+    /// `reference/client/js/src/internal/apiService/driveTypes.ts`) is
+    /// `{ Code, AllowSorting, Links }` — there is no `More`/cursor field at
+    /// all (that only exists on the v2 volume-scoped sibling endpoint, see
+    /// `docs/IMPLEMENTATION-STATUS.md` B8). `GetChildrenResponse::more`
+    /// therefore always deserializes to its `#[serde(default)]` of `0`, and a
+    /// termination check of `more == 0` would silently truncate every folder
+    /// with more than `page_size` children after the first page. Instead we
+    /// use the standard offset-pagination convention: a page shorter than the
+    /// requested `PageSize` is definitionally the last page. `more` is still
+    /// read and OR'd in, tolerating a future/undocumented server that does
+    /// send a real `More` signal.
     ///
     /// # TODO MC-followup: convert to async stream for large folder support
     ///
@@ -175,6 +189,7 @@ impl ProtonDriveClient {
                 self.api_get_with_query(&path, query).await?;
 
             let more = resp.more;
+            let returned = resp.links.len();
             for link in resp.links {
                 let name = match &parent_key {
                     Some(key) => decrypt_node_name(&self.opts.openpgp, &link.name, key)
@@ -185,7 +200,8 @@ impl ProtonDriveClient {
                 results.push(link_to_maybe_node(link, &parent.volume_id, name));
             }
 
-            if more == 0 {
+            let full_page = returned >= page_size as usize;
+            if more == 0 && !full_page {
                 break;
             }
             page += 1;
@@ -696,7 +712,10 @@ mod tests {
         }
     }
 
-    fn test_client(http: ChainMockHttpClient, crypto: Arc<RpgpCrypto>) -> ProtonDriveClient {
+    fn test_client(
+        http: impl ProtonDriveHttpClient + 'static,
+        crypto: Arc<RpgpCrypto>,
+    ) -> ProtonDriveClient {
         ProtonDriveClient::new(ProtonDriveClientOptions {
             http_client: Arc::new(http),
             entities_cache: Arc::new(proton_drive_cache::MemoryCache::<String>::new()),
@@ -916,6 +935,127 @@ mod tests {
         assert!(
             matches!(err, Error::Internal(ref msg) if msg.contains("exceeded depth")),
             "expected depth-guard Internal error, got {err:?}"
+        );
+    }
+
+    /// A minimal `Link` JSON object valid for `GetChildrenResponse` parsing.
+    /// Crypto fields are placeholders — this test only exercises pagination
+    /// continuation, not name decryption or key derivation.
+    fn child_link_json(link_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "LinkID": link_id,
+            "ParentLinkID": "parent-1",
+            "Type": 2,
+            "Name": "irrelevant",
+            "NameSignatureEmail": null,
+            "Hash": null,
+            "MIMEType": "text/plain",
+            "State": 1,
+            "Size": 0,
+            "CreateTime": 0,
+            "ModifyTime": 0,
+            "Trashed": null,
+            "NodeKey": "",
+            "NodePassphrase": "",
+            "NodePassphraseSignature": "",
+            "SignatureEmail": null,
+        })
+    }
+
+    /// Mocks the real (undocumented-`More`) legacy children endpoint: each
+    /// `Page` query value maps to its own canned response body, exactly
+    /// `{ Code, AllowSorting, Links }` — no `More` field at all, matching
+    /// `get_drive-shares-{shareID}-folders-{linkID}-children` in
+    /// `reference/client/js/src/internal/apiService/driveTypes.ts`. Any other
+    /// request (e.g. the key-resolution calls `fetch_folder_children` makes
+    /// first) gets a benign "not found" so key resolution fails softly and
+    /// `parent_key` falls back to `None`.
+    struct PagedChildrenMockHttpClient {
+        pages: std::collections::HashMap<String, Bytes>,
+    }
+
+    impl PagedChildrenMockHttpClient {
+        fn new() -> Self {
+            Self {
+                pages: Default::default(),
+            }
+        }
+
+        fn add_page(&mut self, page: u32, link_ids: &[&str]) {
+            let links: Vec<_> = link_ids.iter().map(|id| child_link_json(id)).collect();
+            let body = serde_json::json!({
+                "Code": 1000,
+                "AllowSorting": true,
+                "Links": links,
+            })
+            .to_string();
+            self.pages.insert(page.to_string(), Bytes::from(body));
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for PagedChildrenMockHttpClient {
+        async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
+            if !req.path.contains("/children") {
+                return Ok(JsonResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::from(r#"{"Code":2501,"Error":"not found"}"#),
+                });
+            }
+            let page = req
+                .query
+                .iter()
+                .find(|(k, _)| k == "Page")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("0");
+            let body =
+                self.pages.get(page).cloned().unwrap_or_else(|| {
+                    Bytes::from(r#"{"Code":1000,"AllowSorting":true,"Links":[]}"#)
+                });
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+        }
+
+        async fn request_blob(&self, _req: crate::http::BlobRequest) -> Result<JsonResponse> {
+            Err(Error::Internal("blob requests unused in this test".into()))
+        }
+    }
+
+    /// Regression test for the B-series pagination-truncation bug found in
+    /// the c4 DTO diff sweep: the legacy children endpoint's real response
+    /// shape has no `More` field (see `GetChildrenResponse::more`'s doc
+    /// comment), so a termination check of `more == 0` alone would stop
+    /// after the very first page. With two full pages (`page_size` items
+    /// each) followed by a shorter final page, `fetch_folder_children` must
+    /// still walk all three pages and return every child.
+    #[tokio::test]
+    async fn fetch_folder_children_paginates_past_first_full_page_without_more_field() {
+        let mut http = PagedChildrenMockHttpClient::new();
+        http.add_page(0, &["child-1", "child-2"]);
+        http.add_page(1, &["child-3", "child-4"]);
+        http.add_page(2, &["child-5"]);
+
+        let crypto = Arc::new(RpgpCrypto::new());
+        let client = test_client(http, crypto);
+
+        let parent = NodeUid {
+            volume_id: "share-1".to_owned(),
+            node_id: "parent-1".to_owned(),
+        };
+        let results = client
+            .fetch_folder_children(&parent, 2)
+            .await
+            .expect("fetch_folder_children should succeed across all pages");
+
+        let ids: Vec<String> = results.iter().map(|n| n.uid().node_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["child-1", "child-2", "child-3", "child-4", "child-5"],
+            "all three pages must be walked even though the wire never sends a More field: {ids:?}"
         );
     }
 }
