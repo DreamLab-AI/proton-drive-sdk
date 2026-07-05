@@ -278,6 +278,13 @@ pub mod shares {
         #[serde(rename = "LinkID")]
         pub link_id: String,
         pub r#type: u8,
+        /// Email of the address that created the share. Used to resolve the
+        /// verification keys for `PassphraseSignature` (JS `decryptRootShare`
+        /// -> `account.getPublicKeys(share.creatorEmail)`). `#[serde(default)]`
+        /// since not every `/drive/shares/{shareID}` response shape has been
+        /// observed to include it.
+        #[serde(default)]
+        pub creator_email: Option<String>,
         pub key: String,
         pub passphrase: String,
         pub passphrase_signature: String,

@@ -25,7 +25,7 @@ use crate::nodes::{
 use crate::upload::{FileUploader, ProtonFileUploader, UploadMetadata};
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
 use proton_drive_cache::ProtonDriveCache;
-use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, SrpModule};
+use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey, SrpModule, VerificationStatus};
 use proton_drive_telemetry::Telemetry;
 
 /// All host-supplied dependencies for the SDK.
@@ -207,6 +207,12 @@ impl ProtonDriveClient {
     }
 
     /// Decrypt the share private key for `share_id` via the user's address key.
+    ///
+    /// Non-fatally verifies the share's `PassphraseSignature` against the
+    /// creator address's public keys (JS `SharesCryptoService.decryptRootShare`
+    /// -> `account.getPublicKeys(share.creatorEmail)`); an unresolvable or
+    /// unverifiable signature is only logged, never aborts share-key
+    /// derivation.
     async fn resolve_share_key(&self, share_id: &str) -> Result<PrivateKey> {
         let share_resp: proton_drive_api::shares::GetShareResponse =
             self.api_get(&format!("/drive/shares/{share_id}")).await?;
@@ -215,13 +221,41 @@ impl ProtonDriveClient {
         let address_email = self.opts.account.primary_email();
         let address_key = self.opts.account.address_private_key(address_email).await?;
 
-        decrypt_share_key(
+        let verification_keys = match &share.creator_email {
+            Some(email) => match self.opts.account.address_public_keys(email).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(
+                        email = %email,
+                        "could not resolve share creator public keys for \
+                         PassphraseSignature verification: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+
+        let (share_priv, verified) = decrypt_share_key(
             &self.opts.openpgp,
             &share.key,
             &share.passphrase,
+            &share.passphrase_signature,
             &address_key,
+            &verification_keys,
         )
-        .await
+        .await?;
+
+        if verified != VerificationStatus::Ok {
+            tracing::warn!(
+                share_id = %share_id,
+                status = ?verified,
+                "share PassphraseSignature present but unverifiable (non-fatal, \
+                 JS-faithful) — key still unlocked"
+            );
+        }
+
+        Ok(share_priv)
     }
 
     /// Resolve a node's private key by walking the parent chain to the share
@@ -234,6 +268,14 @@ impl ProtonDriveClient {
     /// `ParentLinkID`, then derive keys top-down starting from `share_priv`.
     ///
     /// `MAX_CHAIN_DEPTH` guards against a malformed/cyclic parent chain.
+    ///
+    /// Each node's `NodePassphraseSignature` is verified non-fatally against
+    /// the resolved verification keys — the signer address's public keys
+    /// when the node carries a `SignatureEmail`, else the parent key's own
+    /// public portion (JS `decryptNode`'s `keyVerificationKeys` /
+    /// `nodeParentKeys` fallback). An unresolvable/invalid signature is only
+    /// logged; it never aborts key derivation (JS-faithful, non-fatal
+    /// `keyAuthor`).
     async fn resolve_node_key_via_chain(
         &self,
         share_id: &str,
@@ -242,8 +284,15 @@ impl ProtonDriveClient {
     ) -> Result<PrivateKey> {
         const MAX_CHAIN_DEPTH: usize = 64;
 
-        // Collect (node_key, node_passphrase) from the target up to the root.
-        let mut chain: Vec<(String, String)> = Vec::new();
+        struct ChainLink {
+            node_key: String,
+            node_passphrase: String,
+            node_passphrase_signature: String,
+            signature_email: Option<String>,
+        }
+
+        // Collect the chain from the target up to the root.
+        let mut chain: Vec<ChainLink> = Vec::new();
         let mut current_id = link_id.to_owned();
 
         loop {
@@ -257,7 +306,12 @@ impl ProtonDriveClient {
             let resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&path).await?;
             let link = resp.link;
             let parent = link.parent_link_id.clone();
-            chain.push((link.node_key, link.node_passphrase));
+            chain.push(ChainLink {
+                node_key: link.node_key,
+                node_passphrase: link.node_passphrase,
+                node_passphrase_signature: link.node_passphrase_signature,
+                signature_email: link.signature_email,
+            });
 
             match parent {
                 Some(p) => current_id = p,
@@ -268,11 +322,45 @@ impl ProtonDriveClient {
         // Fold from the root down: the deepest ancestor (last pushed) unlocks
         // with the share key, each descendant with its parent's node key.
         let mut current: Option<PrivateKey> = None;
-        for (node_key, node_passphrase) in chain.iter().rev() {
+        for entry in chain.iter().rev() {
             let parent_ref: &PrivateKey = current.as_ref().unwrap_or(share_priv);
-            let next =
-                decrypt_node_private_key(&self.opts.openpgp, node_key, node_passphrase, parent_ref)
-                    .await?;
+
+            let verification_keys: Vec<PublicKey> = match &entry.signature_email {
+                Some(email) => match self.opts.account.address_public_keys(email).await {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        tracing::warn!(
+                            email = %email,
+                            "could not resolve node signature address public keys: {e}"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => match self.opts.openpgp.public_key(parent_ref).await {
+                    Ok(pk) => vec![pk],
+                    Err(_) => Vec::new(),
+                },
+            };
+
+            let (next, verified) = decrypt_node_private_key(
+                &self.opts.openpgp,
+                &entry.node_key,
+                &entry.node_passphrase,
+                &entry.node_passphrase_signature,
+                parent_ref,
+                &verification_keys,
+            )
+            .await?;
+
+            if verified != VerificationStatus::Ok {
+                tracing::warn!(
+                    signature_email = ?entry.signature_email,
+                    status = ?verified,
+                    "node NodePassphraseSignature present but unverifiable \
+                     (non-fatal, JS-faithful) — key still unlocked"
+                );
+            }
+
             current = Some(next);
         }
 
@@ -428,11 +516,39 @@ impl ProtonDriveClient {
             Vec::new()
         };
 
-        // ContentKeyPacket is on the node (file link), not the revision.
+        // ContentKeyPacket (+ its signature) is on the node (file link), not
+        // the revision; `download_to_writer` falls back to the revision's own
+        // field for legacy shapes.
         let content_key_packet = link
             .file_properties
             .as_ref()
             .and_then(|fp| fp.content_key_packet.clone());
+        let content_key_packet_signature = link
+            .file_properties
+            .as_ref()
+            .and_then(|fp| fp.content_key_packet_signature.clone());
+
+        // ContentKeyPacketSignature verification keys: JS `decryptContentKeyPacket`
+        // verifies against `[nodeKey, ...keyVerificationKeys]`, where
+        // `keyVerificationKeys` comes from the node's own `SignatureEmail`
+        // (`link.signature_email`) — which can differ from the revision's own
+        // signer used for `signature_address_pubs` above. The node key itself
+        // is added automatically in `download_to_writer`; only the resolved
+        // address key set is carried here.
+        let content_key_verification_pubs = match &link.signature_email {
+            Some(email) => match self.opts.account.address_public_keys(email).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(
+                        email = %email,
+                        "could not resolve node signature address public keys for \
+                         ContentKeyPacket verification: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
 
         Ok(FileDownloader {
             http: self.opts.http_client.clone(),
@@ -444,6 +560,8 @@ impl ProtonDriveClient {
             node_private_key: node_priv,
             signature_address_pubs,
             content_key_packet,
+            content_key_packet_signature,
+            content_key_verification_pubs,
         })
     }
 
