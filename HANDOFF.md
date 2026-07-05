@@ -30,7 +30,7 @@ re-runs `pdtui mvp` against a real account.
 | JSON DTOs (list/upload/download/events) | Complete (happy-path subset) | Yes — roundtripped live pre-audit |
 | `ReqwestHttpClient` (retry/backoff/headers, 429+`Retry-After`) | Complete | Yes — live API pre-audit; unit-tested post-audit |
 | Crypto — encrypt/decrypt/sign/verify | Complete | Yes — JS-encoded wire fixtures + tamper/wrong-signer rejection |
-| SRP auth (`proton-srp` 0.8.2) | Complete | Yes — live login pre-audit |
+| SRP auth (`proton-srp` 0.8.2) | Complete, incl. TOTP 2FA (`/auth/2fa`) | Non-2FA path: yes — live login pre-audit. 2FA path: mock-server-tested only, needs a live run against a TOTP-enabled account (`docs/plan-2fa-totp.md`) |
 | `SessionManager` refresh (ADR-0010) | Complete | Yes — unit-tested; single-flight coalescing added post-audit |
 | Upload block protocol | Complete for share-root parents; **nested-folder upload still unresolved** (`upload.rs::resolve_parent_context` only derives the correct parent hash key when the parent is the share root) | Root-parent case: yes, live byte-identical round-trip pre-audit. Nested-parent case: no — known gap, see `docs/IMPLEMENTATION-STATUS.md` B2 |
 | Download block protocol | Complete | Yes — root + nested (646 MB verified); manifest verified after write |

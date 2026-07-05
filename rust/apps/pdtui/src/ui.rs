@@ -53,6 +53,17 @@ pub fn render(
         Screen::Main => {}
         Screen::Login(form) => render_login_overlay(frame, area, form, false),
         Screen::Authenticating(_) => render_login_overlay(frame, area, &LoginForm::new(), true),
+        Screen::SecondFactor(form) => render_second_factor_overlay(
+            frame,
+            area,
+            form.username(),
+            &form.code,
+            form.error.as_deref(),
+            false,
+        ),
+        Screen::SubmittingSecondFactor { pending, .. } => {
+            render_second_factor_overlay(frame, area, pending.username(), "", None, true)
+        }
     }
 }
 
@@ -219,6 +230,8 @@ fn render_keybar(frame: &mut Frame<'_>, area: Rect, screen: &Screen) {
     let text = match screen {
         Screen::Login(_) => " Tab next field   Enter submit   Esc cancel",
         Screen::Authenticating(_) => " Authenticating...   Esc cancel",
+        Screen::SecondFactor(_) => " Enter submit code   Esc cancel login",
+        Screen::SubmittingSecondFactor { .. } => " Validating code...   Esc cancel",
         Screen::Main => " F4 login   F3 upload   F2 download   F5 refresh   Tab switch   q quit",
     };
     frame.render_widget(Paragraph::new(text), area);
@@ -300,6 +313,70 @@ fn render_login_overlay(frame: &mut Frame<'_>, area: Rect, form: &LoginForm, aut
     } else {
         lines.push(Line::from(Span::styled(
             "  Tab: next field   Enter: submit   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// TOTP second-factor overlay. Rendered after SRP succeeds on a 2FA-enabled
+/// account: one code field, in clear (a TOTP code expires within seconds and
+/// is displayed on the user's own authenticator — masking it only hurts
+/// entry).
+fn render_second_factor_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    username: &str,
+    code: &str,
+    error: Option<&str>,
+    submitting: bool,
+) {
+    const W: u16 = 54;
+    const H: u16 = 9;
+    let popup = centered_rect(W, H, area);
+
+    frame.render_widget(Clear, popup);
+
+    let title = if submitting {
+        " Validating code... "
+    } else {
+        " Two-factor authentication "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let code_val = if submitting {
+        code.to_owned()
+    } else {
+        format!("{code}▌")
+    };
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::raw(""),
+        Line::raw(format!("  Account : {username}")),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " ▶ Code     : ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(code_val),
+        ]),
+        Line::raw(""),
+    ];
+
+    if submitting {
+        lines.push(Line::raw("  Validating second factor, please wait..."));
+    } else if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Enter the code from your authenticator app",
             Style::default().fg(Color::DarkGray),
         )));
     }

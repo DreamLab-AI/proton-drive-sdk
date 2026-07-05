@@ -29,7 +29,7 @@ Live SRP login confirmed end-to-end (`apps/pdtui/tests/auth_integration.rs` pass
 - AEAD-GCM / SEIPDv2 (per ADR-0006 — rejected at boundary)
 - Thumbnail generation/upload
 - Resumable upload, parallel block upload >4 in flight, retry orchestration
-- 2FA login (returns `TwoFactorRequired` cleanly — fix-forward when needed)
+- ~~2FA login (returns `TwoFactorRequired` cleanly — fix-forward when needed)~~ — **shipped since this PRD was written**: TOTP codes are submitted via `POST /core/v4/auth/2fa` in both `pdtui login` and the TUI login flow (see `docs/plan-2fa-totp.md`). FIDO2/security-key second factor remains out of scope (upstream's account SDK doesn't support it either).
 
 ## Milestones
 

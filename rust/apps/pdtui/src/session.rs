@@ -233,7 +233,7 @@ struct SessionFile {
     ///
     /// `#[serde(default)]` (-> `0`, i.e. already-expired) so a minimal,
     /// hand-authored `session.json` — such as the one
-    /// `scripts/configure-session.sh` writes for the 2FA/`pdtui probe`
+    /// `scripts/configure-session.sh` writes for the `pdtui probe`
     /// workaround, which only ever contains `AccessToken` + `UID` — still
     /// deserializes instead of hard-failing with "missing field ExpiresAt".
     /// Treating the missing field as already-expired is the safe default: it
@@ -1187,8 +1187,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2FA workaround (`scripts/configure-session.sh`) <-> `SessionFile`
-    // deserializer agreement.
+    // `pdtui probe` workaround (`scripts/configure-session.sh`) <->
+    // `SessionFile` deserializer agreement.
     //
     // The script only ever writes `{"AccessToken": ..., "UID": ...}` (it
     // cannot obtain `refresh_token`/`key_password` without a full SRP

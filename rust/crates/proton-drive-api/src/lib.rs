@@ -696,6 +696,27 @@ pub mod auth {
         pub enabled: u32,
     }
 
+    /// Body for `POST /core/v4/auth/2fa` — submits the TOTP (or recovery)
+    /// code for a `twofactor`-scoped session. Wire shape per the C# account
+    /// SDK's `SecondFactorValidationRequest` and the JS OpenAPI route
+    /// `/core/{_version}/auth/2fa` (coreTypes.ts).
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct TwoFactorRequest {
+        pub two_factor_code: String,
+    }
+
+    /// Response payload of `POST /core/v4/auth/2fa` (inside the standard
+    /// envelope). Upstream's `ScopesResponse` — the scopes granted once the
+    /// second factor validates. Informational: this port doesn't track
+    /// scopes, success is established by the envelope code alone.
+    #[derive(Debug, Clone, Deserialize, Default)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct TwoFactorResponse {
+        #[serde(default)]
+        pub scopes: Vec<String>,
+    }
+
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct RefreshRequest {
@@ -753,6 +774,33 @@ mod tests {
         assert_eq!(env.code, common::CODE_OK);
         assert_eq!(env.inner.user.email, "alice@proton.me");
         assert_eq!(env.inner.user.keys.len(), 1);
+    }
+
+    #[test]
+    fn serialize_two_factor_request_wire_shape() {
+        // Must match the C# account SDK's `SecondFactorValidationRequest`:
+        // a single `TwoFactorCode` string, nothing else.
+        let body = serde_json::to_value(auth::TwoFactorRequest {
+            two_factor_code: "123456".to_owned(),
+        })
+        .expect("serialize");
+        assert_eq!(body, serde_json::json!({"TwoFactorCode": "123456"}));
+    }
+
+    #[test]
+    fn deserialize_two_factor_response_envelope() {
+        let body = r#"{ "Code": 1000, "Scopes": ["full", "drive"] }"#;
+        let env: common::ResponseEnvelope<auth::TwoFactorResponse> =
+            serde_json::from_str(body).expect("parse");
+        assert_eq!(env.code, common::CODE_OK);
+        assert_eq!(env.inner.scopes, vec!["full", "drive"]);
+
+        // Scopes may be absent entirely — only the envelope code matters.
+        let bare = r#"{ "Code": 1000 }"#;
+        let env: common::ResponseEnvelope<auth::TwoFactorResponse> =
+            serde_json::from_str(bare).expect("parse without Scopes");
+        assert_eq!(env.code, common::CODE_OK);
+        assert!(env.inner.scopes.is_empty());
     }
 
     #[test]

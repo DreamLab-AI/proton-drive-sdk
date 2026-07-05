@@ -11,9 +11,9 @@
 # `key_password`, both of which require a full SRP exchange (what `pdtui
 # login` performs) against your account password. It therefore cannot unlock
 # the interactive TUI, `pdtui mvp`, or any other encrypted list/upload/
-# download path — those need a real `pdtui login` (which fails today if your
-# account has 2FA enabled; this script is the documented stand-in, but only
-# for `pdtui probe`).
+# download path — those need a real `pdtui login`. (`pdtui login` handles
+# TOTP 2FA natively, so 2FA accounts no longer need this script; it remains
+# only as a probe-diagnostics shortcut for sessions captured out-of-band.)
 
 set -euo pipefail
 

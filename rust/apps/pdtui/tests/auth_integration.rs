@@ -6,6 +6,10 @@
 //!   PDTUI_TEST_EMAIL=you@proton.me \
 //!   PDTUI_TEST_PASSWORD=yourpassword \
 //!   cargo test -p pdtui --test auth_integration -- --ignored --nocapture
+//!
+//! If the account has TOTP 2FA enabled, also set PDTUI_TEST_TOTP to a
+//! freshly generated code (it expires within ~30 s, so set it just before
+//! running).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -23,9 +27,21 @@ async fn live_srp_login_succeeds() {
         std::env::var("PDTUI_TEST_PASSWORD").expect("set PDTUI_TEST_PASSWORD to run this test");
 
     let http = ReqwestHttpClient::new(BASE_URL, APP_VERSION).expect("http client init");
-    let creds = auth::login(&http, &email, &password)
+    let outcome = auth::login(&http, &email, &password)
         .await
         .expect("SRP login failed");
+    let creds = match outcome {
+        auth::LoginOutcome::Complete(creds) => creds,
+        auth::LoginOutcome::NeedsSecondFactor(pending) => {
+            let code = std::env::var("PDTUI_TEST_TOTP").expect(
+                "account has 2FA enabled — set PDTUI_TEST_TOTP to a fresh code to run this test",
+            );
+            pending
+                .submit_totp(&http, &code)
+                .await
+                .expect("2FA validation failed (stale code?)")
+        }
+    };
 
     assert!(!creds.uid.is_empty(), "uid is empty");
     assert!(!creds.access_token.is_empty(), "access_token is empty");

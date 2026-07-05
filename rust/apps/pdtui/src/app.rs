@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 use crate::account::PdtuiAccount;
-use crate::auth::{self, AuthError, Credentials};
+use crate::auth::{self, AuthError, Credentials, LoginOutcome, PendingLogin};
 use crate::events_bridge;
 use crate::http::SessionAwareHttpClient;
 use crate::keymap::{Action, dispatch};
@@ -38,7 +38,16 @@ const BASE_URL: &str = "https://drive.proton.me/api";
 pub enum Screen {
     Main,
     Login(LoginForm),
-    Authenticating(JoinHandle<Result<Credentials, AuthError>>),
+    Authenticating(JoinHandle<Result<LoginOutcome, AuthError>>),
+    /// SRP accepted; waiting for the user to type their TOTP code.
+    SecondFactor(SecondFactorForm),
+    /// TOTP code submitted; awaiting the server + key-password derivation.
+    /// `pending` is kept so a rejected code returns to the form for another
+    /// attempt without redoing the SRP exchange.
+    SubmittingSecondFactor {
+        handle: JoinHandle<Result<Credentials, AuthError>>,
+        pending: Arc<PendingLogin>,
+    },
 }
 
 pub struct LoginForm {
@@ -70,6 +79,30 @@ impl LoginForm {
 impl Default for LoginForm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Input state for the TOTP second-factor step. The code is not a secret in
+/// the password sense (it expires within seconds and is shown on the user's
+/// own authenticator), so it renders in clear to help entry.
+pub struct SecondFactorForm {
+    pub code: String,
+    pub error: Option<String>,
+    pending: Arc<PendingLogin>,
+}
+
+impl SecondFactorForm {
+    fn new(pending: Arc<PendingLogin>) -> Self {
+        Self {
+            code: String::new(),
+            error: None,
+            pending,
+        }
+    }
+
+    /// Account label for the overlay title.
+    pub fn username(&self) -> &str {
+        self.pending.username()
     }
 }
 
@@ -172,7 +205,12 @@ impl App {
             // holding a borrow on self.screen.
             if matches!(self.screen, Screen::Login(_)) {
                 self.handle_login_key(k.code, k.modifiers);
-            } else if matches!(self.screen, Screen::Authenticating(_)) {
+            } else if matches!(self.screen, Screen::SecondFactor(_)) {
+                self.handle_second_factor_key(k.code, k.modifiers);
+            } else if matches!(
+                self.screen,
+                Screen::Authenticating(_) | Screen::SubmittingSecondFactor { .. }
+            ) {
                 if k.code == KeyCode::Esc {
                     self.screen = Screen::Login(LoginForm::new());
                 }
@@ -290,7 +328,7 @@ impl App {
             _ => return,
         };
         let app_version = format!("external-drive-pdtui@{}-stable", proton_drive::VERSION);
-        let handle: JoinHandle<Result<Credentials, AuthError>> = tokio::spawn(async move {
+        let handle: JoinHandle<Result<LoginOutcome, AuthError>> = tokio::spawn(async move {
             let http = crate::http::ReqwestHttpClient::new(BASE_URL, &app_version)
                 .map_err(AuthError::Http)?;
             auth::login(&http, &email, password.as_str()).await
@@ -298,10 +336,59 @@ impl App {
         self.screen = Screen::Authenticating(handle);
     }
 
+    // -----------------------------------------------------------------------
+    // Second-factor (TOTP) form key handling
+    // -----------------------------------------------------------------------
+
+    fn handle_second_factor_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            // Abandoning the 2FA step abandons the whole login attempt — the
+            // twofactor-scoped tokens are useless without a code.
+            KeyCode::Esc => self.screen = Screen::Login(LoginForm::new()),
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            KeyCode::Enter => self.start_second_factor(),
+            KeyCode::Backspace => {
+                if let Screen::SecondFactor(form) = &mut self.screen {
+                    form.code.pop();
+                }
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                if let Screen::SecondFactor(form) = &mut self.screen {
+                    form.code.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_second_factor(&mut self) {
+        let (code, pending) = match &self.screen {
+            Screen::SecondFactor(form) => (form.code.trim().to_owned(), Arc::clone(&form.pending)),
+            _ => return,
+        };
+        if code.is_empty() {
+            if let Screen::SecondFactor(form) = &mut self.screen {
+                form.error = Some("enter the code from your authenticator app".into());
+            }
+            return;
+        }
+        let app_version = format!("external-drive-pdtui@{}-stable", proton_drive::VERSION);
+        let task_pending = Arc::clone(&pending);
+        let handle: JoinHandle<Result<Credentials, AuthError>> = tokio::spawn(async move {
+            let http = crate::http::ReqwestHttpClient::new(BASE_URL, &app_version)
+                .map_err(AuthError::Http)?;
+            task_pending.submit_totp(&http, &code).await
+        });
+        self.screen = Screen::SubmittingSecondFactor { handle, pending };
+    }
+
     async fn check_auth_result(&mut self) {
         // Non-borrowing check for the variant.
         let finished = match &self.screen {
             Screen::Authenticating(h) => h.is_finished(),
+            Screen::SubmittingSecondFactor { handle, .. } => handle.is_finished(),
             _ => return,
         };
         if !finished {
@@ -309,33 +396,62 @@ impl App {
         }
         // Take ownership of the handle by swapping screen to a placeholder.
         let old = std::mem::replace(&mut self.screen, Screen::Main);
-        let Screen::Authenticating(handle) = old else {
-            return;
-        };
-        match handle.await {
-            Ok(Ok(creds)) => {
-                let username = creds.username.clone();
-                self.status = Some(format!("logged in as {username}"));
-                self.screen = Screen::Main;
-                // `build_client_from_login` persists the session through
-                // `SessionManager::from_login` (keyring + session.json), so no
-                // separate persistence step is needed here.
-                if let Err(e) = self.build_client_from_login(creds).await {
-                    warn!("client build after login failed: {e}");
-                    self.panes.remote.error = Some(format!("listing failed: {e}"));
-                    self.status = Some(format!("logged in as {username} (listing failed)"));
+        match old {
+            Screen::Authenticating(handle) => match handle.await {
+                Ok(Ok(LoginOutcome::Complete(creds))) => self.complete_login(creds).await,
+                Ok(Ok(LoginOutcome::NeedsSecondFactor(pending))) => {
+                    self.screen = Screen::SecondFactor(SecondFactorForm::new(Arc::new(pending)));
                 }
-            }
-            Ok(Err(e)) => {
-                let mut form = LoginForm::new();
-                form.error = Some(e.to_string());
-                self.screen = Screen::Login(form);
-            }
-            Err(e) => {
-                let mut form = LoginForm::new();
-                form.error = Some(format!("auth task panicked: {e}"));
-                self.screen = Screen::Login(form);
-            }
+                Ok(Err(e)) => {
+                    let mut form = LoginForm::new();
+                    form.error = Some(e.to_string());
+                    self.screen = Screen::Login(form);
+                }
+                Err(e) => {
+                    let mut form = LoginForm::new();
+                    form.error = Some(format!("auth task panicked: {e}"));
+                    self.screen = Screen::Login(form);
+                }
+            },
+            Screen::SubmittingSecondFactor { handle, pending } => match handle.await {
+                Ok(Ok(creds)) => self.complete_login(creds).await,
+                // A rejected code keeps the SRP-authenticated pending state
+                // alive: back to the code form for another attempt.
+                Ok(Err(e @ AuthError::SecondFactorRejected { .. })) => {
+                    let mut form = SecondFactorForm::new(pending);
+                    form.error = Some(e.to_string());
+                    self.screen = Screen::SecondFactor(form);
+                }
+                // Anything else (network failure, session invalidated after
+                // repeated bad codes) restarts the login from scratch.
+                Ok(Err(e)) => {
+                    let mut form = LoginForm::new();
+                    form.error = Some(e.to_string());
+                    self.screen = Screen::Login(form);
+                }
+                Err(e) => {
+                    let mut form = LoginForm::new();
+                    form.error = Some(format!("auth task panicked: {e}"));
+                    self.screen = Screen::Login(form);
+                }
+            },
+            other => self.screen = other,
+        }
+    }
+
+    /// Post-login tail shared by the direct and post-2FA paths.
+    ///
+    /// `build_client_from_login` persists the session through
+    /// `SessionManager::from_login` (keyring + session.json), so no separate
+    /// persistence step is needed here.
+    async fn complete_login(&mut self, creds: Credentials) {
+        let username = creds.username.clone();
+        self.status = Some(format!("logged in as {username}"));
+        self.screen = Screen::Main;
+        if let Err(e) = self.build_client_from_login(creds).await {
+            warn!("client build after login failed: {e}");
+            self.panes.remote.error = Some(format!("listing failed: {e}"));
+            self.status = Some(format!("logged in as {username} (listing failed)"));
         }
     }
 
