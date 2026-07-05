@@ -26,11 +26,12 @@ byte-identically through the live Proton API.
 |---|---|
 | SRP login + session resume (OS keyring) | Live |
 | List folder children (decrypts names, sizes, types) | Live |
-| Upload — wire-faithful armored protocol, HMAC name hash, XAttr | Live, byte-identical round-trip |
+| Upload to the My Files root — wire-faithful armored protocol, HMAC name hash, XAttr | Live, byte-identical round-trip |
+| Upload into a **nested** (non-root-parent) folder | **Known gap** — parent hash-key resolution only handles a share-root parent; not yet fixed |
 | Download — block fetch, SHA-256 integrity, manifest verification | Live |
-| Nested files — parent-chain node-key derivation (depth ≥ 3) | Live (646 MB real file verified) |
+| Nested files — parent-chain node-key derivation for **listing/download** (depth ≥ 3) | Live (646 MB real file verified) |
 | Signature-issue tolerance — rotated-out signer keys | Delivers data, flags `signature_verified=false` (matches the official client) |
-| Event subscription | DTOs only (pull-on-focus for MVP) |
+| Event subscription | Live — background poll/backoff loop drives pdtui's remote pane; falls back to pull-on-focus if the subscription can't be established |
 
 Integrity model mirrors the JS SDK: blocks are guarded by their SHA-256
 ciphertext hash; the manifest signature is verified **after** the data is
@@ -38,6 +39,13 @@ delivered. A *missing* manifest signature aborts before any byte is written; a
 *present-but-unverifiable* one (e.g. the signer's key was rotated out of the
 account) delivers the data and reports `signature_verified = false` rather than
 discarding a file the official client would still download.
+
+A mesh audit found and fixed 38 issues across the areas above since the last
+live round-trip; see [`docs/audit-2026-07-05.md`](docs/audit-2026-07-05.md)
+for what changed and what's still deliberately deferred, and
+[`docs/IMPLEMENTATION-STATUS.md`](docs/IMPLEMENTATION-STATUS.md) for the
+current milestone-by-milestone state. The fixes are unit/wire-tested but not
+yet re-proven against a live account.
 
 ## Quick start
 
@@ -80,7 +88,10 @@ are shared with first-party clients.
   `external-drive-pdtui@{semver}-stable`. Never spoof a first-party header.
 - **Official endpoints only.** All HTTP hits the official Proton Drive domain;
   no proxying.
-- **Event-based sync.** Do not poll or recursively traverse the tree.
+- **Event-based sync.** No ad hoc polling of node/listing state or recursive
+  tree traversal. The event-loop consumer's own interval poll against the
+  official Events endpoint (mirroring the JS SDK's `eventManager.ts` — Proton
+  Drive has no push transport) is the one sanctioned exception.
 - **No Proton branding.** This is an unofficial, third-party tool.
 
 A breaking cryptographic-model migration is targeted by Proton for late

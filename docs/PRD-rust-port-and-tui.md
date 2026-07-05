@@ -247,7 +247,7 @@ This is the **only** code path in pdtui that talks outside the SDK trait surface
 | M3 | `proton-drive-core`: auth-injected client, `my_files_root`, `iter_folder_children` | `pdtui` skeleton lists remote root |
 | M4 | Upload (`FileUploader` + stream) | 1 GB file uploads, JS SDK can download and verify SHA1 |
 | M5 | Download (`FileDownloader` + stream) | Inverse of M4 |
-| M6 | Events subscription | Renaming a node from web UI refreshes pane within 5s without polling |
+| M6 | Events subscription | Renaming a node from the web UI refreshes the pane within one event-loop tick, with **no ad hoc polling of node/listing endpoints outside the official Events API**. *(Reconciled 2026-07-05: the original "within 5s without polling" wording didn't survive contact with upstream — the JS SDK's own event loop is itself a ~30s-interval poll against the Events endpoint with Fibonacci backoff, since Proton Drive has no push/websocket transport. The Rust port mirrors that cadence exactly (`spawn_volume_event_loop`, `POLL_INTERVAL_SECS = 30`). "Without polling" means without the client re-listing/re-fetching nodes on its own timer, not a sub-5s push guarantee neither SDK provides.)* |
 | M7 | `pdtui` v0.1.0 release | All keymap entries work, tmux smoke test passes, single static binary < 15 MB stripped |
 
 Target cadence: 2 weeks per M, with M0/M1 in flight together. Total ~14 weeks single-engineer to M7.
@@ -259,7 +259,7 @@ Target cadence: 2 weeks per M, with M0/M1 in flight together. Total ~14 weeks si
 | `rpgp` diverges from Proton's OpenPGP packet expectations on a real fixture | High | Interop fixture suite at every milestone; if blocking, fork `rpgp` locally rather than switching to cgo |
 | **Late-2026/early-2027 crypto migration** breaks wire format mid-port | High | All crypto behind trait; pin work to JS SDK version; allocate buffer between M6 and M7 to absorb the migration. Personal-use scope means we can stop and rebase rather than ship broken |
 | OpenAPI DTOs drift (JS regenerates from `api/openapi-*.json` outside this repo) | Med | Vendor a copy of the OpenAPI files at port time; track diffs |
-| Rate limiting from over-eager event polling | Med | Use event subscription exclusively; assert in tests that no `getNode`/`iterateFolderChildren` is called on a timer |
+| Rate limiting from over-eager event polling | Med | Use event subscription exclusively — the event loop's own interval poll against the Events endpoint (JS-faithful cadence, see M6 above) is sanctioned; assert in tests that `getNode`/`iterateFolderChildren` (the *node/listing* endpoints) are never called on a timer, only on focus-change or in response to a dispatched `DriveEvent` |
 | tmux + crossterm mouse/paste edge cases | Low | Manual test matrix in M7 (tmux 3.4, alacritty, kitty, wezterm) |
 | Scope creep into sharing/photos | Med | Stubbed modules return `Error::NotImplemented`; PRD explicit in §3 |
 
