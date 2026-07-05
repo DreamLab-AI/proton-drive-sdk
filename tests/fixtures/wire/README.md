@@ -10,9 +10,10 @@ committed to the repository**.
 - They are NOT deployed anywhere.
 - `key_priv.asc` uses an **EMPTY passphrase** — intentionally, for test
   simplicity. Never do this with any real key.
-- They can be regenerated at any time by running `generate.mjs` again.
-  The fixtures are re-committed after regeneration. Old fixtures are invalid
-  and must be replaced in full.
+- `generate.mjs` **reuses** these four committed keypairs if present rather
+  than rotating them — only the derived `.bin`/`.meta.json` fixtures are
+  rewritten on each run. Delete the `.asc` files first if you deliberately
+  want a fresh keypair (then re-commit all of the above in full).
 - The private keys are committed **only** because they sign test data and have
   zero operational value — auditors: treat these like public test vectors.
 
@@ -36,6 +37,8 @@ interoperability with the actual Proton wire format.  Implements ADR-0012.
 | `seipdv1_signed.meta.json` | Metadata: key fingerprints, plaintext SHA-256 |
 | `seipdv1_tampered.bin` | `seipdv1_signed.bin` with one SEIPD-body byte flipped |
 | `seipdv1_wrong_signer.bin` | Re-signed with a throwaway key not in `signer_pub.asc` |
+| `seipdv1_truncated.bin` | `seipdv1_signed.bin` cut off partway through the SEIPD body — simulates a network interruption / short read |
+| `seipdv1_wrong_recipient.bin` | Encrypted to a throwaway key instead of `key_pub.asc` — simulates a parent-key-resolution bug that hands the decryptor the wrong key |
 | `seipdv1_signed_compressed.bin` | Encrypted+signed with ZIP compression on the inner literal — the shape JS produces for ExtendedAttributes (`compress: true`, see `driveCrypto.ts` `encryptExtendedAttributes`). Same keys and plaintext as `seipdv1_signed.bin`. |
 | `seipdv1_signed_compressed.meta.json` | Metadata for the compressed fixture (same plaintext SHA-256 as `seipdv1_signed.meta.json`) |
 | `generate.mjs` | Script to regenerate all of the above |

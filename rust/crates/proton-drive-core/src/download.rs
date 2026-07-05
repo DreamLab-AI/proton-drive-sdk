@@ -899,7 +899,9 @@ mod tests {
     use crate::http::{BlobRequest, JsonRequest, JsonResponse};
     use bytes::Bytes;
     use proton_drive_api::download::{BlockResponse, RevisionWithBlocks};
-    use proton_drive_crypto::{EncryptOptions, OpenPgpCrypto, PrivateKey, PublicKey, RpgpCrypto};
+    use proton_drive_crypto::{
+        ArmorKind, EncryptOptions, OpenPgpCrypto, PrivateKey, PublicKey, RpgpCrypto, armor,
+    };
 
     // ── mock HTTP client for protocol tests ───────────────────────────────────
 
@@ -2223,21 +2225,807 @@ mod tests {
         assert_ne!(status, VerificationStatus::Ok);
     }
 
-    /// Round-trip test (gated `#[ignore]` — requires live credentials).
-    ///
-    /// Upload `tests/fixtures/small.txt` via MD's FileUploader, then download
-    /// via ME's FileDownloader, assert plaintext bytes are byte-identical.
-    ///
-    /// Skipped without live credentials: set `PROTON_TEST_CREDENTIALS` env var.
+    /// Out-of-order block delivery must not corrupt assembly or
+    /// verification: `download_to_writer` sorts blocks by `Index` before
+    /// both writing plaintext and hashing the manifest payload (lines
+    /// 263-264), so a server that returns blocks in descending order must
+    /// still assemble correctly and verify against a manifest signed over
+    /// the ascending-order concatenation.
     #[tokio::test]
-    #[ignore = "requires live Proton credentials — set PROTON_TEST_CREDENTIALS"]
+    async fn download_sorts_out_of_order_blocks_before_verifying_manifest() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let ct1 = crypto
+            .encrypt_and_sign(
+                b"first-half-",
+                &session_key,
+                &[],
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let ct2 = crypto
+            .encrypt_and_sign(
+                b"second-half",
+                &session_key,
+                &[],
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash1 = block_hash_b64(&ct1);
+        let hash2 = block_hash_b64(&ct2);
+
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        // Manifest signed over the ASCENDING-index concatenation
+        // (hash1 || hash2) — the order `download_to_writer` must reconstruct
+        // regardless of the delivery order below.
+        let mut manifest_payload = Vec::new();
+        manifest_payload.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(&hash1)
+                .unwrap(),
+        );
+        manifest_payload.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(&hash2)
+                .unwrap(),
+        );
+        let manifest_sig = crypto.sign(&manifest_payload, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        // Server lists block 2 BEFORE block 1 — out-of-order delivery.
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [
+                    {"Index": 2, "BareURL": "https://cdn/block-2", "Token": "t2",
+                     "Hash": hash2, "EncryptedSignature": null, "Size": ct2.len() as u64},
+                    {"Index": 1, "BareURL": "https://cdn/block-1", "Token": "t1",
+                     "Hash": hash1, "EncryptedSignature": null, "Size": ct1.len() as u64},
+                ],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
+        mock.add("cdn/block-1", Bytes::from(ct1));
+        mock.add("cdn/block-2", Bytes::from(ct2));
+
+        let downloader = build_downloader(Arc::new(mock), crypto, sign_key, vec![sign_pub]);
+
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+
+        assert_eq!(
+            out, b"first-half-second-half",
+            "plaintext must be assembled in ascending Index order, not delivery order"
+        );
+        assert!(
+            stats.signature_verified,
+            "manifest signed over the ascending-order concatenation must verify \
+             even though the server delivered blocks out of order"
+        );
+    }
+
+    /// Companion to the test above: proves the ascending-index sort is load
+    /// bearing, not incidental. Calls the private `verify_manifest` directly
+    /// with blocks left in descending (delivery) order — bypassing
+    /// `download_to_writer`'s `sort_by_key` — against a manifest signed over
+    /// the ascending concatenation. If a future regression ever dropped that
+    /// sort call, this is exactly the failure an out-of-order server
+    /// response would produce: a real, validly-signed manifest reported as
+    /// unverified.
+    #[tokio::test]
+    async fn verify_manifest_fails_without_the_index_sort() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let hash1 = block_hash_b64(b"block-one-ciphertext-stand-in");
+        let hash2 = block_hash_b64(b"block-two-ciphertext-stand-in");
+
+        let block1 = BlockResponse {
+            index: 1,
+            bare_url: "unused-1".into(),
+            token: "t1".into(),
+            hash: hash1.clone(),
+            encrypted_signature: None,
+            size: 0,
+        };
+        let block2 = BlockResponse {
+            index: 2,
+            bare_url: "unused-2".into(),
+            token: "t2".into(),
+            hash: hash2.clone(),
+            encrypted_signature: None,
+            size: 0,
+        };
+
+        // Manifest signed over the ASCENDING concatenation (hash1 || hash2)
+        // — the only order a genuine server-signed manifest could have been
+        // produced over (the upload side always hashes in index order).
+        let mut ascending_payload = Vec::new();
+        ascending_payload.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(&hash1)
+                .unwrap(),
+        );
+        ascending_payload.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(&hash2)
+                .unwrap(),
+        );
+        let manifest_sig = crypto
+            .sign(&ascending_payload, &sign_key, "")
+            .await
+            .unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        let downloader = build_downloader(
+            Arc::new(MockHttpClient::new()),
+            crypto,
+            sign_key,
+            vec![sign_pub],
+        );
+
+        // Descending (unsorted) order — what `download_to_writer` would pass
+        // to `verify_manifest` if its `sort_by_key(|b| b.index)` call were
+        // ever removed.
+        let unsorted = vec![block2, block1];
+        let verified = downloader
+            .verify_manifest(&unsorted, Some(&manifest_sig_b64))
+            .await
+            .unwrap();
+
+        assert!(
+            !verified,
+            "a manifest signed over the ascending-index concatenation must fail \
+             to verify against a descending-order payload — proving the \
+             production sort-before-hash step is load-bearing"
+        );
+    }
+
+    // ── in-process upload→download round trip (real crypto, no network) ─────
+    // Supersedes the permanent `unimplemented!()` stub this test used to be:
+    // MD (block-upload) landed long ago (see `docs/IMPLEMENTATION-STATUS.md`)
+    // but the stub was never wired up. Rather than requiring live
+    // credentials, this builds a tiny stateful fake Proton Drive server
+    // (`InProcessServer`) that BOTH `ProtonFileUploader` (upload.rs) and
+    // `FileDownloader` (this file) talk to over the same
+    // `ProtonDriveHttpClient` seam, using real `RpgpCrypto` throughout (not
+    // the `upload.rs` unit tests' `FakeCrypto` stub, which only round-trips
+    // a "FAKE_ENC:" marker). This proves the upload path's wire output —
+    // encrypted node key/passphrase, content key packet, block ciphertext +
+    // manifest signature, XAttr — is genuinely decryptable by the download
+    // path, not just independently mocked on each side.
+
+    const ROUNDTRIP_FILE_LINK_ID: &str = "roundtrip-file-link";
+    const ROUNDTRIP_FILE_REVISION_ID: &str = "roundtrip-file-rev";
+
+    /// Fields captured from the real `CreateFileRequest` POST body so they
+    /// can be served back on the subsequent `GET .../links/{id}` calls
+    /// during download — mirroring what the real server would persist.
+    struct RoundtripCapturedFile {
+        name: String,
+        hash: String,
+        node_key: String,
+        node_passphrase: String,
+        node_passphrase_signature: String,
+        content_key_packet: String,
+        content_key_packet_signature: String,
+        signature_address: String,
+    }
+
+    /// Fields captured from the real `CommitRevisionRequest` PUT body.
+    struct RoundtripCapturedCommit {
+        manifest_signature: String,
+        signature_address: String,
+        x_attr: String,
+    }
+
+    struct RoundtripBlockMeta {
+        index: u32,
+        bare_url: String,
+        token: String,
+    }
+
+    /// Extract the raw ciphertext from `put_block`'s multipart/form-data
+    /// body (a single "Block" part): locates the blank line ending the part
+    /// headers and the trailing `--boundary` marker, rather than hardcoding
+    /// upload.rs's private boundary constant.
+    fn extract_multipart_block(body: &[u8]) -> Vec<u8> {
+        let header_end = body
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(0);
+        let after_headers = &body[header_end..];
+        match after_headers.windows(4).rposition(|w| w == b"\r\n--") {
+            Some(idx) => after_headers[..idx].to_vec(),
+            None => after_headers.to_vec(),
+        }
+    }
+
+    /// A tiny stateful in-process fake of the Proton Drive HTTP API,
+    /// sufficient to drive one file through the real upload protocol
+    /// (`upload.rs`) and then the real download protocol (this file)
+    /// against the *same* backing state. Unlike the crate's other mocks
+    /// (`MockHttpClient` above, `FakeHttpClient` in `upload.rs`), this one
+    /// actually persists what each write call sends so the corresponding
+    /// read calls can serve it back — a real server's job, minimally
+    /// reimplemented for the test.
+    struct InProcessServer {
+        share_id: String,
+        root_link_id: String,
+        volume_id: String,
+        /// Pre-built canned response bodies for the share and the My Files
+        /// root folder — fixed for the whole test, not captured from a write.
+        share_json: String,
+        root_link_json: String,
+        file: std::sync::Mutex<Option<RoundtripCapturedFile>>,
+        blocks_meta: std::sync::Mutex<Vec<RoundtripBlockMeta>>,
+        block_bytes: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+        commit: std::sync::Mutex<Option<RoundtripCapturedCommit>>,
+    }
+
+    impl InProcessServer {
+        fn new(
+            share_id: impl Into<String>,
+            root_link_id: impl Into<String>,
+            volume_id: impl Into<String>,
+            share_json: String,
+            root_link_json: String,
+        ) -> Self {
+            Self {
+                share_id: share_id.into(),
+                root_link_id: root_link_id.into(),
+                volume_id: volume_id.into(),
+                share_json,
+                root_link_json,
+                file: std::sync::Mutex::new(None),
+                blocks_meta: std::sync::Mutex::new(Vec::new()),
+                block_bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                commit: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn capture_create_file(&self, body: &[u8]) -> Result<()> {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Probe {
+                name: String,
+                hash: String,
+                node_key: String,
+                node_passphrase: String,
+                node_passphrase_signature: String,
+                content_key_packet: String,
+                content_key_packet_signature: String,
+                signature_address: String,
+            }
+            let probe: Probe = serde_json::from_slice(body)
+                .map_err(|e| Error::Internal(format!("capture create-file body: {e}")))?;
+            *self.file.lock().unwrap() = Some(RoundtripCapturedFile {
+                name: probe.name,
+                hash: probe.hash,
+                node_key: probe.node_key,
+                node_passphrase: probe.node_passphrase,
+                node_passphrase_signature: probe.node_passphrase_signature,
+                content_key_packet: probe.content_key_packet,
+                content_key_packet_signature: probe.content_key_packet_signature,
+                signature_address: probe.signature_address,
+            });
+            Ok(())
+        }
+
+        fn capture_commit(&self, body: &[u8]) -> Result<()> {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Probe {
+                manifest_signature: String,
+                signature_address: String,
+                #[serde(rename = "XAttr")]
+                x_attr: String,
+            }
+            let probe: Probe = serde_json::from_slice(body)
+                .map_err(|e| Error::Internal(format!("capture commit body: {e}")))?;
+            *self.commit.lock().unwrap() = Some(RoundtripCapturedCommit {
+                manifest_signature: probe.manifest_signature,
+                signature_address: probe.signature_address,
+                x_attr: probe.x_attr,
+            });
+            Ok(())
+        }
+
+        fn handle_request_blocks(&self, body: &[u8]) -> Result<String> {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct EntryProbe {
+                index: u32,
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Probe {
+                block_list: Vec<EntryProbe>,
+            }
+            let probe: Probe = serde_json::from_slice(body)
+                .map_err(|e| Error::Internal(format!("capture request-blocks body: {e}")))?;
+
+            let mut meta = self.blocks_meta.lock().unwrap();
+            let mut links = Vec::new();
+            for entry in &probe.block_list {
+                let bare_url = format!("https://upload.proton.me/block/{}", entry.index);
+                let token = format!("blk-tok-{}", entry.index);
+                meta.push(RoundtripBlockMeta {
+                    index: entry.index,
+                    bare_url: bare_url.clone(),
+                    token: token.clone(),
+                });
+                links.push(serde_json::json!({
+                    "Index": entry.index, "BareURL": bare_url, "Token": token,
+                }));
+            }
+            Ok(serde_json::json!({"Code": 1000, "UploadLinks": links}).to_string())
+        }
+
+        fn file_link_json(&self) -> String {
+            let file = self.file.lock().unwrap();
+            let file = file
+                .as_ref()
+                .expect("create-file must be captured before the file link is fetched");
+            let commit = self.commit.lock().unwrap();
+            let signature_email = commit.as_ref().map(|c| c.signature_address.clone());
+            serde_json::json!({
+                "Code": 1000,
+                "Link": {
+                    "LinkID": ROUNDTRIP_FILE_LINK_ID,
+                    "ParentLinkID": self.root_link_id,
+                    "Type": 2,
+                    "Name": file.name,
+                    "NameSignatureEmail": null,
+                    "Hash": file.hash,
+                    "MIMEType": "text/plain",
+                    "State": 1,
+                    "Size": 0,
+                    "CreateTime": 0,
+                    "ModifyTime": 0,
+                    "Trashed": null,
+                    "NodeKey": file.node_key,
+                    "NodePassphrase": file.node_passphrase,
+                    "NodePassphraseSignature": file.node_passphrase_signature,
+                    "SignatureEmail": file.signature_address,
+                    "FileProperties": {
+                        "ContentKeyPacket": file.content_key_packet,
+                        "ContentKeyPacketSignature": file.content_key_packet_signature,
+                        "ActiveRevision": {
+                            "ID": ROUNDTRIP_FILE_REVISION_ID,
+                            "State": 1,
+                            "CreateTime": 0,
+                            "Size": 0,
+                            "ManifestSignature": null,
+                            "SignatureEmail": signature_email,
+                        },
+                    },
+                    "FolderProperties": null,
+                }
+            })
+            .to_string()
+        }
+
+        fn revision_page_json(&self, query: &[(String, String)]) -> String {
+            let from_block_index: u32 = query
+                .iter()
+                .find(|(k, _)| k == "FromBlockIndex")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(1);
+
+            let meta = self.blocks_meta.lock().unwrap();
+            let bytes_map = self.block_bytes.lock().unwrap();
+            let commit = self.commit.lock().unwrap();
+
+            let blocks: Vec<serde_json::Value> = meta
+                .iter()
+                .filter(|b| b.index >= from_block_index)
+                .map(|b| {
+                    let ct = bytes_map.get(&b.bare_url).cloned().unwrap_or_default();
+                    serde_json::json!({
+                        "Index": b.index,
+                        "BareURL": b.bare_url,
+                        "Token": b.token,
+                        "Hash": block_hash_b64(&ct),
+                        "EncryptedSignature": null,
+                        "Size": ct.len() as u64,
+                    })
+                })
+                .collect();
+
+            let (manifest_signature, x_attr, signature_email) = match &*commit {
+                Some(c) => (
+                    Some(c.manifest_signature.clone()),
+                    Some(c.x_attr.clone()),
+                    Some(c.signature_address.clone()),
+                ),
+                None => (None, None, None),
+            };
+
+            serde_json::json!({
+                "Code": 1000,
+                "Revision": {
+                    "ID": ROUNDTRIP_FILE_REVISION_ID,
+                    "State": 1,
+                    "Blocks": blocks,
+                    "ManifestSignature": manifest_signature,
+                    "ContentKeyPacket": null,
+                    "ContentKeyPacketSignature": null,
+                    "XAttr": x_attr,
+                    "SignatureEmail": signature_email,
+                }
+            })
+            .to_string()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProtonDriveHttpClient for InProcessServer {
+        async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
+            fn ok(body: String) -> JsonResponse {
+                JsonResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::from(body),
+                }
+            }
+
+            let share_path = format!("/drive/shares/{}", self.share_id);
+            let root_link_path = format!(
+                "/drive/shares/{}/links/{}",
+                self.share_id, self.root_link_id
+            );
+            let file_link_path = format!(
+                "/drive/shares/{}/links/{}",
+                self.share_id, ROUNDTRIP_FILE_LINK_ID
+            );
+            let create_file_path = format!("/drive/v2/volumes/{}/files", self.volume_id);
+            let revision_path = format!(
+                "/drive/v2/volumes/{}/files/{}/revisions/{}",
+                self.volume_id, ROUNDTRIP_FILE_LINK_ID, ROUNDTRIP_FILE_REVISION_ID
+            );
+
+            if req.method == HttpMethod::Get && req.path == share_path {
+                return Ok(ok(self.share_json.clone()));
+            }
+            if req.method == HttpMethod::Get && req.path == root_link_path {
+                return Ok(ok(self.root_link_json.clone()));
+            }
+            if req.method == HttpMethod::Get && req.path == file_link_path {
+                return Ok(ok(self.file_link_json()));
+            }
+            if req.method == HttpMethod::Post && req.path == create_file_path {
+                self.capture_create_file(req.body.as_deref().unwrap_or_default())?;
+                return Ok(ok(serde_json::json!({
+                    "Code": 1000,
+                    "File": {"ID": ROUNDTRIP_FILE_LINK_ID, "RevisionID": ROUNDTRIP_FILE_REVISION_ID},
+                })
+                .to_string()));
+            }
+            if req.method == HttpMethod::Get && req.path.ends_with("/verification") {
+                return Ok(ok(serde_json::json!({
+                    "Code": 1000,
+                    "VerificationCode": base64::engine::general_purpose::STANDARD.encode([0xAAu8; 64]),
+                    "ContentKeyPacket": base64::engine::general_purpose::STANDARD.encode(b"unused"),
+                })
+                .to_string()));
+            }
+            if req.method == HttpMethod::Post && req.path == "/drive/blocks" {
+                return Ok(ok(
+                    self.handle_request_blocks(req.body.as_deref().unwrap_or_default())?
+                ));
+            }
+            if req.method == HttpMethod::Put && req.path == revision_path {
+                self.capture_commit(req.body.as_deref().unwrap_or_default())?;
+                return Ok(ok(serde_json::json!({"Code": 1000}).to_string()));
+            }
+            if req.method == HttpMethod::Get && req.path == revision_path {
+                return Ok(ok(self.revision_page_json(&req.query)));
+            }
+
+            Err(Error::Internal(format!(
+                "InProcessServer: unhandled request {:?} {}",
+                req.method, req.path
+            )))
+        }
+
+        async fn request_blob(&self, req: BlobRequest) -> Result<JsonResponse> {
+            match req.method {
+                HttpMethod::Post => {
+                    let ciphertext = extract_multipart_block(&req.body);
+                    self.block_bytes
+                        .lock()
+                        .unwrap()
+                        .insert(req.path.clone(), Bytes::from(ciphertext));
+                    Ok(JsonResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: Bytes::from_static(b"{}"),
+                    })
+                }
+                HttpMethod::Get => {
+                    let body = self
+                        .block_bytes
+                        .lock()
+                        .unwrap()
+                        .get(&req.path)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::NotFound(format!("InProcessServer: no block at {}", req.path))
+                        })?;
+                    Ok(JsonResponse {
+                        status: 200,
+                        headers: vec![],
+                        body,
+                    })
+                }
+                other => Err(Error::Internal(format!(
+                    "InProcessServer: unexpected blob method {other:?}"
+                ))),
+            }
+        }
+    }
+
+    /// Host account backed by real keys (not `upload.rs`'s `FakeAccount`
+    /// literal placeholder strings) — the downloader genuinely decrypts and
+    /// verifies against these.
+    struct RoundtripAccount {
+        email: String,
+        address_priv: PrivateKey,
+        address_pub: PublicKey,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::account::ProtonDriveAccount for RoundtripAccount {
+        fn user_id(&self) -> &str {
+            "roundtrip-user"
+        }
+
+        fn primary_email(&self) -> &str {
+            &self.email
+        }
+
+        async fn address_private_key(&self, _email: &str) -> Result<PrivateKey> {
+            Ok(self.address_priv.clone())
+        }
+
+        async fn address_public_keys(&self, _email: &str) -> Result<Vec<PublicKey>> {
+            Ok(vec![self.address_pub.clone()])
+        }
+
+        async fn address_id(&self, _email: &str) -> Result<String> {
+            Ok("roundtrip-address-id".into())
+        }
+
+        async fn key_password(&self) -> Result<String> {
+            Ok("unused".into())
+        }
+    }
+
+    /// Round-trip test: upload a file through the real `ProtonFileUploader`
+    /// protocol, then download it through the real `FileDownloader`
+    /// protocol, both driven by the same in-process fake server and real
+    /// `RpgpCrypto` — no live credentials, no `unimplemented!()`.
+    #[tokio::test]
     async fn round_trip_upload_download_byte_identical() {
-        // This test is intentionally left as a stub pending live integration.
-        // When MD (block-upload) lands, wire:
-        //   1. Build ProtonDriveClient with real reqwest + credentials.
-        //   2. Upload tests/fixtures/small.txt via client.file_uploader(...).upload_from_stream.
-        //   3. Download the resulting node via client.file_downloader(...).download_to_writer.
-        //   4. assert_eq!(downloaded_bytes, original_bytes).
-        unimplemented!("round-trip test stub — wire after MD lands");
+        use crate::account::ProtonDriveAccount;
+        use crate::client::{ProtonDriveClient, ProtonDriveClientOptions};
+        use crate::config::ProtonDriveConfig;
+        use crate::nodes::make_node_uid;
+        use crate::upload::{FileUploader, ProtonFileUploader, UploadMetadata};
+        use tokio::io::AsyncRead;
+
+        let crypto = Arc::new(RpgpCrypto::new());
+
+        // ── real key hierarchy: address → share → My Files root folder ───────
+        let (address_priv, address_pub_armored) = crypto
+            .generate_key("address-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let address_pub = PublicKey {
+            armored: address_pub_armored,
+            fingerprint_hex: address_priv.fingerprint_hex.clone(),
+        };
+
+        let (share_priv, share_pub_armored) = crypto
+            .generate_key("share-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let share_pub = PublicKey {
+            armored: share_pub_armored,
+            fingerprint_hex: share_priv.fingerprint_hex.clone(),
+        };
+
+        let (root_priv, root_pub_armored) = crypto
+            .generate_key("root-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let root_pub = PublicKey {
+            armored: root_pub_armored,
+            fingerprint_hex: root_priv.fingerprint_hex.clone(),
+        };
+
+        // Share's own passphrase is encrypted to the ADDRESS key
+        // (`decrypt_share_key`'s contract).
+        let share_pp_session = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let share_pp_msg = crypto
+            .encrypt(
+                b"share-pass",
+                &share_pp_session,
+                std::slice::from_ref(&address_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let share_passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&share_pp_msg);
+
+        // The My Files root folder's own NodePassphrase is encrypted
+        // directly to the SHARE key — only the share root gets this
+        // treatment; every other node's passphrase is encrypted to its
+        // *parent node* key.
+        let root_pp_session = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let root_pp_msg = crypto
+            .encrypt(
+                b"root-pass",
+                &root_pp_session,
+                std::slice::from_ref(&share_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let root_passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&root_pp_msg);
+
+        // Root folder's NodeHashKey: encrypted to its OWN public key (a
+        // folder locks its child-name HMAC key to itself), armored — this
+        // field is dearmored directly on the wire, not base64
+        // (`ProtonFileUploader::resolve_parent_context`).
+        let hash_key_session = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let hash_key_msg = crypto
+            .encrypt(
+                b"roundtrip-hash-key-material",
+                &hash_key_session,
+                std::slice::from_ref(&root_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash_key_armored = armor(&hash_key_msg, ArmorKind::Message);
+
+        let share_id = "share-1";
+        let root_link_id = "root-link";
+        let volume_id = "vol-1";
+        let address_email = "roundtrip@proton.me";
+
+        let share_json = serde_json::json!({
+            "Code": 1000,
+            "ShareID": share_id, "VolumeID": volume_id, "LinkID": root_link_id, "Type": 1,
+            "Key": share_priv.armored, "Passphrase": share_passphrase_b64,
+            "PassphraseSignature": "", "AddressID": "addr-1",
+        })
+        .to_string();
+
+        let root_link_json = serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": root_link_id, "ParentLinkID": null, "Type": 1, "Name": "root",
+                "NameSignatureEmail": null, "Hash": null, "MIMEType": null, "State": 1,
+                "Size": 0, "CreateTime": 0, "ModifyTime": 0, "Trashed": null,
+                "NodeKey": root_priv.armored, "NodePassphrase": root_passphrase_b64,
+                "NodePassphraseSignature": "", "SignatureEmail": null,
+                "FileProperties": null,
+                "FolderProperties": {"NodeHashKey": hash_key_armored},
+            }
+        })
+        .to_string();
+
+        let server = Arc::new(InProcessServer::new(
+            share_id,
+            root_link_id,
+            volume_id,
+            share_json,
+            root_link_json,
+        ));
+
+        let account: Arc<dyn ProtonDriveAccount> = Arc::new(RoundtripAccount {
+            email: address_email.to_owned(),
+            address_priv,
+            address_pub,
+        });
+
+        let content = b"round-trip upload-then-download content, byte-identical end to end";
+
+        let uploader = ProtonFileUploader {
+            http: server.clone() as Arc<dyn ProtonDriveHttpClient>,
+            openpgp: Arc::clone(&crypto) as Arc<dyn OpenPgpCrypto>,
+            account: account.clone(),
+            parent: make_node_uid(share_id, root_link_id),
+            name: "roundtrip.txt".into(),
+            metadata: UploadMetadata {
+                media_type: "text/plain".into(),
+                expected_size: content.len() as u64,
+                expected_sha1_hex: None,
+                modification_time: None,
+                additional_metadata_json: None,
+                override_existing_draft_by_other_client: false,
+            },
+        };
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+        uploader
+            .upload_from_stream(stream, progress_tx)
+            .await
+            .unwrap();
+
+        // ── download the just-uploaded file through the same server ──────────
+        let client = ProtonDriveClient::new(ProtonDriveClientOptions {
+            http_client: server as Arc<dyn ProtonDriveHttpClient>,
+            entities_cache: Arc::new(proton_drive_cache::MemoryCache::<String>::new()),
+            crypto_cache: Arc::new(proton_drive_cache::MemoryCache::<
+                crate::nodes::CachedCryptoMaterial,
+            >::new()),
+            account,
+            openpgp: Arc::clone(&crypto) as Arc<dyn OpenPgpCrypto>,
+            srp: crypto as Arc<dyn proton_drive_crypto::SrpModule>,
+            config: ProtonDriveConfig::default(),
+            telemetry: None,
+            latest_event_id: None,
+        });
+
+        let uid = make_node_uid(share_id, ROUNDTRIP_FILE_LINK_ID);
+        let downloader = client.file_downloader(&uid).await.unwrap();
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+
+        assert_eq!(
+            out,
+            content.to_vec(),
+            "downloaded bytes must be byte-identical to the uploaded content"
+        );
+        assert_eq!(stats.bytes, content.len() as u64);
+        assert_eq!(stats.blocks, 1);
+        assert!(
+            stats.signature_verified,
+            "manifest must verify: it was signed by the same address key the \
+             downloader resolves via the file's SignatureEmail"
+        );
     }
 }

@@ -1,6 +1,6 @@
 {
   "generator": "generate.mjs (openpgp.js v6, SEIPDv1)",
-  "generated_at": "2026-05-28T17:27:21.508Z",
+  "generated_at": "2026-07-05T16:21:11.384Z",
   "plaintext_seed": "proton-drive-sdk-wire-format-test-fixture-v1",
   "plaintext_length": 256,
   "plaintext_sha256": "2bf75526f6c5e38eb7a2a8a30413cfa71dc52eaee96dbd04d780ae17d3bfa4ca",

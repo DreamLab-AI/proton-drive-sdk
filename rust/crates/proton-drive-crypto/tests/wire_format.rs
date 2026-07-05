@@ -280,7 +280,68 @@ async fn wire_compressed_signed_decrypts_and_verifies() {
     );
 }
 
-// ── test 5 (JS roundtrip): Rust encrypts → Node/openpgp.js decrypts ──────────
+// ── test 5: truncated ciphertext — short read must not silently decrypt ──────
+
+/// A message cut off mid-`SEIPD`-body (simulating a network interruption /
+/// short read) must not produce a successful decryption. The PKESK packet
+/// is untouched (the cut lands well inside the SEIPD body), so session-key
+/// extraction still succeeds; the final decrypt+verify step must fail
+/// cleanly instead of panicking or returning truncated "plaintext".
+#[tokio::test]
+async fn wire_truncated_ciphertext_is_rejected() {
+    let crypto = RpgpCrypto::new();
+    let fx = load_fixtures(&crypto).await;
+    let truncated = fixture("seipdv1_truncated.bin");
+
+    let session_key = crypto
+        .decrypt_session_key(&truncated, &[fx.priv_key.clone()])
+        .await
+        .expect("session key from truncated message — PKESK precedes the cut");
+
+    let result = crypto
+        .decrypt_and_verify(&truncated, &session_key, &[fx.signer_pub.clone()])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected Err for truncated ciphertext, got Ok({:?})",
+        result.map(|(pt, st)| (pt.len(), st))
+    );
+
+    match result.unwrap_err() {
+        CryptoError::Decrypt(_) => {} // expected
+        other => panic!("expected CryptoError::Decrypt, got {other:?}"),
+    }
+}
+
+// ── test 6: wrong recipient — a key that isn't the message's target ──────────
+
+/// `seipdv1_wrong_recipient.bin` is encrypted to a throwaway key, not
+/// `key_pub.asc`. A parent-key-resolution bug that hands the decryptor the
+/// wrong node/share key would look exactly like this: no PKESK in the
+/// message matches `key_priv.asc`, so session-key extraction must fail
+/// cleanly (`CryptoError::Decrypt`), never panic or return a bogus key.
+#[tokio::test]
+async fn wire_wrong_recipient_is_rejected() {
+    let crypto = RpgpCrypto::new();
+    let fx = load_fixtures(&crypto).await;
+    let wrong_recipient_bin = fixture("seipdv1_wrong_recipient.bin");
+
+    let result = crypto
+        .decrypt_session_key(&wrong_recipient_bin, &[fx.priv_key.clone()])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected Err: key_priv.asc is not a recipient of this message"
+    );
+    match result.unwrap_err() {
+        CryptoError::Decrypt(_) => {} // expected — "no key could decrypt the session key"
+        other => panic!("expected CryptoError::Decrypt, got {other:?}"),
+    }
+}
+
+// ── test 7 (JS roundtrip): Rust encrypts → Node/openpgp.js decrypts ──────────
 
 /// Rust encrypts + signs the fixture plaintext, then a small Node.js script
 /// (`wire_roundtrip.mjs`) decrypts it using openpgp.js and writes the
