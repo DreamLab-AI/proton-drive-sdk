@@ -162,13 +162,18 @@ pub fn link_to_maybe_node(
 
 /// Parse a protocol error into the appropriate domain `Error`.
 ///
-/// The Proton API returns `Code` ≠ 1000 for known error conditions.
-/// We surface the message directly; callers decide whether to retry.
+/// The Proton API returns `Code` ≠ 1000 for known error conditions. Codes are
+/// taken from the canonical taxonomy in
+/// `reference/js/sdk/src/internal/apiService/errorCodes.ts` (`ErrorCode`
+/// enum): `NOT_ENOUGH_PERMISSIONS = 2011`, `ALREADY_EXISTS = 2500`,
+/// `NOT_EXISTS = 2501`. We surface the message directly; callers decide
+/// whether to retry.
 pub fn map_api_error(code: u32, message: Option<String>) -> Error {
     let msg = message.unwrap_or_else(|| format!("API error {code}"));
     match code {
         2501 => Error::NotFound(msg),
-        2011 => Error::NodeWithSameNameExists { name: msg },
+        2500 => Error::NodeWithSameNameExists { name: msg },
+        2011 => Error::PermissionDenied(msg),
         _ => Error::Internal(msg),
     }
 }
@@ -226,5 +231,37 @@ mod tests {
         };
         assert_eq!(missing.uid(), &uid);
         assert_eq!(degraded.uid(), &uid);
+    }
+
+    /// Per `reference/js/sdk/src/internal/apiService/errorCodes.ts`,
+    /// `ALREADY_EXISTS = 2500` — a name/draft collision, not a permissions
+    /// error. Regression test for the code-2500/2011 swap.
+    #[test]
+    fn map_api_error_2500_is_already_exists() {
+        let err = map_api_error(2500, Some("name taken".into()));
+        assert!(matches!(err, Error::NodeWithSameNameExists { name } if name == "name taken"));
+    }
+
+    /// Per `reference/js/sdk/src/internal/apiService/errorCodes.ts`,
+    /// `NOT_ENOUGH_PERMISSIONS = 2011` — must not be mistaken for a
+    /// name collision.
+    #[test]
+    fn map_api_error_2011_is_permission_denied() {
+        let err = map_api_error(2011, Some("no access".into()));
+        assert!(matches!(err, Error::PermissionDenied(msg) if msg == "no access"));
+    }
+
+    /// `NOT_EXISTS = 2501` maps to `NotFound` — unaffected by the 2500/2011 fix.
+    #[test]
+    fn map_api_error_2501_is_not_found() {
+        let err = map_api_error(2501, Some("gone".into()));
+        assert!(matches!(err, Error::NotFound(msg) if msg == "gone"));
+    }
+
+    /// Unknown codes still fall back to the opaque `Internal` bucket.
+    #[test]
+    fn map_api_error_unknown_code_is_internal() {
+        let err = map_api_error(9999, None);
+        assert!(matches!(err, Error::Internal(msg) if msg == "API error 9999"));
     }
 }
