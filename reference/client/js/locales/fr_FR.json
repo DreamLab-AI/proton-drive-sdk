@@ -1,0 +1,279 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=2; plural=(n >= 2);",
+    "language": "fr_FR"
+  },
+  "contexts": {
+    "Error": {
+      "A message is required when reporting copyright infringement or stolen data": [
+        "Un message est requis lors du signalement d'une violation du droit d'auteur ou de données volées"
+      ],
+      "Bookmark password is not available": [
+        "Le mot de passe du favori n'est pas disponible."
+      ],
+      "Cannot add photo to album without a valid name": [
+        "Impossible d'ajouter une photo à l'album sans un nom valide."
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "Impossible de créer un lien public pour un volume n'appartenant pas à l'utilisateur."
+      ],
+      "Cannot download a folder": [
+        "Le téléchargement d'un dossier n'a pas abouti."
+      ],
+      "Cannot share root folder": [
+        "Le partager du dossier principal n'a pas abouti."
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "Impossible de mettre à jour un lien public pour un volume n'appartenant pas à l'utilisateur"
+      ],
+      "Content key packet is required for small revision upload": [
+        "Un paquet de clés de contenu est requis pour importer de petites révisions."
+      ],
+      "Copy operation aborted": [
+        "L'opération de copie a été annulée."
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "La copie d'un élément vers un élément qui n'est pas un dossier n'est pas autorisée."
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "La création de documents dans des éléments qui ne sont pas des dossiers n'est pas autorisée."
+      ],
+      "Creating files in non-folders is not allowed": [
+        "La création de fichiers dans des éléments qui ne sont pas des dossiers n'est pas autorisée."
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "La création de dossiers dans des éléments qui ne sont pas des dossiers n'est pas autorisée."
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "La création de révisions dans des éléments qui ne sont pas des fichiers n'est pas autorisée."
+      ],
+      "Data integrity check failed": [
+        "La vérification de l'intégrité des données n'a pas abouti."
+      ],
+      "Data integrity check of one part failed": [
+        "La vérification de l'intégrité des données d'une partie n'a pas abouti."
+      ],
+      "Device not found": [
+        "L'appareil est introuvable."
+      ],
+      "Expiration date cannot be in the past": [
+        "La date d\"expiration ne peut pas être antérieure."
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Le déchiffrement de la révision active n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Le déchiffrement du bloc n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Le déchiffrement de la clé du favori n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Le déchiffrement du nom du favori n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Le déchiffrement du mot de passe du favori n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Le déchiffrement de la clé de contenu n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Le déchiffrement du nom de l'élément n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Le déchiffrement de la clé de nœud n'a pas abouti : ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Le déchiffrement de la vignette n'a pas abouti : ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "La récupération des clés de l'invitant n'a pas abouti"
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "La récupération des informations de partage pour le nœud ${ nodeUid } n'a pas abouti"
+      ],
+      "Failed to get verification keys": [
+        "Impossible d'obtenir les clés de vérification"
+      ],
+      "Failed to load some items": [
+        "Le chargement de certains éléments n'a pas abouti."
+      ],
+      "Failed to load some nodes": [
+        "Le chargement de certains nœuds n'a pas abouti."
+      ],
+      "Failed to verify invitation": [
+        "La vérification de l'invitation n'a pas abouti."
+      ],
+      "File download failed due to empty response": [
+        "Le téléchargement du fichier n'a pas abouti en raison d'une réponse vide."
+      ],
+      "File has no active revision": [
+        "Le fichier n'a pas de révision active."
+      ],
+      "File has no content key": [
+        "Le fichier n'a pas de clé de contenu."
+      ],
+      "File has no revision": [
+        "Le fichier n'a pas de révision."
+      ],
+      "File hash does not match expected hash": [
+        "Le hachage du fichier ne correspond pas au hachage attendu."
+      ],
+      "Invalid URL": [
+        "L'URL n'est pas valide."
+      ],
+      "Invitation not found": [
+        "L'invitation est introuvable."
+      ],
+      "Item cannot be decrypted": [
+        "L'élément ne peut pas être déchiffré."
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "L'ancien lien public ne peut pas être mis à jour. Veuillez recréer un nouveau lien public."
+      ],
+      "Missing integrity signature": [
+        "Il manque la signature d'intégrité."
+      ],
+      "Missing inviter email": [
+        "L'adresse de l'expéditeur est manquante"
+      ],
+      "Missing signature": [
+        "Il manque la signature."
+      ],
+      "Missing signature for ${ signatureType }": [
+        "La signature est manquante pour ${ signatureType }."
+      ],
+      "Move operation aborted": [
+        "Le déplacement a été annulé."
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "Le déplacement d'un élément vers un élément qui n'est pas un dossier n'est pas autorisé."
+      ],
+      "Moving root item is not allowed": [
+        "Le déplacement de l'élément principal n'est pas autorisé."
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "Le nom doit être composé d'${ MAX_NODE_NAME_LENGTH } caractère au maximum.",
+        "Le nom doit être composé de ${ MAX_NODE_NAME_LENGTH } caractères au maximum."
+      ],
+      "Name must not be empty": [
+        "Le nom ne doit pas être vide."
+      ],
+      "No available name found": [
+        "Aucun nom disponible trouvé"
+      ],
+      "Node has no thumbnail": [
+        "Le nœud n'a pas de vignette."
+      ],
+      "Node is not accessible": [
+        "Le nœud n'est pas accessible."
+      ],
+      "Node is not accessible via a share": [
+        "Le nœud n'est pas accessible via un partage"
+      ],
+      "Node is not shared": [
+        "Le nœud n'est pas partagé."
+      ],
+      "Node not found": [
+        "Le nœud est introuvable."
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Seuls les administrateurs peuvent convertir des invitations non-Proton."
+      ],
+      "Operation aborted": [
+        "L'opération a été annulée."
+      ],
+      "Operation failed, try again later": [
+        "L'opération n'a pas abouti, veuillez réessayer plus tard."
+      ],
+      "Parent cannot be decrypted": [
+        "L'élément principal ne peut pas être déchiffré."
+      ],
+      "Photo is already in the target album": [
+        "La photo est déjà dans l’album cible."
+      ],
+      "Photo not found": [
+        "La photo est introuvable."
+      ],
+      "Renaming root item is not allowed": [
+        "La modification du nom de l'élément principal n'est pas autorisée."
+      ],
+      "Request aborted": [
+        "La requête a été annulée."
+      ],
+      "Signature is missing": [
+        "La signature est manquante"
+      ],
+      "Signature verification failed": [
+        "La signature n'a pas pu être vérifiée."
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "La signature de vérification n'a pas abouti : ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "La vérification de la signature pour ${ signatureType } n'a pas abouti."
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "La vérification de la signature destinée à ${ signatureType } n'a pas été aboutie :${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Certains octets de fichier n'ont pas pu être importés."
+      ],
+      "Some file parts failed to upload": [
+        "Certaines parties de fichier n'ont pas pu être importées."
+      ],
+      "The node is not shared anymore": [
+        "Ce nœud n'est plus partagé."
+      ],
+      "Thumbnail not found": [
+        "La vignette n'a pas été trouvée."
+      ],
+      "Too many server errors, please try again later": [
+        "Trop d'erreurs de serveur. Veuillez réessayer plus tard."
+      ],
+      "Too many server requests, please try again later": [
+        "Trop de requêtes de serveur. Veuillez réessayer plus tard."
+      ],
+      "Unknown error": [
+        "Erreur inconnue"
+      ],
+      "Unknown error ${ code }": [
+        "Erreur inconnue ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Les clés de vérification ne sont pas disponibles."
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Les clés de vérification pour ${ signatureType } ne sont pas disponibles."
+      ],
+      "You can leave only item that is shared with you": [
+        "Vous pouvez seulement quitter l'élément partagé avec vous."
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "L'auteur n'est pas indiqué sur le lien public"
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "attributs"
+      ],
+      "content key": [
+        "clé de contenu"
+      ],
+      "hash key": [
+        "clé de hachage"
+      ],
+      "key": [
+        "clé"
+      ],
+      "membership": [
+        "abonnement"
+      ],
+      "name": [
+        "nom"
+      ]
+    }
+  }
+}

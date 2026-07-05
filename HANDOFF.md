@@ -86,7 +86,7 @@ wp1–wp9 fixes — not new milestones. See `docs/audit-2026-07-05.md`.
 - `unwrap_used`/`expect_used`/`panic` are **denied workspace-wide**. Tests opt out with `#[allow(...)]` on the test module.
 - `cargo fmt --check` is part of CI. Run `cargo fmt --all` before committing.
 - The crypto trait seam is non-negotiable — direct `pgp::*` references outside `proton-drive-crypto` are a bug.
-- The DTOs are JSON. The `reference/cs/sdk/src/protos/` files are the C-ABI marshalling source for kt/swift and the build-time wire-type codegen source for `proton-drive-api` (`build.rs`).
+- The DTOs are JSON. The `reference/client/cs/src/protos/` file is the C-ABI marshalling source for kt/swift and the build-time wire-type codegen source for `proton-drive-api` (`build.rs`).
 - No *ad hoc* polling of node/listing state outside the official Events API. The event-loop consumer itself (`spawn_volume_event_loop`) legitimately polls the Events endpoint on an interval with Fibonacci backoff — that mirrors the JS SDK's own `eventManager.ts` exactly (Proton Drive has no push/websocket transport for events) and is not a guardrail violation. What the PRD invariant forbids is a client re-listing folders or re-fetching nodes on a timer instead of reacting to the Events feed.
 - `x-pm-appversion = external-drive-pdtui@{semver}-stable`. Never spoof a first-party header. The middleware enforces this; don't bypass.
 - Personal use only. No publishing to crates.io, no binary releases, no fork-promotion. See ADR-0007.

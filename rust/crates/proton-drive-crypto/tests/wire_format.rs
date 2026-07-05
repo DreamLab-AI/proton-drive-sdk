@@ -231,7 +231,7 @@ async fn wire_wrong_signer_is_rejected() {
 /// `seipdv1_signed_compressed.bin`'s SEIPD wraps an OpenPGP-compressed (ZIP)
 /// packet around the signed literal — exactly the shape JS produces for
 /// ExtendedAttributes (`compress: true`, see
-/// reference/js/sdk/src/crypto/driveCrypto.ts:556
+/// reference/client/js/src/crypto/driveCrypto.ts:556
 /// `encryptExtendedAttributes` -> openPGPCrypto.ts:124-132
 /// `encryptAndSignArmored`). Before the `finalize_decrypted` fix this either
 /// mis-verified the signature (rpgp's `verify_nested` refuses a

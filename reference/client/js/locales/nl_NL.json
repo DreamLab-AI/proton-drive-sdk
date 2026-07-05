@@ -1,0 +1,273 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=2; plural=(n != 1);",
+    "language": "nl_NL"
+  },
+  "contexts": {
+    "Error": {
+      "Bookmark password is not available": [
+        "Bladwijzerwachtwoord is niet beschikbaar"
+      ],
+      "Cannot add photo to album without a valid name": [
+        "Kan geen foto aan album toevoegen zonder geldige naam"
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "Kan geen openbare link aanmaken voor een volume dat geen eigendom is van de gebruiker."
+      ],
+      "Cannot download a folder": [
+        "Kan geen map downloaden"
+      ],
+      "Cannot share root folder": [
+        "Kan hoofdmap niet delen"
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "Het is niet mogelijk om de openbare link bij te werken voor een volume dat geen eigendom is van de gebruiker."
+      ],
+      "Content key packet is required for small revision upload": [
+        "Content key packet is vereist voor kleine revisie upload"
+      ],
+      "Copy operation aborted": [
+        "Kopieeractie afgebroken"
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "Het kopiëren van een item naar een niet-map is niet toegestaan"
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "Het aanmaken van documenten in niet-mappen is niet toegestaan"
+      ],
+      "Creating files in non-folders is not allowed": [
+        "Het aanmaken van bestanden in niet-mappen is niet toegestaan"
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "Het aanmaken van mappen in niet-mappen is niet toegestaan"
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "Het aanmaken van revisies in niet-mappen is niet toegestaan"
+      ],
+      "Data integrity check failed": [
+        "Integriteitscontrole van gegevens mislukt"
+      ],
+      "Data integrity check of one part failed": [
+        "Integriteitscontrole van één onderdeel is mislukt"
+      ],
+      "Device not found": [
+        "Apparaat niet gevonden"
+      ],
+      "Expiration date cannot be in the past": [
+        "De vervaldatum kan niet in het verleden liggen"
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Fout bij het ontsleutelen van actieve revisie: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Fout bij het ontsleutelen van blok: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Fout bij het ontsleutelen van de bladwijzersleutel: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Fout bij het ontsleutelen van bladwijzernaam: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Fout bij het ontsleutelen van bladwijzerwachtwoord: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Fout bij het ontsleutelen van de inhoudssleutel: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Fout bij het ontsleutelen van de itemnaam: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Fout bij het ontsleutelen van de nodesleutel: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Fout bij het ontsleutelen van de miniatuur: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "Ophalen van de sleutels van de uitnodiger is niet gelukt."
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "Kon de deel informatie voor node ${ nodeUid } niet ophalen."
+      ],
+      "Failed to get verification keys": [
+        "Fout bij het ophalen van verificatiesleutels"
+      ],
+      "Failed to load some items": [
+        "Fout bij het laden van sommige items"
+      ],
+      "Failed to load some nodes": [
+        "Fout bij het laden van sommige nodes"
+      ],
+      "Failed to verify invitation": [
+        "Verificatie van de uitnodiging is mislukt"
+      ],
+      "File download failed due to empty response": [
+        "Het downloaden van het bestand is mislukt door een leeg antwoord"
+      ],
+      "File has no active revision": [
+        "Bestand heeft geen actieve revisie"
+      ],
+      "File has no content key": [
+        "Bestand heeft geen inhoudssleutel"
+      ],
+      "File has no revision": [
+        "Bestand heeft geen revisie"
+      ],
+      "File hash does not match expected hash": [
+        "Bestandhash komt niet overeen met verwachte hash"
+      ],
+      "Invalid URL": [
+        "Ongeldige URL"
+      ],
+      "Invitation not found": [
+        "Uitnodiging niet gevonden"
+      ],
+      "Item cannot be decrypted": [
+        "Item kan niet worden ontsleuteld"
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "De verouderde openbare koppeling kan niet worden bijgewerkt. Maak opnieuw een openbare koppeling aan."
+      ],
+      "Missing integrity signature": [
+        "Integriteitshandtekening ontbreekt"
+      ],
+      "Missing inviter email": [
+        "E-mailadres van uitnodiger ontbreekt"
+      ],
+      "Missing signature": [
+        "Handtekening ontbreekt"
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Ontbrekende handtekening voor ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "Verplaatsactie afgebroken"
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "Het verplaatsen van een item naar een niet-map is niet toegestaan"
+      ],
+      "Moving root item is not allowed": [
+        "Het verplaatsen van het hoofditem is niet toegelaten"
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "Naam mag maximaal ${ MAX_NODE_NAME_LENGTH } teken lang zijn",
+        "Naam mag maximaal ${ MAX_NODE_NAME_LENGTH } tekens lang zijn"
+      ],
+      "Name must not be empty": [
+        "Naam mag niet leeg zijn"
+      ],
+      "No available name found": [
+        "Geen beschikbare naam gevonden"
+      ],
+      "Node has no thumbnail": [
+        "Node heeft geen miniatuur"
+      ],
+      "Node is not accessible": [
+        "Node is niet toegankelijk"
+      ],
+      "Node is not shared": [
+        "Node is niet gedeeld"
+      ],
+      "Node not found": [
+        "Node niet gevonden"
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Alleen beheerders kunnen uitnodigingen omzetten die niet van Proton zijn."
+      ],
+      "Operation aborted": [
+        "Handeling afgebroken"
+      ],
+      "Operation failed, try again later": [
+        "Actie mislukt, probeer het later opnieuw"
+      ],
+      "Parent cannot be decrypted": [
+        "Bovenliggend onderdeel kan niet worden ontsleuteld"
+      ],
+      "Photo is already in the target album": [
+        "Foto staat al in het doelalbum"
+      ],
+      "Photo not found": [
+        "Foto niet gevonden"
+      ],
+      "Renaming root item is not allowed": [
+        "Het hernoemen van het hoofditem is niet toegelaten"
+      ],
+      "Request aborted": [
+        "Verzoek afgebroken"
+      ],
+      "Signature is missing": [
+        "Handtekening ontbreekt"
+      ],
+      "Signature verification failed": [
+        "Controle van handtekening mislukt"
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Verificatie van handtekening is mislukt: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "Verificatie van de handtekening voor ${ signatureType } is mislukt"
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "Verificatie van de handtekening voor ${ signatureType } is mislukt: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Sommige bestandsbytes konden niet worden geüpload"
+      ],
+      "Some file parts failed to upload": [
+        "Sommige bestandsonderdelen konden niet worden geüpload"
+      ],
+      "The node is not shared anymore": [
+        "De node wordt niet langer gedeeld"
+      ],
+      "Thumbnail not found": [
+        "Miniatuur niet gevonden"
+      ],
+      "Too many server errors, please try again later": [
+        "Te veel serverfouten, probeer het later opnieuw"
+      ],
+      "Too many server requests, please try again later": [
+        "Te veel serveraanvragen, probeer het later opnieuw"
+      ],
+      "Unknown error": [
+        "Onbekende fout"
+      ],
+      "Unknown error ${ code }": [
+        "Onbekende fout ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Verificatiesleutels zijn niet beschikbaar"
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Verificatiesleutels voor ${ signatureType } zijn niet beschikbaar"
+      ],
+      "You can leave only item that is shared with you": [
+        "U kunt alleen een item verlaten dat met u wordt gedeeld"
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "Auteur is niet opgegeven op openbare link"
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "attributen"
+      ],
+      "content key": [
+        "inhoudssleutel"
+      ],
+      "hash key": [
+        "hash sleutel"
+      ],
+      "key": [
+        "sleutel"
+      ],
+      "membership": [
+        "lidmaatschap"
+      ],
+      "name": [
+        "naam"
+      ]
+    }
+  }
+}

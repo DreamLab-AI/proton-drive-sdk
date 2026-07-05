@@ -75,7 +75,7 @@ pub struct Credentials {
     /// 31-char bcrypt hash portion — passphrase for unlocking the user's PGP key.
     pub key_password: Zeroizing<String>,
     /// Access-token lifetime in seconds. Taken from the server's `ExpiresIn`
-    /// field on `/core/v4/auth` when present (reference/js/sdk coreTypes.ts
+    /// field on `/core/v4/auth` when present (reference/client/js coreTypes.ts
     /// documents it, deprecated but present); otherwise the previous
     /// conservative 30-minute default.
     pub expires_in_secs: u64,

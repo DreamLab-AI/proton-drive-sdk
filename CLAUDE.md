@@ -24,7 +24,7 @@ honestly; never claim audit-grade security.
 | `docs/` | PRDs, domain model, ADRs (`docs/adr/`) for the port. |
 | `tests/fixtures/wire/` | Cross-language wire-format fixtures; consumed by `rust/crates/proton-drive-crypto/tests/wire_format.rs` via a repo-root-relative path (`../../../tests/fixtures/wire`). **Do not move.** |
 | `scripts/` | Dev tooling: `setup.sh` (gate), `configure-session.sh`, `run-probes.sh`, `js-probe.mjs` (JS cross-check). |
-| `reference/` | Upstream Proton SDKs — `reference/{js,cs,kt,swift}`. Wire-format source of truth. |
+| `reference/` | Vendored upstream Proton SDKs monorepo — `reference/client/{js,cs}`, `reference/incubating/client/{kt,swift}`. Wire-format source of truth. See `reference/VENDORED.md` for the pinned commit and layout mapping. |
 
 ## Build & Test (the Rust project)
 
@@ -45,8 +45,8 @@ Quality gate (run before committing):
 `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 
 The `proton-drive-api` crate runs **build-time protobuf codegen** from
-`reference/cs/sdk/src/protos/` (see `rust/crates/proton-drive-api/build.rs`).
-Moving `reference/cs` requires updating that path.
+`reference/client/cs/src/protos/` (see `rust/crates/proton-drive-api/build.rs`).
+Moving `reference/client/cs` requires updating that path.
 
 ### Rust guardrails (non-negotiable)
 - `unwrap_used` / `expect_used` / `panic` are **denied workspace-wide** for
@@ -54,7 +54,7 @@ Moving `reference/cs` requires updating that path.
   out because a build script *should* abort loudly.
 - The crypto trait seam is the only boundary that may touch `pgp::*` — direct
   `pgp` references outside `proton-drive-crypto` are a bug.
-- DTOs are JSON, not protobuf. The `reference/cs/sdk/src/protos/` files exist for
+- DTOs are JSON, not protobuf. The `reference/client/cs/src/protos/` file exists for
   C-ABI marshalling to kt/swift and as the Rust wire-type codegen source only.
 - No *ad hoc* polling of node/listing state outside the official Events API —
   don't add a client that re-lists folders or re-fetches nodes on a timer.
@@ -79,13 +79,16 @@ Independent upstream implementations the port mirrors. Touch only when checking
 wire-format ground truth; the JS SDK is the primary behavioural reference for
 the Rust port (see ADR-0001).
 
-- **TypeScript** — `reference/js/sdk/`. Entry `ProtonDriveClient`
+- **TypeScript** — `reference/client/js/`. Entry `ProtonDriveClient`
   (`protonDriveClient.ts`); only `src/index.ts` re-exports are public API,
   `internal/` mirrors domain concerns (`nodes/`, `upload/`, `download/`,
   `events/`, `apiService/`). Crypto + cache + account are host-injected.
-  Changelog `reference/js/CHANGELOG.md`.
-- **C#** — `reference/cs/sdk/`. `Proton.Sdk` (base) + `Proton.Drive.Sdk`
+  Changelog `reference/client/js/CHANGELOG.md`.
+- **C#** — `reference/client/cs/`. `Proton.Sdk` (base) + `Proton.Drive.Sdk`
   (Drive). `*.CExports` produce the C ABI for kt/swift. Changelog
-  `reference/cs/CHANGELOG.md` (source of truth for kt/swift).
-- **Kotlin / Swift** — `reference/kt/`, `reference/swift/ProtonDriveSDK/`.
-  Bindings over the C# AOT native library; no business logic of their own.
+  `reference/client/cs/CHANGELOG.md` (source of truth for kt/swift).
+- **Kotlin / Swift** — `reference/incubating/client/kt/`,
+  `reference/incubating/client/swift/ProtonDriveSDK/`. Bindings over the C#
+  AOT native library; no business logic of their own.
+- **CLI** — `reference/cli/`, new since the previous vendored snapshot; not
+  used by this port.

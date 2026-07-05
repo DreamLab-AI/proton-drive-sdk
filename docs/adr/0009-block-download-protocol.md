@@ -10,7 +10,7 @@ JS-faithful "deliver-then-flag" design.
 
 ## Decision
 
-Port `js/sdk/src/internal/download/` happy path 1:1 into `proton-drive-core::download`. Sequential block fetch, per-block ciphertext-hash check, write to async stream, then manifest-signature verification. Seekable/parallel download deferred.
+Port `client/js/src/internal/download/` happy path 1:1 into `proton-drive-core::download`. Sequential block fetch, per-block ciphertext-hash check, write to async stream, then manifest-signature verification. Seekable/parallel download deferred.
 
 ## The protocol (as derived from the JS SDK and matching `download_to_writer`, `crates/proton-drive-core/src/download.rs`)
 
@@ -73,7 +73,7 @@ Port `js/sdk/src/internal/download/` happy path 1:1 into `proton-drive-core::dow
 - **XAttr size/SHA1 mismatch is deliberately non-fatal.** Corrected 2026-07-05:
   this ADR previously claimed "the JS SDK does verify the assembled size
   matches XAttr.Common.Size; we should too" — that is false. Neither
-  `reference/js/sdk`'s `fileDownloader.ts` (which uses the claimed size only
+  `reference/client/js`'s `fileDownloader.ts` (which uses the claimed size only
   for progress reporting) nor the Rust port asserts on a size/SHA1 mismatch;
   `verify_xattr` (`download.rs`) logs a warning and still returns the decrypted
   modification time. Only a **missing** ManifestSignature is a hard abort; a
@@ -124,7 +124,7 @@ pub struct DownloadStats {
 
 ## References
 
-- `js/sdk/src/internal/download/fileDownloader.ts`
-- `js/sdk/src/internal/download/apiService.ts`
-- `js/sdk/src/internal/download/cryptoService.ts`
-- `js/sdk/src/internal/download/controller.ts`
+- `client/js/src/internal/download/fileDownloader.ts`
+- `client/js/src/internal/download/apiService.ts`
+- `client/js/src/internal/download/cryptoService.ts`
+- `client/js/src/internal/download/controller.ts`

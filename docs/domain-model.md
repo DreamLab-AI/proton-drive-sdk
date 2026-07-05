@@ -1,6 +1,6 @@
 # Domain Model — Proton Drive SDK (Rust port)
 
-This document captures the bounded contexts, aggregates, and ubiquitous language for the Rust port. The model is **derived from `js/sdk/src/interface/`**, not invented. Naming follows Proton's vocabulary so that file-by-file mapping between JS and Rust holds.
+This document captures the bounded contexts, aggregates, and ubiquitous language for the Rust port. The model is **derived from `client/js/src/interface/`**, not invented. Naming follows Proton's vocabulary so that file-by-file mapping between JS and Rust holds.
 
 ## 1. Bounded Contexts
 

@@ -1,4 +1,4 @@
-//! Node aggregate. Mirrors `js/sdk/src/interface/nodes.ts`.
+//! Node aggregate. Mirrors `client/js/src/interface/nodes.ts`.
 
 use crate::account::Author;
 use crate::error::Error;
@@ -164,7 +164,7 @@ pub fn link_to_maybe_node(
 ///
 /// The Proton API returns `Code` ≠ 1000 for known error conditions. Codes are
 /// taken from the canonical taxonomy in
-/// `reference/js/sdk/src/internal/apiService/errorCodes.ts` (`ErrorCode`
+/// `reference/client/js/src/internal/apiService/errorCodes.ts` (`ErrorCode`
 /// enum): `NOT_ENOUGH_PERMISSIONS = 2011`, `ALREADY_EXISTS = 2500`,
 /// `NOT_EXISTS = 2501`. We surface the message directly; callers decide
 /// whether to retry.
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(degraded.uid(), &uid);
     }
 
-    /// Per `reference/js/sdk/src/internal/apiService/errorCodes.ts`,
+    /// Per `reference/client/js/src/internal/apiService/errorCodes.ts`,
     /// `ALREADY_EXISTS = 2500` — a name/draft collision, not a permissions
     /// error. Regression test for the code-2500/2011 swap.
     #[test]
@@ -242,7 +242,7 @@ mod tests {
         assert!(matches!(err, Error::NodeWithSameNameExists { name } if name == "name taken"));
     }
 
-    /// Per `reference/js/sdk/src/internal/apiService/errorCodes.ts`,
+    /// Per `reference/client/js/src/internal/apiService/errorCodes.ts`,
     /// `NOT_ENOUGH_PERMISSIONS = 2011` — must not be mistaken for a
     /// name collision.
     #[test]

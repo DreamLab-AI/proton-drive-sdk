@@ -1,0 +1,121 @@
+import Foundation
+import ProtonCoreDataModel
+import SwiftProtobuf
+
+public protocol AccountClientProtocol: Sendable {
+    func getAddress(addressId: String) -> Address?
+    func getDefaultAddress() -> Address?
+    func getAddressPrimaryPrivateKey(addressId: String) -> Data?
+    func getAddressPrivateKeys(addressId: String) -> [Data]?
+    func getAddressPublicKeysRequest(emailAddress: String) -> [Data]
+}
+
+let cCompatibleAccountClientRequest: CCallbackWithCallbackPointer = { statePointer, byteArray, callbackPointer in
+    guard let stateRawPointer = UnsafeRawPointer(bitPattern: statePointer) else {
+        SDKResponseHandler.sendInteropErrorToSDK(message: "cCompatibleAccountClientRequest.statePointer is null",
+                                                 callbackPointer: callbackPointer)
+        return
+    }
+    let stateTypedPointer = Unmanaged<BoxedCompletionBlock<Int, SDKClientProvider>>.fromOpaque(stateRawPointer)
+    let provider: SDKClientProvider = stateTypedPointer.takeUnretainedValue().state
+
+    guard
+        let driveClient = provider.get(callbackPointer: callbackPointer, releaseBox: {
+            // we don't release the stateTypedPointer by design — there might be some calls coming from the SDK racing with the client deallocation
+            // stateTypedPointer.release()
+        })
+    else { return }
+
+    Task { [driveClient] in
+        let accountClient = driveClient.accountClient
+
+        let request = Proton_Drive_Sdk_AccountRequest(byteArray: byteArray)
+
+        switch request.payload {
+        case .getAddress(let request):
+            guard let address = accountClient.getAddress(addressId: request.addressID) else {
+                SDKResponseHandler.sendInteropErrorToSDK(message: "cCompatibleAccountClientRequest.address is null",
+                                                         callbackPointer: callbackPointer)
+                return
+            }
+            let protoAddress = address.makeProtoAddress()
+            SDKResponseHandler.send(callbackPointer: callbackPointer, message: protoAddress)
+        case .getDefaultAddress(let request):
+            guard let address = accountClient.getDefaultAddress() else {
+                SDKResponseHandler.sendInteropErrorToSDK(message: "cCompatibleAccountClientRequest.defaultAddress is null",
+                                                         callbackPointer: callbackPointer)
+                return
+            }
+            let protoAddress = address.makeProtoAddress()
+            SDKResponseHandler.send(callbackPointer: callbackPointer, message: protoAddress)
+        case .getAddressPrimaryPrivateKey(let request):
+            guard let key = accountClient.getAddressPrimaryPrivateKey(addressId: request.addressID) else {
+                SDKResponseHandler.sendInteropErrorToSDK(message: "cCompatibleAccountClientRequest.key is null",
+                                                         callbackPointer: callbackPointer)
+                return
+            }
+            let bytesValue = Google_Protobuf_BytesValue.with {
+                $0.value = key
+            }
+            SDKResponseHandler.send(callbackPointer: callbackPointer, message: bytesValue)
+        case .getAddressPrivateKeys(let request):
+            guard let privateKeys = accountClient.getAddressPrivateKeys(addressId: request.addressID) else {
+                SDKResponseHandler.sendInteropErrorToSDK(message: "cCompatibleAccountClientRequest.privateKeys is null",
+                                                         callbackPointer: callbackPointer)
+                return
+            }
+            let repeatedBytes = Proton_Drive_Sdk_RepeatedBytesValue.with {
+                $0.value = privateKeys
+            }
+            SDKResponseHandler.send(callbackPointer: callbackPointer, message: repeatedBytes)
+        case .getAddressPublicKeys(let request):
+            let publicKeys = accountClient.getAddressPublicKeysRequest(emailAddress: request.emailAddress)
+            let repeatedBytes = Proton_Drive_Sdk_RepeatedBytesValue.with {
+                $0.value = publicKeys
+            }
+            SDKResponseHandler.send(callbackPointer: callbackPointer, message: repeatedBytes)
+        case nil:
+            let message = "cCompatibleAccountClientRequest.Proton_Drive_Sdk_AccountRequest.payload is null"
+            SDKResponseHandler.sendInteropErrorToSDK(message: message, callbackPointer: callbackPointer)
+        }
+    }
+}
+
+extension ProtonCoreDataModel.Address {
+    func makeProtoAddress() -> Proton_Drive_Sdk_Address {
+        return Proton_Drive_Sdk_Address.with {
+            $0.addressID = addressID
+            $0.order = Int32(order)
+            $0.emailAddress = email
+            let addressStatus: Proton_Drive_Sdk_AddressStatus = {
+                switch status {
+                case .disabled:
+                    return .disabled
+                case .enabled:
+                    return .enabled
+                }
+            }()
+            $0.status = addressStatus
+            $0.primaryKeyIndex = Int32(keys.firstIndex(where: { $0.primary == 1 }) ?? 0)
+            $0.keys = keys.map { key in
+                Proton_Drive_Sdk_AddressKey.with {
+                    $0.addressID = addressID
+                    $0.addressKeyID = key.keyID
+                    $0.isActive = key.active == 1
+                    $0.isAllowedForEncryption = key.isAllowedForEncryption //TODO double check
+                    $0.isAllowedForVerification = key.isAllowedForVerification
+                }
+            }
+        }
+    }
+}
+
+fileprivate extension Key {
+    var isAllowedForEncryption: Bool {
+        KeyFlags(rawValue: UInt8(truncating: keyFlags as NSNumber)).contains(.encryptNewData)
+    }
+
+    var isAllowedForVerification: Bool {
+        KeyFlags(rawValue: UInt8(truncating: keyFlags as NSNumber)).contains(.verifySignatures)
+    }
+}

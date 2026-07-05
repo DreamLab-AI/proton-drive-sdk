@@ -1,0 +1,255 @@
+import { Logger, MemberRole, NodeResult, NodeType, ProtonDriveTelemetry, resultOk } from '../../interface';
+import { BatchLoading } from '../batchLoading';
+import { DecryptedNode } from '../nodes';
+import { ALBUM_MEDIA_TYPE } from '../nodes/mediaTypes';
+import { validateNodeName } from '../nodes/validations';
+import { splitNodeUid } from '../uids';
+import { AddToAlbumProcess } from './addToAlbum';
+import { AlbumsCryptoService } from './albumsCrypto';
+import { PhotosAPIService } from './apiService';
+import { AlbumContainsPhotosNotInTimelineError } from './errors';
+import { AlbumItem, DecryptedPhotoNode } from './interface';
+import { PhotosNodesAccess } from './nodes';
+import { PhotosManager } from './photosManager';
+import { PhotoSharesManager } from './shares';
+
+const BATCH_LOADING_SIZE = 10;
+
+/**
+ * Provides access and high-level actions for managing albums.
+ */
+export class AlbumsManager {
+    private logger: Logger;
+
+    constructor(
+        telemetry: ProtonDriveTelemetry,
+        private apiService: PhotosAPIService,
+        private cryptoService: AlbumsCryptoService,
+        private photoShares: PhotoSharesManager,
+        private nodesService: PhotosNodesAccess,
+        private photos: PhotosManager,
+    ) {
+        this.logger = telemetry.getLogger('albums');
+        this.apiService = apiService;
+        this.cryptoService = cryptoService;
+        this.photoShares = photoShares;
+        this.nodesService = nodesService;
+    }
+
+    async *iterateAlbums(signal?: AbortSignal): AsyncGenerator<DecryptedNode> {
+        const { volumeId } = await this.photoShares.getRootIDs();
+
+        const batchLoading = new BatchLoading<string, DecryptedNode>({
+            iterateItems: (nodeUids) => this.iterateNodesAndIgnoreMissingOnes(nodeUids, signal),
+            batchSize: BATCH_LOADING_SIZE,
+        });
+        for await (const album of this.apiService.iterateAlbums(volumeId, signal)) {
+            yield* batchLoading.load(album.albumUid);
+        }
+        yield* batchLoading.loadRest();
+    }
+
+    async *iterateAlbumUids(signal?: AbortSignal): AsyncGenerator<string> {
+        const { volumeId } = await this.photoShares.getRootIDs();
+
+        for await (const album of this.apiService.iterateAlbums(volumeId, signal)) {
+            // Patch fresh album metadata into the node cache so that the subsequent
+            // iterateNodes call returns up-to-date photoCount/coverNodeUid without
+            // an extra API round-trip. The fresh data comes from the /albums endpoint
+            // which always reflects the current state.
+            void this.nodesService.updateAlbumMetadataCache(album.albumUid, {
+                photoCount: album.photoCount,
+                coverNodeUid: album.coverNodeUid,
+                lastActivityTime: album.lastActivityTime,
+            });
+            yield album.albumUid;
+        }
+    }
+
+    async *iterateAlbum(albumNodeUid: string, signal?: AbortSignal): AsyncGenerator<AlbumItem> {
+        yield* this.apiService.iterateAlbumChildren(albumNodeUid, signal);
+    }
+
+    async createAlbum(name: string): Promise<DecryptedPhotoNode> {
+        validateNodeName(name);
+
+        const rootNode = await this.nodesService.getVolumeRootFolder();
+        const parentKeys = await this.nodesService.getNodeKeys(rootNode.uid);
+        if (!parentKeys.hashKey) {
+            throw new Error('Cannot create album: parent folder hash key not available');
+        }
+
+        const signingKeys = await this.nodesService.getNodeSigningKeys({ parentNodeUid: rootNode.uid });
+        const { encryptedCrypto } = await this.cryptoService.createAlbum(
+            { key: parentKeys.key, hashKey: parentKeys.hashKey },
+            signingKeys,
+            name,
+        );
+
+        const nodeUid = await this.apiService.createAlbum(rootNode.uid, {
+            encryptedName: encryptedCrypto.encryptedName,
+            hash: encryptedCrypto.hash,
+            armoredKey: encryptedCrypto.armoredKey,
+            armoredNodePassphrase: encryptedCrypto.armoredNodePassphrase,
+            armoredNodePassphraseSignature: encryptedCrypto.armoredNodePassphraseSignature,
+            signatureEmail: encryptedCrypto.signatureEmail,
+            armoredHashKey: encryptedCrypto.armoredHashKey,
+        });
+
+        await this.nodesService.notifyChildCreated(rootNode.uid);
+
+        return {
+            // Internal metadata
+            hash: encryptedCrypto.hash,
+            encryptedName: encryptedCrypto.encryptedName,
+
+            // Basic node metadata
+            uid: nodeUid,
+            parentUid: rootNode.uid,
+            type: NodeType.Album,
+            mediaType: ALBUM_MEDIA_TYPE,
+            creationTime: new Date(),
+            modificationTime: new Date(),
+
+            // Share node metadata
+            isShared: false,
+            isSharedPublicly: false,
+            directRole: MemberRole.Inherited,
+            ownedBy: rootNode.ownedBy,
+
+            // Decrypted metadata
+            isStale: false,
+            keyAuthor: resultOk(encryptedCrypto.signatureEmail),
+            nameAuthor: resultOk(encryptedCrypto.signatureEmail),
+            name: resultOk(name),
+            treeEventScopeId: splitNodeUid(nodeUid).volumeId,
+        };
+    }
+
+    async updateAlbum(
+        nodeUid: string,
+        updates: {
+            name?: string;
+            coverPhotoNodeUid?: string;
+        },
+    ): Promise<DecryptedPhotoNode> {
+        if (updates.name !== undefined) {
+            validateNodeName(updates.name);
+        }
+
+        const node = await this.nodesService.getNode(nodeUid);
+        const newNode = { ...node };
+
+        let nameUpdate:
+            | {
+                  encryptedName: string;
+                  hash: string;
+                  originalHash: string;
+                  nameSignatureEmail: string;
+              }
+            | undefined;
+
+        if (updates.name) {
+            const parentKeys = await this.nodesService.getParentKeys(node);
+            const signingKeys = await this.nodesService.getNodeSigningKeys({ nodeUid, parentNodeUid: node.parentUid });
+
+            const { signatureEmail, armoredNodeName, hash } = await this.cryptoService.renameAlbum(
+                { key: parentKeys.key, hashKey: parentKeys.hashKey },
+                node.encryptedName,
+                signingKeys,
+                updates.name,
+            );
+
+            nameUpdate = {
+                encryptedName: armoredNodeName,
+                hash,
+                originalHash: node.hash || '',
+                nameSignatureEmail: signatureEmail,
+            };
+            newNode.name = resultOk(updates.name);
+            newNode.encryptedName = nameUpdate.encryptedName;
+            newNode.nameAuthor = resultOk(nameUpdate.nameSignatureEmail);
+            newNode.hash = nameUpdate.hash;
+        }
+
+        await this.apiService.updateAlbum(nodeUid, updates.coverPhotoNodeUid, nameUpdate);
+        await this.nodesService.notifyNodeChanged(nodeUid);
+        return newNode;
+    }
+
+    async deleteAlbum(nodeUid: string, options: { force?: boolean; saveToTimeline?: boolean } = {}): Promise<void> {
+        try {
+            await this.apiService.deleteAlbum(nodeUid, options);
+        } catch (error) {
+            if (
+                options.saveToTimeline &&
+                error instanceof AlbumContainsPhotosNotInTimelineError &&
+                error.photosOnlyInAlbumNodeUids.length > 0
+            ) {
+                for await (const result of this.photos.saveToTimeline(error.photosOnlyInAlbumNodeUids)) {
+                    if (!result.ok) {
+                        throw result.error;
+                    }
+                }
+                await this.apiService.deleteAlbum(nodeUid, options);
+            } else {
+                throw error;
+            }
+        }
+        await this.nodesService.notifyNodeDeleted(nodeUid);
+    }
+
+    async *addPhotos(albumNodeUid: string, photoNodeUids: string[], signal?: AbortSignal): AsyncGenerator<NodeResult> {
+        const albumKeys = await this.nodesService.getNodeKeys(albumNodeUid);
+        if (!albumKeys.hashKey) {
+            throw new Error('Cannot add photos to album: album hash key not available');
+        }
+        const signingKeys = await this.nodesService.getNodeSigningKeys({ nodeUid: albumNodeUid });
+
+        const process = new AddToAlbumProcess(
+            albumNodeUid,
+            albumKeys,
+            signingKeys,
+            this.apiService,
+            this.cryptoService,
+            this.nodesService,
+            this.logger,
+            signal,
+        );
+        try {
+            yield* process.execute(photoNodeUids);
+        } finally {
+            await this.nodesService.notifyNodeChanged(albumNodeUid);
+        }
+    }
+
+    async *removePhotos(
+        albumNodeUid: string,
+        photoNodeUids: string[],
+        signal?: AbortSignal,
+    ): AsyncGenerator<NodeResult> {
+        try {
+            for await (const result of this.apiService.removePhotosFromAlbum(albumNodeUid, photoNodeUids, signal)) {
+                if (result.ok) {
+                    await this.nodesService.notifyNodeChanged(result.uid);
+                }
+                yield result;
+            }
+        } finally {
+            await this.nodesService.notifyNodeChanged(albumNodeUid);
+        }
+    }
+
+    private async *iterateNodesAndIgnoreMissingOnes(
+        nodeUids: string[],
+        signal?: AbortSignal,
+    ): AsyncGenerator<DecryptedNode> {
+        const nodeGenerator = this.nodesService.iterateNodes(nodeUids, signal);
+        for await (const node of nodeGenerator) {
+            if ('missingUid' in node) {
+                continue;
+            }
+            yield node;
+        }
+    }
+}

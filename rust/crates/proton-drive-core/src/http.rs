@@ -1,4 +1,4 @@
-//! Host-supplied HTTP client trait. Mirrors `js/sdk/src/interface/httpClient.ts`.
+//! Host-supplied HTTP client trait. Mirrors `client/js/src/interface/httpClient.ts`.
 //!
 //! The SDK does **not** ship an HTTP impl — `apps/pdtui` provides one over `reqwest`.
 

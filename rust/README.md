@@ -30,7 +30,7 @@ rust/
 ├─ crates/
 │  ├─ proton-drive             # public facade (re-exports)
 │  ├─ proton-drive-core        # client, nodes, events, transfer
-│  ├─ proton-drive-api         # HTTP DTOs (M1: codegen from reference/cs/sdk protos)
+│  ├─ proton-drive-api         # HTTP DTOs (M1: codegen from reference/client/cs protos)
 │  ├─ proton-drive-crypto      # OpenPgpCrypto trait + rpgp impl (M2)
 │  ├─ proton-drive-cache       # ProtonDriveCache trait + MemoryCache
 │  └─ proton-drive-telemetry   # Telemetry trait + NullTelemetry
@@ -52,7 +52,7 @@ cargo build -p pdtui
 - ✅ Trait surface mirrors JS `interface/` 1:1
 - ✅ Error taxonomy, config, value objects in place
 - ✅ pdtui skeleton with keymap dispatch and ratatui rendering
-- ◐ M1: protobuf codegen in `proton-drive-api` (build-time, from `reference/cs/sdk/src/protos`).
+- ◐ M1: protobuf codegen in `proton-drive-api` (build-time, from `reference/client/cs/src/protos`).
   OpenAPI codegen deferred — REST DTOs stay hand-written until the specs are
   vendored into this repo.
 - ✅ M2: `rpgp` bodies in `proton-drive-crypto` (SEIPDv1 path), SRP verifier,

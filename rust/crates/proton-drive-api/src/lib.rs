@@ -16,9 +16,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Protobuf wire types, generated at build time from the cross-language
-/// `.proto` sources in `cs/sdk/src/protos` (the source of truth shared with the
-/// C#/Kotlin/Swift implementations). Codegen runs in `build.rs`: a bundled
-/// `protoc` (via `protoc-bin-vendored`) compiles the editions protos to a
+/// `.proto` source in `client/cs/src/protos` (the source of truth shared with
+/// the C#/Kotlin/Swift implementations). Codegen runs in `build.rs`: a bundled
+/// `protoc` (via `protoc-bin-vendored`) compiles the editions proto to a
 /// `FileDescriptorSet`, which is relabelled to proto3 and fed to `prost-build`;
 /// the output lands in `OUT_DIR` and is pulled in with `include!` below.
 ///
@@ -29,26 +29,21 @@ use serde::{Deserialize, Serialize};
 /// deferred until the specs are vendored here; the REST DTOs therefore remain
 /// hand-written and are not touched by this protobuf codegen.
 ///
-/// Two protobuf packages are generated:
-/// - `proton.sdk` → `proto::proton::sdk`
+/// Upstream merged the former two-package split (`proton.sdk` +
+/// `proton.drive.sdk`, the latter importing the former) into a single
+/// `package proton.drive.sdk;` (see `reference/VENDORED.md`), so only one
+/// protobuf package is generated:
 /// - `proton.drive.sdk` → `proto::proton::drive::sdk`
 // `large_enum_variant` fires on prost-generated `oneof` enums (`Node`,
 // `DegradedNode`); the wire layout is fixed by the schema, so it is not ours to
 // "box". Scoped to the generated module only.
 #[allow(clippy::large_enum_variant)]
 pub mod proto {
-    /// Module tree mirrors the protobuf package components so prost's
-    /// cross-package references (e.g. `proton.drive.sdk` -> `proton.sdk.Error`,
-    /// emitted as `super::super::sdk::Error`) resolve.
+    /// Module tree mirrors the protobuf package components.
     pub mod proton {
-        /// `package proton.sdk;` — base SDK primitives (sessions, HTTP,
-        /// telemetry, errors, addresses).
-        pub mod sdk {
-            include!(concat!(env!("OUT_DIR"), "/proton.sdk.rs"));
-        }
-
-        /// `package proton.drive.sdk;` — Drive-specific request/response
-        /// messages (nodes, uploads, downloads, photos).
+        /// `package proton.drive.sdk;` — SDK primitives (sessions, HTTP,
+        /// telemetry, errors, addresses) merged with Drive-specific
+        /// request/response messages (nodes, uploads, downloads, photos).
         pub mod drive {
             pub mod sdk {
                 include!(concat!(env!("OUT_DIR"), "/proton.drive.sdk.rs"));
@@ -539,7 +534,7 @@ pub mod download {
 
     /// Response from `GET drive/v2/volumes/{VolumeID}/files/{linkID}/revisions/{revisionID}`.
     ///
-    /// Mirrors `GetRevisionResponse` in `js/sdk/src/internal/download/apiService.ts`.
+    /// Mirrors `GetRevisionResponse` in `client/js/src/internal/download/apiService.ts`.
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct GetRevisionResponse {
@@ -1001,48 +996,50 @@ mod tests {
 
 /// Proves the build-time protobuf codegen produces usable, wire-correct types:
 /// constructs representative generated messages and round-trips them through
-/// `prost::Message` encode/decode, including a cross-package reference
-/// (`proton.drive.sdk` -> `proton.sdk.Error`) and a well-known type
-/// (`google.protobuf.Timestamp`).
+/// `prost::Message` encode/decode, including a same-package message reference
+/// (`proton.drive.sdk.NodeResultPair` -> `proton.drive.sdk.Error` — upstream
+/// merged the former `proton.sdk` package into `proton.drive.sdk`, see
+/// `reference/VENDORED.md`) and a well-known type (`google.protobuf.Timestamp`).
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod proto_tests {
     use prost::Message as _;
 
-    use crate::proto::proton::{drive, sdk};
+    use crate::proto::proton::drive;
 
     #[test]
     fn roundtrip_proton_sdk_error_with_enum_and_nested() {
-        let original = sdk::Error {
+        let original = drive::sdk::Error {
             r#type: "ApiError".to_owned(),
             message: "rate limited".to_owned(),
-            domain: sdk::ErrorDomain::Api as i32,
+            domain: drive::sdk::ErrorDomain::Api as i32,
             primary_code: 429,
             secondary_code: 2028,
             context: "upload".to_owned(),
-            inner_error: Some(Box::new(sdk::Error {
+            inner_error: Some(Box::new(drive::sdk::Error {
                 message: "retry exhausted".to_owned(),
-                domain: sdk::ErrorDomain::Network as i32,
+                domain: drive::sdk::ErrorDomain::Network as i32,
                 ..Default::default()
             })),
             additional_data: None,
         };
 
         let bytes = original.encode_to_vec();
-        let decoded = sdk::Error::decode(bytes.as_slice()).expect("decode proton.sdk.Error");
+        let decoded =
+            drive::sdk::Error::decode(bytes.as_slice()).expect("decode proton.drive.sdk.Error");
 
         assert_eq!(decoded, original);
-        assert_eq!(decoded.domain(), sdk::ErrorDomain::Api);
+        assert_eq!(decoded.domain(), drive::sdk::ErrorDomain::Api);
         assert_eq!(
             decoded.inner_error.as_ref().map(|e| e.domain()),
-            Some(sdk::ErrorDomain::Network)
+            Some(drive::sdk::ErrorDomain::Network)
         );
     }
 
     #[test]
     fn roundtrip_drive_node_result_references_sdk_error() {
-        // Exercises the cross-package generated reference
-        // (`proton.drive.sdk.NodeResultPair.error: proton.sdk.Error`).
+        // Exercises the generated message reference
+        // (`proton.drive.sdk.NodeResultPair.error: proton.drive.sdk.Error`).
         let original = drive::sdk::NodeResultListResponse {
             results: vec![
                 drive::sdk::NodeResultPair {
@@ -1051,9 +1048,9 @@ mod proto_tests {
                 },
                 drive::sdk::NodeResultPair {
                     node_uid: "node-bad".to_owned(),
-                    error: Some(sdk::Error {
+                    error: Some(drive::sdk::Error {
                         message: "trash failed".to_owned(),
-                        domain: sdk::ErrorDomain::BusinessLogic as i32,
+                        domain: drive::sdk::ErrorDomain::BusinessLogic as i32,
                         ..Default::default()
                     }),
                 },

@@ -1,6 +1,6 @@
 //! Core domain for the Proton Drive SDK.
 //!
-//! Module layout mirrors `js/sdk/src/internal/` 1:1 (see ADR-0001):
+//! Module layout mirrors `client/js/src/internal/` 1:1 (see ADR-0001):
 //! - [`nodes`] — Node aggregate, folder iteration, revisions
 //! - [`upload`] / [`download`] — Transfer aggregates
 //! - [`events`] — Event subscription, drive events

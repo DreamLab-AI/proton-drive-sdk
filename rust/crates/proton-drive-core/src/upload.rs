@@ -67,7 +67,7 @@ struct EnvelopeProbe {
 }
 
 /// Name hash: `HMAC-SHA256(parent_hash_key, name_bytes)` → hex. Mirrors JS
-/// `generateLookupHash` (`reference/js/sdk/src/crypto/driveCrypto.ts:439-443`:
+/// `generateLookupHash` (`reference/client/js/src/crypto/driveCrypto.ts:439-443`:
 /// `computeHmacSignature(importHmacKey(parentHashKey), utf8(newName)).toHex()`).
 /// The key is the parent folder's decrypted `NodeHashKey` bytes; the message
 /// is the UTF-8 file name. Pulled out to a standalone, pure function so a
@@ -616,7 +616,7 @@ impl ProtonFileUploader {
             .collect();
 
         // No signature context: JS signManifest → signArmored signs with no
-        // context (js/sdk/src/crypto/driveCrypto.ts), and verifyManifest →
+        // context (client/js/src/crypto/driveCrypto.ts), and verifyManifest →
         // verifyArmored reads it back with no context. A non-empty context here
         // would embed a critical notation that OpenPGP.js verification rejects.
         let manifest_sig = self
@@ -1232,7 +1232,7 @@ mod tests {
     /// against an independent HMAC-SHA256 computation. Provenance: Node's
     /// built-in `crypto` module (standard HMAC-SHA256 — the same primitive
     /// JS's `@protontech/crypto/subtle/hmac.ts` `importKey`/`signData` wraps
-    /// for `generateLookupHash`, `reference/js/sdk/src/crypto/driveCrypto.ts:439-443`;
+    /// for `generateLookupHash`, `reference/client/js/src/crypto/driveCrypto.ts:439-443`;
     /// `@protontech/crypto` itself isn't vendored under `reference/`, so this
     /// cross-checks the algorithm rather than shelling out to their exact lib):
     /// ```text

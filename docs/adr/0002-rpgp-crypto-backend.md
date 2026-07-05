@@ -8,7 +8,7 @@
 | Related | ADR-0006 (SEIPDv1 default) |
 
 ## Context
-The SDK's crypto layer must perform: Curve25519 key generation, multi-recipient session-key encryption, SEIPDv1 symmetric encryption (default), SEIPDv2/AEAD-GCM (feature-flag-gated), detached and inline signatures, critical signature notations (`signatureContext`), password-encrypted session keys, and armoured/binary I/O. The full required surface is captured in `js/sdk/src/crypto/interface.ts`.
+The SDK's crypto layer must perform: Curve25519 key generation, multi-recipient session-key encryption, SEIPDv1 symmetric encryption (default), SEIPDv2/AEAD-GCM (feature-flag-gated), detached and inline signatures, critical signature notations (`signatureContext`), password-encrypted session keys, and armoured/binary I/O. The full required surface is captured in `client/js/src/crypto/interface.ts`.
 
 Proton's first-party clients use **GopenPGP** (Go). Wrapping it from Rust requires cgo bindings, a Go runtime, cross-compile toolchains per target triple, and inherits whatever licence terms the Go side imposes.
 

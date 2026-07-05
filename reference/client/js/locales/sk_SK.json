@@ -1,0 +1,275 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2;",
+    "language": "sk_SK"
+  },
+  "contexts": {
+    "Error": {
+      "Bookmark password is not available": [
+        "Heslo záložky nie je dostupné"
+      ],
+      "Cannot add photo to album without a valid name": [
+        "Nie je možné pridať fotografiu do albumu bez platného názvu"
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "Nie je možné vytvoriť verejný odkaz pre zväzok, ktorý nevlastní daný používateľ"
+      ],
+      "Cannot download a folder": [
+        "Nie je možné stiahnuť priečinok"
+      ],
+      "Cannot share root folder": [
+        "Nie je možné zdieľať koreňový priečinok"
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "Nie je možné aktualizovať verejný odkaz pre zväzok, ktorý nevlastní daný používateľ"
+      ],
+      "Content key packet is required for small revision upload": [
+        "Na nahratie malých revízií je potrebný balík kľúčov obsahu."
+      ],
+      "Copy operation aborted": [
+        "Operácia kopírovania bola prerušená"
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "Kopírovanie položky mimo priečinka nie je povolené."
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "Vytváranie dokumentov mimo priečinkov nie je povolené."
+      ],
+      "Creating files in non-folders is not allowed": [
+        "Vytváranie súborov mimo priečinkov nie je povolené."
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "Vytváranie priečinkov mimo priečinkov nie je povolené."
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "Vytváranie revízií v nesúborových položkách nie je povolené."
+      ],
+      "Data integrity check failed": [
+        "Kontrola integrity dát zlyhala"
+      ],
+      "Data integrity check of one part failed": [
+        "Kontrola integrity dát jednej časti zlyhala"
+      ],
+      "Device not found": [
+        "Zariadenie nebolo nájdené"
+      ],
+      "Expiration date cannot be in the past": [
+        "Dátum expirácie nemôže byť v minulosti"
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Nepodarilo sa dešifrovať aktívnu revíziu: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Nepodarilo sa dešifrovať blok: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Nepodarilo sa dešifrovať kľúč záložky: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Nepodarilo sa dešifrovať názov záložky: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Nepodarilo sa dešifrovať heslo záložky: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Nepodarilo sa dešifrovať kľúč obsahu: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Nepodarilo sa dešifrovať názov položky: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Nepodarilo sa dešifrovať kľúč uzla: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Nepodarilo sa dešifrovať miniatúru: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "Nepodarilo sa získať pozývacie kľúče"
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "Nepodarilo sa získať informácie o zdieľaní pre uzol ${ nodeUid }"
+      ],
+      "Failed to get verification keys": [
+        "Získanie overovacích kľúčov zlyhalo"
+      ],
+      "Failed to load some items": [
+        "Nepodarilo sa načítať niektoré položky"
+      ],
+      "Failed to load some nodes": [
+        "Nepodarilo sa načítať niektoré uzly"
+      ],
+      "Failed to verify invitation": [
+        "Nepodarilo sa overiť pozvánku"
+      ],
+      "File download failed due to empty response": [
+        "Stiahnutie súboru zlyhalo z dôvodu prázdnej odpovede."
+      ],
+      "File has no active revision": [
+        "Súbor nemá aktívnu revíziu"
+      ],
+      "File has no content key": [
+        "Súbor nemá kľúč obsahu"
+      ],
+      "File has no revision": [
+        "Súbor nemá žiadnu revíziu"
+      ],
+      "File hash does not match expected hash": [
+        "Hash súboru nezodpovedá očakávanému hashu"
+      ],
+      "Invalid URL": [
+        "Neplatná URL"
+      ],
+      "Invitation not found": [
+        "Pozvánka nenájdená"
+      ],
+      "Item cannot be decrypted": [
+        "Položku nemožno dešifrovať"
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "Starý verejný odkaz sa nedá aktualizovať. Vytvorte nový verejný odkaz, prosím."
+      ],
+      "Missing integrity signature": [
+        "Chýbajúci podpis integrity"
+      ],
+      "Missing inviter email": [
+        "Chýba email odosielateľa pozvánky"
+      ],
+      "Missing signature": [
+        "Chýbajúci podpis"
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Chýba podpis pre ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "Presun bol prerušený"
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "Presúvanie položky mimo priečinka nie je povolené."
+      ],
+      "Moving root item is not allowed": [
+        "Presúvanie koreňovej položky nie je povolené"
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "Názov musí mať najviac ${ MAX_NODE_NAME_LENGTH } znak",
+        "Názov musí mať najviac ${ MAX_NODE_NAME_LENGTH } znaky",
+        "Názov musí mať najviac ${ MAX_NODE_NAME_LENGTH } znakov",
+        "Názov musí mať najviac ${ MAX_NODE_NAME_LENGTH } znakov"
+      ],
+      "Name must not be empty": [
+        "Názov nesmie byť prázdny"
+      ],
+      "No available name found": [
+        "Nenašiel sa žiadny dostupný názov"
+      ],
+      "Node has no thumbnail": [
+        "Uzol nemá miniatúru"
+      ],
+      "Node is not accessible": [
+        "Uzol nie je dostupný"
+      ],
+      "Node is not shared": [
+        "Uzol nie je zdieľaný"
+      ],
+      "Node not found": [
+        "Uzol nebol nájdený"
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Pozvánky, ktoré nie sú od služby Proton, môžu zmeniť len správcovia"
+      ],
+      "Operation aborted": [
+        "Operácia prerušená"
+      ],
+      "Operation failed, try again later": [
+        "Operácia zlyhala, skúste to neskôr"
+      ],
+      "Parent cannot be decrypted": [
+        "Nadradenú položku nemožno dešifrovať"
+      ],
+      "Photo is already in the target album": [
+        "Fotografia sa už v cieľovom albume nachádza"
+      ],
+      "Photo not found": [
+        "Fotka sa nenašla"
+      ],
+      "Renaming root item is not allowed": [
+        "Premenovanie koreňovej položky nie je povolené"
+      ],
+      "Request aborted": [
+        "Požiadavka prerušená"
+      ],
+      "Signature is missing": [
+        "Chýbajúci podpis"
+      ],
+      "Signature verification failed": [
+        "Overenie podpisu zlyhalo"
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Overenie podpisu zlyhalo: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "Overenie podpisu pre ${ signatureType } zlyhalo"
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "Overenie podpisu pre ${ signatureType } zlyhalo: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Niektoré bajty súboru sa nepodarilo nahrať"
+      ],
+      "Some file parts failed to upload": [
+        "Niektoré časti súboru sa nepodarilo nahrať"
+      ],
+      "The node is not shared anymore": [
+        "Uzol už nie je zdieľaný"
+      ],
+      "Thumbnail not found": [
+        "Miniatúra nenájdená"
+      ],
+      "Too many server errors, please try again later": [
+        "Príliš veľa serverových chýb, skúste to neskôr, prosím"
+      ],
+      "Too many server requests, please try again later": [
+        "Príliš veľa serverových požiadaviek, skúste to neskôr, prosím"
+      ],
+      "Unknown error": [
+        "Neznáma chyba"
+      ],
+      "Unknown error ${ code }": [
+        "Neznáma chyba ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Overovacie kľúče nie sú k dispozícii"
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Overovacie kľúče pre ${ signatureType } nie sú k dispozícii"
+      ],
+      "You can leave only item that is shared with you": [
+        "Môžete opustiť iba položku, ktorá je s vami zdieľaná."
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "Autor nie je uvedený na verejnom odkaze."
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "atribúty"
+      ],
+      "content key": [
+        "kľúč obsahu"
+      ],
+      "hash key": [
+        "hash kľúč"
+      ],
+      "key": [
+        "kľúč"
+      ],
+      "membership": [
+        "členstvo"
+      ],
+      "name": [
+        "názov"
+      ]
+    }
+  }
+}

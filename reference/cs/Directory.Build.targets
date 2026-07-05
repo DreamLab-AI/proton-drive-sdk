@@ -1,9 +1,0 @@
-<Project>
-
-  <PropertyGroup Condition="'$(_IsPublishing)' == 'yes'">
-    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
-    <DefineConstants Condition="$(RuntimeIdentifier.StartsWith('win'))">$(DefineConstants);WINDOWS</DefineConstants>
-    <NativeLibPrefix Condition="!$(RuntimeIdentifier.StartsWith('win'))">lib</NativeLibPrefix>
-  </PropertyGroup>
-
-</Project>

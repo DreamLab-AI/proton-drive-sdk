@@ -24,7 +24,7 @@
 //! `upload.proton.me`) authenticate with the caller-supplied
 //! `pm-storage-token` header only. This matches the JS reference's
 //! `makeStorageRequest`, which sends only `pm-storage-token`, `Language` and
-//! `x-pm-drive-sdk-version` (reference/js/sdk/src/internal/apiService/apiService.ts:233-253)
+//! `x-pm-drive-sdk-version` (reference/client/js/src/internal/apiService/apiService.ts:233-253)
 //! -- never the API bearer. Sending the full-scope session bearer to a
 //! separate storage host would widen the blast radius of that token far
 //! beyond its intended use.
@@ -46,7 +46,7 @@ use crate::session::{SessionManager, SessionManagerError};
 
 /// Default retry delay (seconds) for a `429` response with no `Retry-After`
 /// header. Matches the JS reference's `DEFAULT_429_RETRY_DELAY_SECONDS`
-/// (reference/js/sdk/src/internal/apiService/apiService.ts:77).
+/// (reference/client/js/src/internal/apiService/apiService.ts:77).
 const DEFAULT_429_RETRY_DELAY_SECS: u64 = 10;
 
 /// Bounded number of `429` retries per request before giving up and
@@ -56,7 +56,7 @@ const DEFAULT_429_RETRY_DELAY_SECS: u64 = 10;
 /// refusing to send further requests once a *global*, cross-request rolling
 /// count of consecutive `429`s exceeds `TOO_MANY_SUBSEQUENT_429_ERRORS` (50)
 /// within a 60s window
-/// (reference/js/sdk/src/internal/apiService/apiService.ts:35,303-306,408-414).
+/// (reference/client/js/src/internal/apiService/apiService.ts:35,303-306,408-414).
 /// We cap retries per-request instead of threading cross-request state
 /// through the transport, trading a little fidelity for a deterministic,
 /// easily-tested budget while still transparently absorbing the common case
@@ -332,7 +332,7 @@ impl ProtonDriveHttpClient for SessionAwareHttpClient {
         // API session's `Authorization` bearer or `x-pm-uid`: that would leak
         // a full-scope, longer-lived credential to a separate storage host
         // that was never designed to receive it (see module docs and
-        // reference/js/sdk/src/internal/apiService/apiService.ts:233-253
+        // reference/client/js/src/internal/apiService/apiService.ts:233-253
         // `makeStorageRequest`, which sends only `pm-storage-token`,
         // `Language` and `x-pm-drive-sdk-version`).
         let retry_req = BlobRequest {

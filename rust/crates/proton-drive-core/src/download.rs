@@ -1,4 +1,4 @@
-//! Block-download protocol. Ports `js/sdk/src/internal/download/` happy path.
+//! Block-download protocol. Ports `client/js/src/internal/download/` happy path.
 //!
 //! Implements ADR-0009: sequential block fetch, SHA-256 ciphertext integrity
 //! check, per-revision manifest signature verification, per-block decryption,
@@ -27,7 +27,7 @@ use proton_drive_api::shares::GetShareResponse;
 use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey, VerificationStatus};
 
 /// Blocks-per-page for the revision-blocks GET, matching the JS reference's
-/// `BLOCKS_PAGE_SIZE` (`js/sdk/src/internal/download/apiService.ts`). The
+/// `BLOCKS_PAGE_SIZE` (`client/js/src/internal/download/apiService.ts`). The
 /// server paginates this endpoint; a request without `PageSize`/
 /// `FromBlockIndex` risks a silently truncated `Blocks` array on revisions
 /// with more blocks than a single page.
@@ -208,7 +208,7 @@ impl FileDownloader {
         // `[node_key, ...address_keys]`, mirroring JS `decryptContentKeyPacket`
         // -> `decryptAndVerifySessionKey(base64ContentKeyPacket,
         // armoredContentKeyPacketSignature, key, [key, ...keyVerificationKeys])`
-        // (`reference/js/sdk/src/internal/nodes/cryptoService.ts:517-534`). The
+        // (`reference/client/js/src/internal/nodes/cryptoService.ts:517-534`). The
         // signature covers the *decrypted session key bytes*, not the
         // ciphertext packet. A present-but-invalid or missing signature never
         // aborts the download — like JS's non-fatal `contentKeyPacketAuthor`,
@@ -749,7 +749,7 @@ async fn verify_detached_non_fatal(
 /// like JS `cryptoService.decryptKey` ->
 /// `driveCrypto.decryptKey(armoredKey, armoredNodePassphrase,
 /// armoredNodePassphraseSignature, [parentKey], verificationKeys)`
-/// (`reference/js/sdk/src/internal/nodes/cryptoService.ts:307-338`): a
+/// (`reference/client/js/src/internal/nodes/cryptoService.ts:307-338`): a
 /// present-but-invalid or missing signature never aborts key derivation, it
 /// is only surfaced as an authorship result via the returned
 /// [`VerificationStatus`] (mirrors JS's non-fatal `keyAuthor`).
@@ -813,7 +813,7 @@ pub async fn decrypt_node_private_key(
 /// verified non-fatally against `verification_keys` (the share creator's
 /// address public keys), mirroring JS `SharesCryptoService.decryptRootShare`
 /// -> `driveCrypto.decryptKey(..., addressPublicKeys)`
-/// (`reference/js/sdk/src/internal/shares/cryptoService.ts:75-103`): a
+/// (`reference/client/js/src/internal/shares/cryptoService.ts:75-103`): a
 /// present-but-invalid or missing signature never aborts share-key
 /// derivation, only degrades the returned [`VerificationStatus`].
 pub async fn decrypt_share_key(

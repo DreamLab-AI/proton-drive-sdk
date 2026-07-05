@@ -1,6 +1,6 @@
 //! OpenPGP crypto (ADR-0002) — rpgp v0.16 implementation.
 //!
-//! Mirrors `js/sdk/src/crypto/interface.ts`.
+//! Mirrors `client/js/src/crypto/interface.ts`.
 
 #![forbid(unsafe_code)]
 
@@ -564,7 +564,7 @@ impl RpgpCrypto {
         verification_keys: &[PublicKey],
     ) -> Result<(Vec<u8>, VerificationStatus), CryptoError> {
         // JS sets `compress: true` when encrypting ExtendedAttributes
-        // (reference/js/sdk/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
+        // (reference/client/js/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
         // -> openPGPCrypto.ts:124-132 `encryptAndSignArmored`, which forwards
         // `compress: options.compress || false` into the encrypt call), so a
         // SEIPD's inner plaintext can be an OpenPGP-compressed packet wrapping
@@ -975,7 +975,7 @@ impl OpenPgpCrypto for RpgpCrypto {
 
         // Build a signed-but-unencrypted literal message as the SEIPD plaintext.
         //
-        // `opts.compress` mirrors JS `compress` (reference/js/sdk/src/crypto/
+        // `opts.compress` mirrors JS `compress` (reference/client/js/src/crypto/
         // driveCrypto.ts:556 `encryptExtendedAttributes` -> openPGPCrypto.ts:
         // 124-132 `encryptAndSignArmored`, which sets `compress: true` for
         // ExtendedAttributes and forwards it straight to the encrypt call).

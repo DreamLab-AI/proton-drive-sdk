@@ -1,4 +1,4 @@
-//! Static SDK configuration. Mirrors `js/sdk/src/interface/config.ts`.
+//! Static SDK configuration. Mirrors `client/js/src/interface/config.ts`.
 
 #[derive(Debug, Clone)]
 pub struct ProtonDriveConfig {

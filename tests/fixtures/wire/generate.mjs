@@ -361,7 +361,7 @@ console.log('  Throwaway recipient fingerprint:', throwawayRecipientPub.getFinge
 // ── compressed + signed (ExtendedAttributes-shaped payload) ──────────────────
 //
 // The JS SDK sets `compress: true` when encrypting ExtendedAttributes
-// (reference/js/sdk/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
+// (reference/client/js/src/crypto/driveCrypto.ts:556 `encryptExtendedAttributes`
 // -> openPGPCrypto.ts:124-132 `encryptAndSignArmored`, which forwards
 // `compress: options.compress || false` to the host-injected CryptoProxy).
 // That means real XAttr blobs from any first-party client arrive as a

@@ -47,7 +47,7 @@ Anti-user: any commercial third-party app — explicitly disallowed by Proton's 
 
 ## 5. Reference: what we are porting
 
-From `js/sdk/src/`:
+From `client/js/src/`:
 
 - **Public surface** (`interface/index.ts`, 1,170 LoC across 16 files) — types only, no business logic. Mirror to `proton_drive::interface`.
 - **Construction contract** — `{ httpClient, entitiesCache, cryptoCache, account, openPGPCryptoModule, srpModule, telemetry?, featureFlagProvider?, latestEventIdProvider? }`.
@@ -128,7 +128,7 @@ Transfer objects expose `tokio::io::AsyncRead` / `AsyncWrite` rather than the JS
 
 `OpenPgpCrypto` is a trait — identical role to JS `crypto/interface.ts`. v1 implementation: **`rpgp`** (pure Rust, MIT/Apache-2.0 dual-licensed, compatible with our MIT use). No cgo, no GopenPGP, no Go runtime — cross-compiles trivially, no licence interaction concerns.
 
-**What we actually need from rpgp** (from auditing `js/sdk/src/crypto/openPGPCrypto.ts`):
+**What we actually need from rpgp** (from auditing `client/js/src/crypto/openPGPCrypto.ts`):
 - Curve25519 keys (ECDH + EdDSA) — Proton's default
 - SEIPDv1 symmetric encryption — the path used when feature-flag-gated AEAD is off
 - Detached + inline signatures, multi-recipient session-key encryption, password-encrypted session keys

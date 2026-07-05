@@ -522,7 +522,7 @@ pub(crate) async fn do_refresh(
 
     let new_token = env.inner;
     // Honour the server-supplied `ExpiresIn` (seconds) when present.
-    // reference/js/sdk/src/internal/apiService/coreTypes.ts documents
+    // reference/client/js/src/internal/apiService/coreTypes.ts documents
     // `ExpiresIn?: number` (deprecated but present, e.g. on the
     // `/core/v4/auth/refresh` 200 response) — `proton-drive-api`'s
     // `RefreshResponse` DTO doesn't carry it (outside this work package's

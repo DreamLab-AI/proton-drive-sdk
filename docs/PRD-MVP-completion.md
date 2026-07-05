@@ -78,9 +78,9 @@ Wave 4:             MG  MH       (independent of above; can start any time)
 |---|---|---|
 | **MA-zeroize** | `crates/proton-drive-crypto/src/lib.rs` (struct annotations), `apps/pdtui/src/auth.rs` (Credentials, LoginForm), `apps/pdtui/src/app.rs` (LoginForm shape) | — |
 | **MB-fixture** | `tests/fixtures/`, `crates/proton-drive-crypto/tests/wire_format.rs` (new file) | `crates/proton-drive-crypto/src/lib.rs` |
-| **MC-listing** | `crates/proton-drive-api/src/nodes.rs` (new file extracted from `lib.rs`), `crates/proton-drive-core/src/client.rs`, `crates/proton-drive-core/src/nodes.rs` | `js/sdk/src/internal/nodes/` |
-| **MD-upload** | `crates/proton-drive-core/src/upload.rs`, `crates/proton-drive-api/src/upload.rs` (new file extracted) | `js/sdk/src/internal/upload/` |
-| **ME-download** | `crates/proton-drive-core/src/download.rs`, `crates/proton-drive-api/src/download.rs` (new file extracted) | `js/sdk/src/internal/download/` |
+| **MC-listing** | `crates/proton-drive-api/src/nodes.rs` (new file extracted from `lib.rs`), `crates/proton-drive-core/src/client.rs`, `crates/proton-drive-core/src/nodes.rs` | `client/js/src/internal/nodes/` |
+| **MD-upload** | `crates/proton-drive-core/src/upload.rs`, `crates/proton-drive-api/src/upload.rs` (new file extracted) | `client/js/src/internal/upload/` |
+| **ME-download** | `crates/proton-drive-core/src/download.rs`, `crates/proton-drive-api/src/download.rs` (new file extracted) | `client/js/src/internal/download/` |
 | **MF-tui** | `apps/pdtui/src/transfer.rs`, `apps/pdtui/src/panes.rs`, `apps/pdtui/src/app.rs` (transfer wiring only — not LoginForm), `apps/pdtui/src/ui.rs` | — |
 | **MG-refresh** | `apps/pdtui/src/auth.rs` (refresh fn only — not Credentials), `apps/pdtui/src/session.rs` | — |
 

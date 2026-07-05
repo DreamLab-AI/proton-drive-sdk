@@ -1,0 +1,279 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=2; plural=(n != 1);",
+    "language": "ca_ES"
+  },
+  "contexts": {
+    "Error": {
+      "A message is required when reporting copyright infringement or stolen data": [
+        "Es requereix un missatge quan s'informi d'una infracció dels drets d'autor o de dades robades"
+      ],
+      "Bookmark password is not available": [
+        "La contrasenya d'adreces d'interès no està disponible."
+      ],
+      "Cannot add photo to album without a valid name": [
+        "No es pot afegir la fotografia a l'àlbum sense un nom vàlid"
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "No es pot crear l'enllaç públic d'un volum que no és propietat de l'usuari"
+      ],
+      "Cannot download a folder": [
+        "No es pot descarregar una carpeta"
+      ],
+      "Cannot share root folder": [
+        "No es pot compartir la carpeta arrel"
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "No es pot actualitzar l'enllaç públic d'un volum que no és propietat de l'usuari"
+      ],
+      "Content key packet is required for small revision upload": [
+        "Es requereix el paquet de claus de contingut per carregar revisions petites"
+      ],
+      "Copy operation aborted": [
+        "S'ha cancel·lat l'operació de còpia"
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "No està permès copiar un element a un lloc que no és una carpeta"
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "La creació de documents fora de carpetes no està permesa"
+      ],
+      "Creating files in non-folders is not allowed": [
+        "No es permet crear carpetes en llocs que no són carpetes"
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "No es permet crear carpetes en llocs que no són carpetes"
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "No es permet crear revisions en elements que no són fitxers"
+      ],
+      "Data integrity check failed": [
+        "Ha fallat la comprovació d'integritat de les dades"
+      ],
+      "Data integrity check of one part failed": [
+        "Error amb la comprovació d'integritat de les dades d'una part"
+      ],
+      "Device not found": [
+        "No s'ha trobat el dispositiu"
+      ],
+      "Expiration date cannot be in the past": [
+        "La data de caducitat no pot haver passat"
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "No s'ha pogut desxifrar la revisió activa: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "No s'ha pogut desxifrar el bloc: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "No s'ha pogut desxifrar la clau d'adreces d'interès: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "No s'ha pogut desxifrar el nom de l'adreça d'interès: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "No s'ha pogut desxifrar la contrasenya d'adreces d'interès: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "No s'ha pogut desxifrar la clau de contingut: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "No s'ha pogut desxifrar el nom de l'element: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "No s'ha pogut desxifrar la clau del node: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "No s'ha pogut desxifrar la miniatura: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "No s'han pogut obtenir les claus de qui us convida"
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "No s'ha pogut obtenir la informació de compartició per al node ${ nodeUid }"
+      ],
+      "Failed to get verification keys": [
+        "No s'han pogut obtenir les claus de verificació"
+      ],
+      "Failed to load some items": [
+        "No s'han pogut carregar alguns elements"
+      ],
+      "Failed to load some nodes": [
+        "No s'han pogut carregar alguns nodes"
+      ],
+      "Failed to verify invitation": [
+        "No s'ha pogut verificar la invitació"
+      ],
+      "File download failed due to empty response": [
+        "La descàrrega del fitxer ha fallat a causa d'una resposta buida."
+      ],
+      "File has no active revision": [
+        "El fitxer no té revisió activa."
+      ],
+      "File has no content key": [
+        "El fitxer no té clau de contingut"
+      ],
+      "File has no revision": [
+        "Aquest fitxer no té cap revisió"
+      ],
+      "File hash does not match expected hash": [
+        "L'empremta electrònica del fitxer no coincideix amb l'esperada"
+      ],
+      "Invalid URL": [
+        "L'URL no és vàlid"
+      ],
+      "Invitation not found": [
+        "No s'ha trobat la invitació"
+      ],
+      "Item cannot be decrypted": [
+        "No s'ha pogut desxifrar l'element"
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "L'enllaç públic antic no es pot actualitzar. Torneu a crear-ne un de nou."
+      ],
+      "Missing integrity signature": [
+        "No s'ha trobat la signatura d'integritat"
+      ],
+      "Missing inviter email": [
+        "Falta el correu electrònic de qui us convida"
+      ],
+      "Missing signature": [
+        "No s'ha trobat la signatura"
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Falta la signatura per a ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "S'ha cancel·lat l'operació de moviment"
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "No està permès moure un element a un lloc que no és una carpeta"
+      ],
+      "Moving root item is not allowed": [
+        "No està permès moure un element arrel"
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "El nom ha de tenir com a màxim ${ MAX_NODE_NAME_LENGTH } caràcter",
+        "El nom ha de tenir com a màxim ${ MAX_NODE_NAME_LENGTH } caràcters"
+      ],
+      "Name must not be empty": [
+        "El nom no pot estar buit."
+      ],
+      "No available name found": [
+        "No s'ha trobat cap nom disponible"
+      ],
+      "Node has no thumbnail": [
+        "El node no té miniatura"
+      ],
+      "Node is not accessible": [
+        "Aquest node no és accessible"
+      ],
+      "Node is not accessible via a share": [
+        "No es pot accedir al node mitjançant un recurs compartit"
+      ],
+      "Node is not shared": [
+        "Node no compartit"
+      ],
+      "Node not found": [
+        "No s'ha trobat el node"
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Només els administradors poden convertir invitacions que no siguin de Proton"
+      ],
+      "Operation aborted": [
+        "S'ha interromput l'operació"
+      ],
+      "Operation failed, try again later": [
+        "L'operació ha fallat, torneu-ho a provar més tard"
+      ],
+      "Parent cannot be decrypted": [
+        "L'element principal no es pot desxifrar"
+      ],
+      "Photo is already in the target album": [
+        "La foto ja és a l'àlbum de destinació"
+      ],
+      "Photo not found": [
+        "No s'ha trobat la fotografia"
+      ],
+      "Renaming root item is not allowed": [
+        "No està permès canviar el nom d'un element arrel"
+      ],
+      "Request aborted": [
+        "Sol·licitud cancel·lada"
+      ],
+      "Signature is missing": [
+        "Falta la signatura"
+      ],
+      "Signature verification failed": [
+        "Ha fallat la verificació de la signatura"
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Hi ha hagut un error en la verificació de la signatura: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "No s'ha pogut verificar la signatura per a ${ signatureType }"
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "No s'ha pogut verificar la signatura per a ${ signatureType }: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Alguns bytes del fitxer no s'han pogut carregar"
+      ],
+      "Some file parts failed to upload": [
+        "Algunes parts del fitxer no s'han pogut carregar"
+      ],
+      "The node is not shared anymore": [
+        "Aquest node ja no està compartit"
+      ],
+      "Thumbnail not found": [
+        "No s'ha trobat la miniatura"
+      ],
+      "Too many server errors, please try again later": [
+        "Massa errors del servidor. Torneu-ho a provar més tard"
+      ],
+      "Too many server requests, please try again later": [
+        "Hi ha hagut massa peticions del servidor. Torneu-ho a provar més tard."
+      ],
+      "Unknown error": [
+        "Error desconegut"
+      ],
+      "Unknown error ${ code }": [
+        "Error desconegut ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Les claus de verificació no estan disponibles"
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Les claus de verificació per a ${ signatureType } no estan disponibles"
+      ],
+      "You can leave only item that is shared with you": [
+        "Només podeu abandonar un element que us hagi estat compartit."
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "L'autor no es proporciona a l'enllaç públic"
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "atributs"
+      ],
+      "content key": [
+        "clau de contingut"
+      ],
+      "hash key": [
+        "clau d'empremta electrònica"
+      ],
+      "key": [
+        "clau"
+      ],
+      "membership": [
+        "subscripció"
+      ],
+      "name": [
+        "nom"
+      ]
+    }
+  }
+}

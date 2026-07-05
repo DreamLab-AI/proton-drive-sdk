@@ -4,12 +4,12 @@ on:
   push:
     paths:
       - "rust/**"
-      - "reference/cs/sdk/src/protos/**"
+      - "reference/client/cs/src/protos/**"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
       - "rust/**"
-      - "reference/cs/sdk/src/protos/**"
+      - "reference/client/cs/src/protos/**"
       - ".github/workflows/rust.yml"
   workflow_dispatch:
 

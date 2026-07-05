@@ -1,4 +1,4 @@
-//! Root client. Mirrors `js/sdk/src/protonDriveClient.ts` shape.
+//! Root client. Mirrors `client/js/src/protonDriveClient.ts` shape.
 
 use std::sync::Arc;
 

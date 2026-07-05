@@ -1,0 +1,280 @@
+{
+  "headers": {
+    "plural-forms": "nplurals=3; plural=(n==1 ? 0 : (n==0 || (n%100 > 0 && n%100 < 20)) ? 1 : 2);",
+    "language": "ro_RO"
+  },
+  "contexts": {
+    "Error": {
+      "A message is required when reporting copyright infringement or stolen data": [
+        "Este necesar un mesaj atunci când se raportează încălcarea drepturilor de autor sau furtul de date."
+      ],
+      "Bookmark password is not available": [
+        "Parola semnului de carte nu este disponibilă."
+      ],
+      "Cannot add photo to album without a valid name": [
+        "Nu se poate adăuga o fotografie în album fără un nume valid."
+      ],
+      "Cannot create public link for volume not owned by the user": [
+        "Nu se poate crea legătura web publică pentru volumul care nu este deținut de utilizator."
+      ],
+      "Cannot download a folder": [
+        "Nu se poate descărca un folder."
+      ],
+      "Cannot share root folder": [
+        "Nu se poate partaja folderul rădăcină."
+      ],
+      "Cannot update public link for volume not owned by the user": [
+        "Nu se poate actualiza legătura web publică pentru volumul care nu este deținut de utilizator."
+      ],
+      "Content key packet is required for small revision upload": [
+        "Pentru încărcarea revizuirilor mici este necesar pachetul cheii conținutului."
+      ],
+      "Copy operation aborted": [
+        "Copierea a fost anulată."
+      ],
+      "Copying item to a non-folder is not allowed": [
+        "Copierea articolului în alt loc decât un folder nu este permisă."
+      ],
+      "Creating documents in non-folders is not allowed": [
+        "Crearea documentelor în afara folderelor nu este permisă."
+      ],
+      "Creating files in non-folders is not allowed": [
+        "Crearea fișierelor în non-foldere nu este permisă."
+      ],
+      "Creating folders in non-folders is not allowed": [
+        "Crearea folderelor în non-foldere nu este permisă."
+      ],
+      "Creating revisions in non-files is not allowed": [
+        "Crearea reviziilor în non-fișiere nu este permisă."
+      ],
+      "Data integrity check failed": [
+        "Verificarea integrității datelor a eșuat."
+      ],
+      "Data integrity check of one part failed": [
+        "Verificarea integrității datelor pentru o parte a eșuat."
+      ],
+      "Device not found": [
+        "Dispozitivul nu a fost găsit."
+      ],
+      "Expiration date cannot be in the past": [
+        "Data de expirare nu poate fi în trecut."
+      ],
+      "Failed to decrypt active revision: ${ message }": [
+        "Nu s-a reușit decriptarea reviziei active: ${ message }"
+      ],
+      "Failed to decrypt block: ${ message }": [
+        "Nu s-a reușit decriptarea blocului: ${ message }"
+      ],
+      "Failed to decrypt bookmark key: ${ message }": [
+        "Nu s-a reușit decriptarea cheii semnului de carte: ${ message }"
+      ],
+      "Failed to decrypt bookmark name: ${ message }": [
+        "Nu s-a reușit decriptarea numelui semnului de carte: ${ message }"
+      ],
+      "Failed to decrypt bookmark password: ${ message }": [
+        "Nu s-a reușit decriptarea parolei semnului de carte: ${ message }"
+      ],
+      "Failed to decrypt content key: ${ message }": [
+        "Nu s-a reușit decriptarea cheii de conținut: ${ message }"
+      ],
+      "Failed to decrypt item name: ${ message }": [
+        "Nu s-a reușit decriptarea numelui elementului: ${ message }"
+      ],
+      "Failed to decrypt node key: ${ message }": [
+        "Nu s-a reușit decriptarea cheii nodului: ${ message }"
+      ],
+      "Failed to decrypt thumbnail: ${ message }": [
+        "Nu s-a reușit decriptarea miniaturii: ${ message }"
+      ],
+      "Failed to get inviter keys": [
+        "Preluarea cheilor de invitare a eșuat."
+      ],
+      "Failed to get sharing info for node ${ nodeUid }": [
+        "Nu s-au putut obține informații de partajare pentru nodul ${ nodeUid }."
+      ],
+      "Failed to get verification keys": [
+        "Obținerea cheilor de verificare a eșuat."
+      ],
+      "Failed to load some items": [
+        "Nu s-a reușit încărcarea unor articole."
+      ],
+      "Failed to load some nodes": [
+        "Nu s-a reușit încărcarea unor noduri."
+      ],
+      "Failed to verify invitation": [
+        "Eșuare verificare invitație."
+      ],
+      "File download failed due to empty response": [
+        "Descărcarea fișierului a eșuat din cauza unui răspuns gol."
+      ],
+      "File has no active revision": [
+        "Fișierul nu are nicio revizie activă."
+      ],
+      "File has no content key": [
+        "Fișierul nu are nicio cheie de conținut."
+      ],
+      "File has no revision": [
+        "Fișierul nu are nicio revizie."
+      ],
+      "File hash does not match expected hash": [
+        "Codul de verificare al fișierului nu corespunde cu cel așteptat."
+      ],
+      "Invalid URL": [
+        "Adresă URL nevalidă."
+      ],
+      "Invitation not found": [
+        "Invitația nu a fost găsită."
+      ],
+      "Item cannot be decrypted": [
+        "Articolul nu poate fi decriptat."
+      ],
+      "Legacy public link cannot be updated. Please re-create a new public link.": [
+        "Vechea legătură web publică nu poate fi actualizată. Recreați o nouă legătură web publică."
+      ],
+      "Missing integrity signature": [
+        "Lipsește semnătura de integritate"
+      ],
+      "Missing inviter email": [
+        "Adresa de e-mail al invitantului lipsește."
+      ],
+      "Missing signature": [
+        "Semnătură lipsă."
+      ],
+      "Missing signature for ${ signatureType }": [
+        "Semnătură lipsă pentru ${ signatureType }"
+      ],
+      "Move operation aborted": [
+        "Mutarea a fost anulată."
+      ],
+      "Moving item to a non-folder is not allowed": [
+        "Mutarea elementului într-un non-folder nu este permisă."
+      ],
+      "Moving root item is not allowed": [
+        "Mutarea rădăcinii nu este permisă."
+      ],
+      "Name must be ${ MAX_NODE_NAME_LENGTH } character long at most": [
+        "Numele trebuie să aibă cel mult ${ MAX_NODE_NAME_LENGTH } caracter.",
+        "Numele trebuie să aibă cel mult ${ MAX_NODE_NAME_LENGTH } caractere.",
+        "Numele trebuie să aibă cel mult ${ MAX_NODE_NAME_LENGTH } de caractere."
+      ],
+      "Name must not be empty": [
+        "Numele nu poate fi gol."
+      ],
+      "No available name found": [
+        "Nu a fost găsit niciun nume disponibil."
+      ],
+      "Node has no thumbnail": [
+        "Nodul nu are miniatură."
+      ],
+      "Node is not accessible": [
+        "Nodul nu este accesibil."
+      ],
+      "Node is not accessible via a share": [
+        "Nodul nu este accesibil printr-o partajare."
+      ],
+      "Node is not shared": [
+        "Nodul nu este partajat."
+      ],
+      "Node not found": [
+        "Nod negăsit."
+      ],
+      "Only admins can convert non-Proton invitations": [
+        "Doar administratorii pot converti invitațiile non-Proton."
+      ],
+      "Operation aborted": [
+        "Operație anulată"
+      ],
+      "Operation failed, try again later": [
+        "Operațiunea a eșuat. Reîncercați mai târziu."
+      ],
+      "Parent cannot be decrypted": [
+        "Părintele nu poate fi decriptat."
+      ],
+      "Photo is already in the target album": [
+        "Fotografia există deja în albumul țintă."
+      ],
+      "Photo not found": [
+        "Fotografia nu a fost găsită"
+      ],
+      "Renaming root item is not allowed": [
+        "Redenumirea rădăcinii nu este permisă."
+      ],
+      "Request aborted": [
+        "Solicitare anulată."
+      ],
+      "Signature is missing": [
+        "Semnătura lipsește"
+      ],
+      "Signature verification failed": [
+        "Eșuare verificare semnătură."
+      ],
+      "Signature verification failed: ${ errorMessage }": [
+        "Verificarea semnăturii a eșuat: ${ errorMessage }"
+      ],
+      "Signature verification for ${ signatureType } failed": [
+        "Verificarea semnăturii pentru ${ signatureType } a eșuat."
+      ],
+      "Signature verification for ${ signatureType } failed: ${ errorMessage }": [
+        "Verificarea semnăturii pentru ${ signatureType } a eșuat: ${ errorMessage }"
+      ],
+      "Some file bytes failed to upload": [
+        "Unii octeți ai fișierului nu s-au încărcat."
+      ],
+      "Some file parts failed to upload": [
+        "Unele părți ale fișierului nu s-au încărcat."
+      ],
+      "The node is not shared anymore": [
+        "Nodul nu mai este partajat."
+      ],
+      "Thumbnail not found": [
+        "Miniatură negăsită"
+      ],
+      "Too many server errors, please try again later": [
+        "Prea multe erori de server. Reîncercați mai târziu."
+      ],
+      "Too many server requests, please try again later": [
+        "Prea multe solicitări de server. Reîncercați mai târziu."
+      ],
+      "Unknown error": [
+        "Eroare necunoscută."
+      ],
+      "Unknown error ${ code }": [
+        "Eroare necunoscută ${ code }"
+      ],
+      "Verification keys are not available": [
+        "Cheile de verificare nu sunt disponibile"
+      ],
+      "Verification keys for ${ signatureType } are not available": [
+        "Cheile de verificare pentru ${ signatureType } nu sunt disponibile."
+      ],
+      "You can leave only item that is shared with you": [
+        "Puteți părăsi doar articolul care vi s-a partajat."
+      ]
+    },
+    "Info": {
+      "Author is not provided on public link": [
+        "Autorul nu este furnizat pentru legătura publică."
+      ]
+    },
+    "Property": {
+      "attributes": [
+        "atribute"
+      ],
+      "content key": [
+        "cheie de conținut"
+      ],
+      "hash key": [
+        "cheie criptată"
+      ],
+      "key": [
+        "cheie"
+      ],
+      "membership": [
+        "apartenență"
+      ],
+      "name": [
+        "nume"
+      ]
+    }
+  }
+}
