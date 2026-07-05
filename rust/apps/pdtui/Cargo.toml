@@ -44,3 +44,11 @@ proton-drive = { path = "../../crates/proton-drive" }
 proton-drive-api = { path = "../../crates/proton-drive-api" }
 proton-drive-cache = { path = "../../crates/proton-drive-cache" }
 proton-drive-crypto = { path = "../../crates/proton-drive-crypto" }
+
+# Test-only: a hand-rolled loopback HTTP/1.1 mock server for
+# ReqwestHttpClient retry/backoff tests (src/http.rs) needs `net`. No
+# mock-HTTP-server crate (wiremock etc.) is added -- the raw TCP mock is
+# enough for status-code branching tests and keeps the dependency graph
+# unchanged.
+[dev-dependencies]
+tokio = { workspace = true, features = ["net"] }

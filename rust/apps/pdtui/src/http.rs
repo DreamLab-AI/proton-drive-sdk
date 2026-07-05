@@ -3,18 +3,31 @@
 //! Implements the operational requirements from `README.md`:
 //! - `x-pm-appversion` injected on every request
 //! - retry transient failures with exponential backoff + jitter
-//! - surface 429 as `Error::RateLimited` honouring `Retry-After`
+//! - retry `429` responses, honouring `Retry-After`, up to a bounded budget
+//!   before surfacing `Error::RateLimited` (mirrors the JS reference's
+//!   transparent-retry rate-limit handling; see `send_with_retry`)
 //! - never proxy endpoints (constructor pins the base URL)
 //!
 //! # Session-aware wrapper (ADR-0010)
 //!
 //! [`SessionAwareHttpClient`] wraps any [`ProtonDriveHttpClient`] and injects
 //! auth headers (`Authorization` + `x-pm-uid`) from a [`SessionManager`] on
-//! every request. On a `401` response it calls
+//! every JSON (metadata) request. On a `401` response it calls
 //! [`SessionManager::force_refresh`] once and retries the original request
 //! exactly once. If the refresh itself fails with
 //! [`SessionManagerError::SessionExpired`] that error is converted to
 //! `Error::Internal` so the TUI can surface a re-login prompt.
+//!
+//! Blob (storage) requests are deliberately **not** given the API session's
+//! `Authorization` / `x-pm-uid` headers: storage endpoints (absolute
+//! BareURLs, often on a different host than the API base, e.g.
+//! `upload.proton.me`) authenticate with the caller-supplied
+//! `pm-storage-token` header only. This matches the JS reference's
+//! `makeStorageRequest`, which sends only `pm-storage-token`, `Language` and
+//! `x-pm-drive-sdk-version` (reference/js/sdk/src/internal/apiService/apiService.ts:233-253)
+//! -- never the API bearer. Sending the full-scope session bearer to a
+//! separate storage host would widen the blast radius of that token far
+//! beyond its intended use.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +43,26 @@ use reqwest::Client;
 use tracing::{debug, warn};
 
 use crate::session::{SessionManager, SessionManagerError};
+
+/// Default retry delay (seconds) for a `429` response with no `Retry-After`
+/// header. Matches the JS reference's `DEFAULT_429_RETRY_DELAY_SECONDS`
+/// (reference/js/sdk/src/internal/apiService/apiService.ts:77).
+const DEFAULT_429_RETRY_DELAY_SECS: u64 = 10;
+
+/// Bounded number of `429` retries per request before giving up and
+/// surfacing `Error::RateLimited`.
+///
+/// The JS reference instead retries `429`s indefinitely per-request, only
+/// refusing to send further requests once a *global*, cross-request rolling
+/// count of consecutive `429`s exceeds `TOO_MANY_SUBSEQUENT_429_ERRORS` (50)
+/// within a 60s window
+/// (reference/js/sdk/src/internal/apiService/apiService.ts:35,303-306,408-414).
+/// We cap retries per-request instead of threading cross-request state
+/// through the transport, trading a little fidelity for a deterministic,
+/// easily-tested budget while still transparently absorbing the common case
+/// of a handful of rate-limit responses instead of failing the whole
+/// operation on the first one.
+const MAX_RATE_LIMIT_ATTEMPTS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // ReqwestHttpClient -- bare transport layer, no auth injection
@@ -73,7 +106,9 @@ impl ReqwestHttpClient {
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<JsonResponse> {
         let mut delay_ms: u64 = 250;
-        for attempt in 1..=self.max_attempts {
+        let mut rate_limit_attempts: u32 = 0;
+        let mut attempt: u32 = 1;
+        loop {
             let req = build()
                 .header("x-pm-appversion", &self.app_version)
                 .header("accept", "application/json");
@@ -81,12 +116,17 @@ impl ReqwestHttpClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.as_u16() == 429 {
-                        let retry_after = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(5);
+                        let retry_after = Self::parse_retry_after_secs(resp.headers());
+                        if rate_limit_attempts < MAX_RATE_LIMIT_ATTEMPTS {
+                            rate_limit_attempts += 1;
+                            warn!(
+                                rate_limit_attempts,
+                                retry_after, "rate limited (429); retrying after Retry-After"
+                            );
+                            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                            continue;
+                        }
+                        warn!(retry_after, "rate limit retry budget exhausted; giving up");
                         return Err(Error::RateLimited {
                             retry_after_secs: retry_after,
                         });
@@ -104,6 +144,7 @@ impl ReqwestHttpClient {
                         warn!(attempt, %status, "server error; retrying");
                         Self::sleep_with_jitter(delay_ms).await;
                         delay_ms = (delay_ms * 2).min(8_000);
+                        attempt += 1;
                         continue;
                     }
                     return Ok(JsonResponse {
@@ -121,16 +162,43 @@ impl ReqwestHttpClient {
                     debug!(attempt, error = %e, "transient transport error; retrying");
                     Self::sleep_with_jitter(delay_ms).await;
                     delay_ms = (delay_ms * 2).min(8_000);
+                    attempt += 1;
                 }
-                Err(e) => return Err(Error::Network(e.to_string())),
+                Err(e) => {
+                    // The JS reference retries once on *any* other exception
+                    // before giving up, in addition to its dedicated
+                    // timeout/network branches (apiService.ts:339-343,
+                    // `GENERAL_RETRY_DELAY_SECONDS`). Mirror that single
+                    // fallback retry for transport errors that are neither a
+                    // timeout nor a connect failure (e.g. a mid-stream body
+                    // error), instead of failing on the first occurrence.
+                    if attempt == 1 {
+                        debug!(error = %e, "transport error; retrying once");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        attempt += 1;
+                    } else {
+                        return Err(Error::Network(e.to_string()));
+                    }
+                }
             }
         }
-        Err(Error::Network("max retries exhausted".into()))
     }
 
     async fn sleep_with_jitter(base_ms: u64) {
         let jitter: u64 = rand::thread_rng().gen_range(0..(base_ms / 2 + 1));
         tokio::time::sleep(Duration::from_millis(base_ms + jitter)).await;
+    }
+
+    /// Parse the `Retry-After` header (seconds) from a `429` response,
+    /// falling back to [`DEFAULT_429_RETRY_DELAY_SECS`] when absent or
+    /// unparseable. Pulled out as a pure function so the "with" and
+    /// "without a header" cases are unit-testable without any networking.
+    fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> u64 {
+        headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_429_RETRY_DELAY_SECS)
     }
 }
 
@@ -258,38 +326,31 @@ impl ProtonDriveHttpClient for SessionAwareHttpClient {
     }
 
     async fn request_blob(&self, req: BlobRequest) -> Result<JsonResponse> {
-        let auth_headers = self.session.auth_headers().await;
-        let mut full_headers = auth_headers;
-        full_headers.extend_from_slice(&req.headers);
-
-        let authed_req = BlobRequest {
+        // Storage (blob) requests hit absolute BareURLs -- often on a
+        // different host than the API base -- and authenticate with the
+        // caller-supplied `pm-storage-token` header only. Do NOT prepend the
+        // API session's `Authorization` bearer or `x-pm-uid`: that would leak
+        // a full-scope, longer-lived credential to a separate storage host
+        // that was never designed to receive it (see module docs and
+        // reference/js/sdk/src/internal/apiService/apiService.ts:233-253
+        // `makeStorageRequest`, which sends only `pm-storage-token`,
+        // `Language` and `x-pm-drive-sdk-version`).
+        let retry_req = BlobRequest {
             method: req.method,
             path: req.path.clone(),
             query: req.query.clone(),
-            headers: full_headers,
+            headers: req.headers.clone(),
             body: req.body.clone(),
         };
-        let resp = self.inner.request_blob(authed_req).await?;
+        let resp = self.inner.request_blob(req).await?;
 
         if resp.status != 401 {
             return Ok(resp);
         }
 
-        debug!("401 on blob; attempting token refresh");
+        debug!("401 on blob; attempting token refresh before retrying");
         match self.session.force_refresh().await {
-            Ok(()) => {
-                let auth_headers = self.session.auth_headers().await;
-                let mut full_headers = auth_headers;
-                full_headers.extend_from_slice(&req.headers);
-                let retry_req = BlobRequest {
-                    method: req.method,
-                    path: req.path,
-                    query: req.query,
-                    headers: full_headers,
-                    body: req.body,
-                };
-                self.inner.request_blob(retry_req).await
-            }
+            Ok(()) => self.inner.request_blob(retry_req).await,
             Err(SessionManagerError::SessionExpired) => Err(Error::Internal(
                 "session expired -- please log in again".to_owned(),
             )),
@@ -366,6 +427,40 @@ mod tests {
                 status,
                 headers: vec![],
                 body: Bytes::from(body),
+            })
+        }
+    }
+
+    /// Records the headers it receives on `request_blob` so tests can assert
+    /// on exactly what was sent, without a real network hop.
+    struct HeaderCapturingMock {
+        captured_blob_headers: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl HeaderCapturingMock {
+        fn new() -> Self {
+            Self {
+                captured_blob_headers: std::sync::Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProtonDriveHttpClient for HeaderCapturingMock {
+        async fn request_json(&self, _req: JsonRequest) -> Result<JsonResponse> {
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body: Bytes::from(r#"{"ok":true}"#),
+            })
+        }
+
+        async fn request_blob(&self, req: BlobRequest) -> Result<JsonResponse> {
+            *self.captured_blob_headers.lock().unwrap() = req.headers.clone();
+            Ok(JsonResponse {
+                status: 200,
+                headers: vec![],
+                body: Bytes::new(),
             })
         }
     }
@@ -464,6 +559,256 @@ mod tests {
                 Err(crate::session::SessionManagerError::SessionExpired)
             ),
             "422 should produce SessionExpired, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential-leak regression: SessionAwareHttpClient::request_blob must
+    // never carry the API session's Authorization / x-pm-uid headers.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn session_aware_request_blob_never_leaks_session_auth_headers() {
+        let capturing = Arc::new(HeaderCapturingMock::new());
+        // Separate, unrelated transport backing the SessionManager's own
+        // background refresh loop -- never hit in this test since the blob
+        // response is 200, not 401.
+        let session_transport = Arc::new(SequentialMock::new(vec![]));
+        let manager = Arc::new(make_manager(session_transport));
+
+        let client = SessionAwareHttpClient::new(
+            Arc::clone(&capturing) as Arc<dyn ProtonDriveHttpClient>,
+            manager,
+        );
+
+        let req = BlobRequest {
+            method: HttpMethod::Post,
+            path: "https://storage.example.com/block/abc".to_owned(),
+            query: vec![],
+            headers: vec![("pm-storage-token".to_owned(), "storage-tok-123".to_owned())],
+            body: Bytes::new(),
+        };
+
+        let resp = client
+            .request_blob(req)
+            .await
+            .expect("blob request should succeed");
+        assert_eq!(resp.status, 200);
+
+        let captured = capturing.captured_blob_headers.lock().unwrap();
+        let has_header = |name: &str| captured.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+        assert!(
+            !has_header("authorization"),
+            "blob request must never carry the API session Authorization header, got: {captured:?}"
+        );
+        assert!(
+            !has_header("x-pm-uid"),
+            "blob request must never carry the API session x-pm-uid header, got: {captured:?}"
+        );
+        assert!(
+            has_header("pm-storage-token"),
+            "blob request should still carry the caller-supplied pm-storage-token, got: {captured:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ReqwestHttpClient retry/backoff tests, via a minimal hand-rolled
+    // HTTP/1.1 mock server -- no live network, no keyring, no extra
+    // mock-HTTP-server dependency.
+    // -----------------------------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// One scripted response: (status, extra headers, body).
+    type ScriptedResponse = (u16, Vec<(&'static str, String)>, &'static str);
+
+    /// A single-purpose HTTP/1.1 server: every accepted TCP connection is
+    /// treated as exactly one request/response (`Connection: close`), served
+    /// from a FIFO script. Requests are drained but not parsed -- these
+    /// tests only exercise `ReqwestHttpClient`'s status-code branching.
+    struct MockServer {
+        addr: std::net::SocketAddr,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockServer {
+        async fn start(script: Vec<ScriptedResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock listener");
+            let addr = listener.local_addr().expect("mock listener local addr");
+            let script = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                script,
+            )));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let task_calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let script = Arc::clone(&script);
+                    let calls = Arc::clone(&task_calls);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        // Best-effort drain of the request; these small test
+                        // payloads arrive in a single read over loopback.
+                        let _ = stream.read(&mut buf).await;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let next = script.lock().unwrap().pop_front();
+                        let (status, headers, body) = next.unwrap_or((200, vec![], ""));
+                        let mut out = format!(
+                            "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: {len}\r\n",
+                            reason = reason_phrase(status),
+                            len = body.len(),
+                        );
+                        for (k, v) in &headers {
+                            out.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        out.push_str("\r\n");
+                        out.push_str(body);
+                        let _ = stream.write_all(out.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            Self { addr, calls }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            400 => "Bad Request",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "Unknown",
+        }
+    }
+
+    fn get_request() -> JsonRequest {
+        JsonRequest {
+            method: HttpMethod::Get,
+            path: "/test".to_owned(),
+            query: vec![],
+            headers: vec![],
+            body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_429_honours_retry_after_header_then_succeeds() {
+        let server = MockServer::start(vec![
+            (429, vec![("Retry-After", "0".to_owned())], ""),
+            (200, vec![], r#"{"ok":true}"#),
+        ])
+        .await;
+        let client = ReqwestHttpClient::new(server.base_url(), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient");
+
+        let resp = client
+            .request_json(get_request())
+            .await
+            .expect("429 should be transparently retried and then succeed");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(server.call_count(), 2, "expected initial attempt + 1 retry");
+    }
+
+    // `parse_retry_after_secs` is a pure function precisely so the
+    // with/without-header cases can be asserted deterministically, without
+    // a real (or paused-clock) multi-second sleep. Mixing tokio's paused
+    // virtual clock with real loopback sockets in the same test proved
+    // unreliable (the mock server observed extra connections), so the
+    // *value* is unit-tested here and the *retry behaviour* is exercised
+    // end-to-end below using `Retry-After: 0` to keep those tests fast.
+    #[test]
+    fn parse_retry_after_secs_defaults_when_header_absent() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            ReqwestHttpClient::parse_retry_after_secs(&headers),
+            DEFAULT_429_RETRY_DELAY_SECS
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_secs_honours_header_when_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "42".parse().expect("valid header value"));
+        assert_eq!(ReqwestHttpClient::parse_retry_after_secs(&headers), 42);
+    }
+
+    #[tokio::test]
+    async fn http_429_exhausts_retry_budget_then_returns_rate_limited() {
+        let script: Vec<ScriptedResponse> = (0..=MAX_RATE_LIMIT_ATTEMPTS)
+            .map(|_| (429, vec![("Retry-After", "0".to_owned())], ""))
+            .collect();
+        let expected_calls = script.len();
+        let server = MockServer::start(script).await;
+        let client = ReqwestHttpClient::new(server.base_url(), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient");
+
+        let err = client
+            .request_json(get_request())
+            .await
+            .expect_err("rate limit retry budget should eventually be exhausted");
+
+        match err {
+            Error::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 0),
+            other => panic!("expected Error::RateLimited, got: {other:?}"),
+        }
+        assert_eq!(
+            server.call_count(),
+            expected_calls,
+            "expected exactly the initial attempt plus MAX_RATE_LIMIT_ATTEMPTS retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_5xx_retries_once_then_succeeds() {
+        let server =
+            MockServer::start(vec![(500, vec![], ""), (200, vec![], r#"{"ok":true}"#)]).await;
+        let client = ReqwestHttpClient::new(server.base_url(), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient");
+
+        let resp = client
+            .request_json(get_request())
+            .await
+            .expect("5xx should be retried with backoff and then succeed");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(server.call_count(), 2, "expected initial attempt + 1 retry");
+    }
+
+    #[tokio::test]
+    async fn http_4xx_is_not_retried() {
+        let server = MockServer::start(vec![
+            (400, vec![], r#"{"Code":400,"Error":"bad request"}"#),
+            (200, vec![], r#"{"ok":true}"#), // must never be consumed
+        ])
+        .await;
+        let client = ReqwestHttpClient::new(server.base_url(), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient");
+
+        let resp = client
+            .request_json(get_request())
+            .await
+            .expect("4xx should be surfaced directly, not retried");
+
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            server.call_count(),
+            1,
+            "a 4xx must not trigger any retry attempts"
         );
     }
 }
