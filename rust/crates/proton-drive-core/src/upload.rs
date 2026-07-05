@@ -1,8 +1,12 @@
 //! Block-upload protocol — ADR-0008 §"The protocol".
 //!
 //! Implements `FileUploader::upload_from_stream` for files < 16 MiB.
-//! Happy path only; thumbnail upload, resumable upload, parallel blocks, and
-//! telemetry are explicitly out of scope (ADR-0008 §"What is NOT ported").
+//! Happy path only; thumbnail upload, resumable upload, and parallel blocks
+//! remain out of scope (ADR-0008 §"What is NOT ported"). The block-encryption
+//! verify/retry loop and its telemetry metric (js/v0.16.0, see
+//! `encrypt_block_with_verify_retry` below) *are* now ported, narrowing that
+//! exclusion list — general telemetry beyond that one metric is still out of
+//! scope.
 //!
 //! ## Mapping divergence: JS vs ADR-0008
 //!
@@ -45,6 +49,7 @@ use proton_drive_api::upload::{
 use proton_drive_crypto::{
     ArmorKind, EncryptOptions, OpenPgpCrypto, PrivateKey, PublicKey, SessionKey, armor,
 };
+use proton_drive_telemetry::{MetricEvent, Telemetry};
 
 use crate::account::ProtonDriveAccount;
 use crate::error::{Error, Result};
@@ -55,6 +60,13 @@ use crate::nodes::{NodeUid, map_api_error};
 pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// 16 MiB MVP limit (domain-model-mvp.md invariant table).
 pub const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Extra attempts allowed for a single block's encrypt-then-self-verify
+/// round trip before giving up on the whole upload. Matches the JS
+/// reference's `MAX_BLOCK_ENCRYPTION_RETRIES`
+/// (`client/js/src/internal/upload/streamUploader.ts:76`) — i.e. up to 2
+/// total attempts per block (1 initial + 1 retry).
+const MAX_BLOCK_ENCRYPTION_RETRIES: u32 = 1;
 
 /// Minimal envelope used to inspect a response's `Code`/`Error` without
 /// requiring the typed body — Proton error responses omit the typed payload.
@@ -190,6 +202,10 @@ pub struct ProtonFileUploader {
     pub(crate) name: String,
     /// UploadMetadata for this upload.
     pub(crate) metadata: UploadMetadata,
+    /// Optional telemetry sink. `None` (or `NullTelemetry`) drops every
+    /// event — the only metric currently emitted from this module is
+    /// [`MetricEvent::BlockVerificationError`] (js/v0.16.0 "report metric").
+    pub(crate) telemetry: Option<Arc<dyn Telemetry>>,
 }
 
 #[async_trait::async_trait]
@@ -480,14 +496,12 @@ impl ProtonFileUploader {
             // this port or JS-produced files (which never had a block-level
             // embedded signature to begin with); it only drops dead bytes and
             // a redundant signing operation per block.
+            //
+            // The encrypt step itself is retried on a self-verification
+            // failure (js/v0.16.0 "Retry block encryption and report
+            // metric") — see `encrypt_block_with_verify_retry`.
             let ciphertext = self
-                .openpgp
-                .encrypt(
-                    plaintext_block,
-                    content_session_key,
-                    &[], // no PKESK — bare SEIPD
-                    EncryptOptions::default(),
-                )
+                .encrypt_block_with_verify_retry(plaintext_block, content_session_key, block_index)
                 .await?;
 
             // SHA256 of ciphertext.
@@ -751,6 +765,97 @@ impl ProtonFileUploader {
                     body_snippet(&resp.body)
                 );
             }
+        }
+    }
+
+    /// Encrypt a plaintext block, then self-verify it by attempting to
+    /// decrypt it back with the same content session key -- this is JS's
+    /// `verifyBlock` self-check for bitflips / bad hardware ("Attempt to
+    /// decrypt data block, to try to detect bitflips / bad hardware ... we
+    /// use the key provided by the verification endpoint, to ensure the
+    /// correct key was used to encrypt the data",
+    /// `client/js/src/internal/upload/cryptoService.ts:214-234`).
+    ///
+    /// On a self-verify failure, retry the *entire* encrypt step up to
+    /// [`MAX_BLOCK_ENCRYPTION_RETRIES`] additional times (js/v0.16.0 "Retry
+    /// block encryption and report metric";
+    /// `client/js/src/internal/upload/streamUploader.ts:315-354`), then
+    /// report whether the retry helped via a
+    /// `MetricEvent::BlockVerificationError` (only if at least one attempt
+    /// failed — a clean first attempt emits nothing, matching JS's
+    /// `integrityError` flag gate,
+    /// `client/js/src/internal/upload/streamUploader.ts:328-351`).
+    async fn encrypt_block_with_verify_retry(
+        &self,
+        plaintext_block: &[u8],
+        content_session_key: &SessionKey,
+        block_index: u32,
+    ) -> Result<Vec<u8>> {
+        let mut attempt: u32 = 0;
+        let mut integrity_error_seen = false;
+        loop {
+            let ciphertext = self
+                .openpgp
+                .encrypt(
+                    plaintext_block,
+                    content_session_key,
+                    &[], // no PKESK — bare SEIPD
+                    EncryptOptions::default(),
+                )
+                .await?;
+
+            match self
+                .openpgp
+                .decrypt_and_verify(&ciphertext, content_session_key, &[])
+                .await
+            {
+                Ok(_) => {
+                    if integrity_error_seen {
+                        self.emit_block_verification_metric(true).await;
+                    }
+                    return Ok(ciphertext);
+                }
+                Err(e) => {
+                    integrity_error_seen = true;
+                    if attempt < MAX_BLOCK_ENCRYPTION_RETRIES {
+                        tracing::warn!(
+                            block_index,
+                            attempt,
+                            error = %e,
+                            "block encryption failed self-verification; retrying"
+                        );
+                        attempt += 1;
+                        continue;
+                    }
+                    tracing::error!(
+                        block_index,
+                        attempts = attempt + 1,
+                        error = %e,
+                        "block encryption failed self-verification; giving up"
+                    );
+                    self.emit_block_verification_metric(false).await;
+                    return Err(Error::Integrity(format!(
+                        "block {block_index}: encryption self-verification failed after {} attempts: {e}",
+                        attempt + 1
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Emit the `BlockVerificationError` metric if a telemetry sink is
+    /// configured. Mirrors JS `UploadTelemetry.logBlockVerificationError`
+    /// (`client/js/src/internal/upload/telemetry.ts:29-41`) -- we drop the
+    /// per-volume-type breakdown JS attaches (`getVolumeMetricContext`),
+    /// which is out of scope for this personal-use, single-volume port.
+    async fn emit_block_verification_metric(&self, retry_helped: bool) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry
+                .emit(MetricEvent::BlockVerificationError {
+                    detail: "block encryption self-verification failed at least once".to_owned(),
+                    retry_helped,
+                })
+                .await;
         }
     }
 
@@ -1494,6 +1599,200 @@ mod tests {
         }
     }
 
+    // ── Flaky crypto: fails the block self-verification decrypt a
+    // configurable number of times, otherwise delegates to `FakeCrypto` ──────
+
+    /// Crypto double for `encrypt_block_with_verify_retry` tests: its
+    /// `decrypt_and_verify` fails the first `remaining_failures` calls whose
+    /// ciphertext corresponds to encrypting `target_plaintext` (i.e. the
+    /// block-content self-verification check specifically), then succeeds.
+    /// Every *other* `decrypt_and_verify` call (share passphrase, node
+    /// passphrase, hash key, ...) always delegates straight to
+    /// `FakeCrypto`'s fixed behaviour, unaffected by the counter — run_upload
+    /// performs several such decrypts before ever reaching block encryption,
+    /// and none of those should be perturbed by this double.
+    struct FlakyVerifyCrypto {
+        remaining_failures: std::sync::atomic::AtomicUsize,
+        target_plaintext: Vec<u8>,
+    }
+
+    impl FlakyVerifyCrypto {
+        fn new(failures: usize, target_plaintext: &[u8]) -> Self {
+            Self {
+                remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
+                target_plaintext: target_plaintext.to_vec(),
+            }
+        }
+
+        /// True iff `data` is exactly `FakeCrypto::encrypt(target_plaintext, ..)`'s
+        /// output (the `FAKE_ENC:` marker prefix followed by the tracked
+        /// plaintext).
+        fn is_target_ciphertext(&self, data: &[u8]) -> bool {
+            data.strip_prefix(b"FAKE_ENC:") == Some(self.target_plaintext.as_slice())
+        }
+    }
+
+    #[async_trait]
+    impl proton_drive_crypto::OpenPgpCrypto for FlakyVerifyCrypto {
+        fn generate_passphrase(&self) -> zeroize::Zeroizing<String> {
+            FakeCrypto.generate_passphrase()
+        }
+
+        async fn decrypt_key(
+            &self,
+            armored: &str,
+            passphrase: &str,
+        ) -> std::result::Result<CPrivKey, CryptoError> {
+            FakeCrypto.decrypt_key(armored, passphrase).await
+        }
+
+        async fn encrypt(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+            opts: EncryptOptions,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt(data, session_key, encryption_keys, opts)
+                .await
+        }
+
+        async fn encrypt_and_sign(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+            signing_key: &CPrivKey,
+            opts: EncryptOptions,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_and_sign(data, session_key, encryption_keys, signing_key, opts)
+                .await
+        }
+
+        async fn decrypt_and_verify(
+            &self,
+            data: &[u8],
+            session_key: &SessionKey,
+            verification_keys: &[CPubKey],
+        ) -> std::result::Result<(Vec<u8>, VerificationStatus), CryptoError> {
+            if self.is_target_ciphertext(data) {
+                let remaining = self
+                    .remaining_failures
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if remaining > 0 {
+                    self.remaining_failures
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(CryptoError::Decrypt(
+                        "simulated bitflip for block self-verification test".into(),
+                    ));
+                }
+            }
+            FakeCrypto
+                .decrypt_and_verify(data, session_key, verification_keys)
+                .await
+        }
+
+        async fn decrypt_session_key(
+            &self,
+            data: &[u8],
+            decryption_keys: &[CPrivKey],
+        ) -> std::result::Result<SessionKey, CryptoError> {
+            FakeCrypto.decrypt_session_key(data, decryption_keys).await
+        }
+
+        async fn encrypt_session_key(
+            &self,
+            session_key: &SessionKey,
+            encryption_keys: &[CPubKey],
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_session_key(session_key, encryption_keys)
+                .await
+        }
+
+        async fn encrypt_session_key_with_password(
+            &self,
+            session_key: &SessionKey,
+            password: &str,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto
+                .encrypt_session_key_with_password(session_key, password)
+                .await
+        }
+
+        async fn generate_session_key(
+            &self,
+            encryption_keys: &[CPubKey],
+            opts: EncryptOptions,
+        ) -> std::result::Result<SessionKey, CryptoError> {
+            FakeCrypto.generate_session_key(encryption_keys, opts).await
+        }
+
+        async fn generate_key(
+            &self,
+            passphrase: &str,
+            opts: EncryptOptions,
+        ) -> std::result::Result<(CPrivKey, String), CryptoError> {
+            FakeCrypto.generate_key(passphrase, opts).await
+        }
+
+        async fn sign(
+            &self,
+            data: &[u8],
+            signing_key: &CPrivKey,
+            context: &str,
+        ) -> std::result::Result<Vec<u8>, CryptoError> {
+            FakeCrypto.sign(data, signing_key, context).await
+        }
+
+        async fn verify(
+            &self,
+            data: &[u8],
+            signature: &[u8],
+            verification_keys: &[CPubKey],
+        ) -> std::result::Result<VerificationStatus, CryptoError> {
+            FakeCrypto.verify(data, signature, verification_keys).await
+        }
+
+        async fn public_key(&self, key: &CPrivKey) -> std::result::Result<CPubKey, CryptoError> {
+            FakeCrypto.public_key(key).await
+        }
+
+        async fn public_key_from_armored(
+            &self,
+            armored: &str,
+        ) -> std::result::Result<CPubKey, CryptoError> {
+            FakeCrypto.public_key_from_armored(armored).await
+        }
+    }
+
+    // ── Recording telemetry: captures every emitted metric for assertions ────
+
+    struct RecordingTelemetry {
+        events: Mutex<Vec<MetricEvent>>,
+    }
+
+    impl RecordingTelemetry {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<MetricEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Telemetry for RecordingTelemetry {
+        async fn emit(&self, event: MetricEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     // ── Fake account ──────────────────────────────────────────────────────────
 
     struct FakeAccount;
@@ -1654,6 +1953,7 @@ mod tests {
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
             },
+            telemetry: None,
         };
 
         let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
@@ -1823,10 +2123,22 @@ mod tests {
         expected_size: u64,
         expected_sha1_hex: Option<String>,
     ) -> ProtonFileUploader {
+        make_test_uploader_with_crypto(http, Arc::new(FakeCrypto), expected_size, expected_sha1_hex)
+    }
+
+    /// Like `make_test_uploader`, but with an injectable crypto backend and
+    /// no telemetry sink wired up (callers that need to observe emitted
+    /// metrics build a `ProtonFileUploader` directly instead).
+    fn make_test_uploader_with_crypto(
+        http: Arc<FakeHttpClient>,
+        openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto>,
+        expected_size: u64,
+        expected_sha1_hex: Option<String>,
+    ) -> ProtonFileUploader {
         use crate::nodes::make_node_uid;
         ProtonFileUploader {
             http,
-            openpgp: Arc::new(FakeCrypto),
+            openpgp,
             account: Arc::new(FakeAccount),
             parent: make_node_uid("share-abc", "root-link"),
             name: "test-file.txt".into(),
@@ -1838,6 +2150,7 @@ mod tests {
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
             },
+            telemetry: None,
         }
     }
 
@@ -2047,5 +2360,126 @@ mod tests {
             "server returned 0 upload links but 1 blocks were requested".into(),
         );
         assert!(matches!(e, Error::ProtocolViolation(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // js/v0.16.0 "Retry block encryption and report metric"
+    // (`client/js/src/internal/upload/streamUploader.ts:315-354`,
+    // `client/js/src/internal/upload/telemetry.ts:29-41`).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn block_encryption_retries_once_on_self_verify_failure_then_succeeds() {
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (200, b"{}".to_vec()), // block PUT succeeds
+            (200, commit_bytes),
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let telemetry = Arc::new(RecordingTelemetry::new());
+        // Fails the block self-verification exactly once (well within
+        // MAX_BLOCK_ENCRYPTION_RETRIES=1), so the single retry should
+        // resolve it and the upload should still succeed.
+        let openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto> =
+            Arc::new(FlakyVerifyCrypto::new(1, content));
+
+        let mut uploader =
+            make_test_uploader_with_crypto(http.clone(), openpgp, content.len() as u64, None);
+        uploader.telemetry = Some(telemetry.clone() as Arc<dyn Telemetry>);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            result.is_ok(),
+            "upload should succeed once the single retry resolves the integrity failure: {:?}",
+            result.err()
+        );
+
+        let events = telemetry.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one BlockVerificationError metric, got {events:?}"
+        );
+        match &events[0] {
+            MetricEvent::BlockVerificationError { retry_helped, .. } => {
+                assert!(
+                    *retry_helped,
+                    "retry_helped should be true when the retry resolved the failure"
+                );
+            }
+            other => panic!("expected BlockVerificationError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_encryption_exhausts_retry_budget_then_fails_and_reports_metric() {
+        // The crypto failure is fatal before any block-upload HTTP call, so
+        // the mock client only needs responses through the verification-code
+        // fetch, plus one for the best-effort draft-cleanup call the failure
+        // triggers.
+        let (share_bytes, link_bytes, create_file_bytes, verification_bytes) =
+            common_upload_responses();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, share_bytes),
+            (200, link_bytes),
+            (200, create_file_bytes),
+            (200, verification_bytes),
+            (200, delete_draft_ok_response()), // best-effort delete_draft
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let telemetry = Arc::new(RecordingTelemetry::new());
+        // Never succeeds: exhausts the encrypt-then-self-verify retry budget
+        // (1 initial attempt + MAX_BLOCK_ENCRYPTION_RETRIES=1 retry = 2 total).
+        let openpgp: Arc<dyn proton_drive_crypto::OpenPgpCrypto> =
+            Arc::new(FlakyVerifyCrypto::new(usize::MAX, content));
+
+        let mut uploader =
+            make_test_uploader_with_crypto(http.clone(), openpgp, content.len() as u64, None);
+        uploader.telemetry = Some(telemetry.clone() as Arc<dyn Telemetry>);
+
+        let (progress_tx, _progress_rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            matches!(result, Err(Error::Integrity(_))),
+            "expected a fatal Integrity error once the retry budget is exhausted, got {:?}",
+            result.err()
+        );
+
+        let events = telemetry.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one BlockVerificationError metric, got {events:?}"
+        );
+        match &events[0] {
+            MetricEvent::BlockVerificationError { retry_helped, .. } => {
+                assert!(
+                    !*retry_helped,
+                    "retry_helped should be false when every attempt failed"
+                );
+            }
+            other => panic!("expected BlockVerificationError, got {other:?}"),
+        }
     }
 }

@@ -2,7 +2,12 @@
 //!
 //! Implements the operational requirements from `README.md`:
 //! - `x-pm-appversion` injected on every request
-//! - retry transient failures with exponential backoff + jitter
+//! - retry `5xx` responses with exponential backoff + jitter
+//! - retry connection-level network errors and request timeouts with their
+//!   own bounded attempt counts and fixed delays, matching the JS
+//!   reference's `MAX_NETWORK_ERROR_RETRY_ATTEMPTS` /
+//!   `MAX_TIMEOUT_ERROR_RETRY_ATTEMPTS` split (jitter is layered on top of
+//!   the matched delay; see `send_with_retry`)
 //! - retry `429` responses, honouring `Retry-After`, up to a bounded budget
 //!   before surfacing `Error::RateLimited` (mirrors the JS reference's
 //!   transparent-retry rate-limit handling; see `send_with_retry`)
@@ -64,6 +69,33 @@ const DEFAULT_429_RETRY_DELAY_SECS: u64 = 10;
 /// operation on the first one.
 const MAX_RATE_LIMIT_ATTEMPTS: u32 = 5;
 
+/// Bounded number of retry attempts for a connection-level *network* error
+/// (DNS failure, connection refused/reset -- reqwest's `is_connect()`).
+/// Matches the JS reference's `MAX_NETWORK_ERROR_RETRY_ATTEMPTS`
+/// (reference/client/js/src/internal/apiService/apiService.ts:30). js/v0.15.2
+/// ("Retry network errors more times and with bigger delay",
+/// `reference/client/js/CHANGELOG.md`) bumped both this count and
+/// [`NETWORK_ERROR_RETRY_DELAY_SECS`] upstream; wp2 vendored v0.15.2 but never
+/// ported the change -- this aligns with the *current* (v0.19-pinned) values.
+const NETWORK_ERROR_MAX_ATTEMPTS: u32 = 3;
+
+/// Fixed delay (seconds) between network-error retries. Matches the JS
+/// reference's `NETWORK_ERROR_RETRY_DELAY_SECONDS`
+/// (reference/client/js/src/internal/apiService/apiService.ts:67,333-336).
+const NETWORK_ERROR_RETRY_DELAY_SECS: u64 = 5;
+
+/// Bounded number of retry attempts for a request *timeout* specifically
+/// (reqwest's `is_timeout()`), distinct upstream from a network/connect
+/// failure. Matches the JS reference's `MAX_TIMEOUT_ERROR_RETRY_ATTEMPTS`
+/// (reference/client/js/src/internal/apiService/apiService.ts:25).
+const TIMEOUT_ERROR_MAX_ATTEMPTS: u32 = 3;
+
+/// Fixed delay (seconds) between request-timeout retries. Matches the JS
+/// reference's `SERVER_ERROR_RETRY_DELAY_SECONDS`, which is reused for
+/// `TimeoutError` retries
+/// (reference/client/js/src/internal/apiService/apiService.ts:62,327-329).
+const TIMEOUT_ERROR_RETRY_DELAY_SECS: u64 = 1;
+
 // ---------------------------------------------------------------------------
 // ReqwestHttpClient -- bare transport layer, no auth injection
 // ---------------------------------------------------------------------------
@@ -73,6 +105,13 @@ pub struct ReqwestHttpClient {
     app_version: String,
     client: Client,
     max_attempts: u32,
+    /// Defaults to [`NETWORK_ERROR_RETRY_DELAY_SECS`] * 1000; only ever
+    /// overridden by tests (via [`Self::with_test_delays_ms`]) so retry-count
+    /// behaviour can be asserted without a real multi-second wait.
+    network_error_delay_ms: u64,
+    /// Defaults to [`TIMEOUT_ERROR_RETRY_DELAY_SECS`] * 1000; see
+    /// `network_error_delay_ms`.
+    timeout_error_delay_ms: u64,
 }
 
 impl ReqwestHttpClient {
@@ -88,7 +127,40 @@ impl ReqwestHttpClient {
             app_version: app_version.into(),
             client,
             max_attempts: 5,
+            network_error_delay_ms: NETWORK_ERROR_RETRY_DELAY_SECS * 1000,
+            timeout_error_delay_ms: TIMEOUT_ERROR_RETRY_DELAY_SECS * 1000,
         })
+    }
+
+    /// Test-only seam: shrink the network/timeout-error retry delays from
+    /// several seconds down to a few milliseconds so retry-COUNT behaviour
+    /// (as opposed to the delay duration itself, which is a one-line constant
+    /// change reviewed against `reference/client/js`) can be asserted quickly
+    /// and deterministically.
+    #[cfg(test)]
+    fn with_test_delays_ms(mut self, network_ms: u64, timeout_ms: u64) -> Self {
+        self.network_error_delay_ms = network_ms;
+        self.timeout_error_delay_ms = timeout_ms;
+        self
+    }
+
+    /// Test-only seam: rebuild the inner `reqwest::Client` with a much
+    /// shorter overall request timeout, so a server that never responds
+    /// triggers `is_timeout()` in milliseconds instead of the production
+    /// 60s. Falls back to leaving the existing client untouched if the
+    /// builder somehow fails (it never has in practice for a timeout-only
+    /// change) rather than panicking in test code.
+    #[cfg(test)]
+    fn with_test_request_timeout_ms(mut self, ms: u64) -> Self {
+        if let Ok(c) = Client::builder()
+            .timeout(Duration::from_millis(ms))
+            .pool_max_idle_per_host(8)
+            .user_agent("pdtui/0.0.1")
+            .build()
+        {
+            self.client = c;
+        }
+        self
     }
 
     fn method(m: HttpMethod) -> reqwest::Method {
@@ -108,6 +180,8 @@ impl ReqwestHttpClient {
         let mut delay_ms: u64 = 250;
         let mut rate_limit_attempts: u32 = 0;
         let mut attempt: u32 = 1;
+        let mut network_error_attempts: u32 = 0;
+        let mut timeout_error_attempts: u32 = 0;
         loop {
             let req = build()
                 .header("x-pm-appversion", &self.app_version)
@@ -153,16 +227,54 @@ impl ReqwestHttpClient {
                         body: bytes,
                     });
                 }
-                Err(e) if e.is_timeout() || e.is_connect() => {
-                    if attempt >= self.max_attempts {
+                // The JS reference distinguishes a connection-level "network
+                // error" (`isNetworkError` -- DNS failure, connection
+                // refused/reset) from a request `TimeoutError`, retrying each
+                // with its own bounded attempt count and fixed delay rather
+                // than the 5xx path's shared exponential-backoff budget
+                // (apiService.ts:23-30,62,67,327-336). reqwest's
+                // `is_connect()`/`is_timeout()` map onto that same split, so
+                // mirror it here instead of folding both into
+                // `self.max_attempts`.
+                Err(e) if e.is_connect() => {
+                    // `network_error_attempts` is 0-based (retries issued so
+                    // far), mirroring JS's `attempt`: retry while
+                    // `attempt + 1 < MAX_NETWORK_ERROR_RETRY_ATTEMPTS`, i.e.
+                    // while fewer than `NETWORK_ERROR_MAX_ATTEMPTS` total
+                    // attempts have been made (apiService.ts:333-336).
+                    if network_error_attempts + 1 < NETWORK_ERROR_MAX_ATTEMPTS {
+                        network_error_attempts += 1;
+                        warn!(
+                            attempt = network_error_attempts,
+                            error = %e,
+                            "network error; retrying"
+                        );
+                        Self::sleep_with_jitter(self.network_error_delay_ms).await;
+                    } else {
                         return Err(Error::Network(format!(
-                            "transport error after {attempt} attempts: {e}"
+                            "network error after {} attempts: {e}",
+                            network_error_attempts + 1
                         )));
                     }
-                    debug!(attempt, error = %e, "transient transport error; retrying");
-                    Self::sleep_with_jitter(delay_ms).await;
-                    delay_ms = (delay_ms * 2).min(8_000);
-                    attempt += 1;
+                }
+                Err(e) if e.is_timeout() => {
+                    // Same 0-based counting as above, mirroring JS's
+                    // `attempt + 1 < MAX_TIMEOUT_ERROR_RETRY_ATTEMPTS`
+                    // (apiService.ts:327-330).
+                    if timeout_error_attempts + 1 < TIMEOUT_ERROR_MAX_ATTEMPTS {
+                        timeout_error_attempts += 1;
+                        debug!(
+                            attempt = timeout_error_attempts,
+                            error = %e,
+                            "timeout error; retrying"
+                        );
+                        Self::sleep_with_jitter(self.timeout_error_delay_ms).await;
+                    } else {
+                        return Err(Error::Network(format!(
+                            "timeout error after {} attempts: {e}",
+                            timeout_error_attempts + 1
+                        )));
+                    }
                 }
                 Err(e) => {
                     // The JS reference retries once on *any* other exception
@@ -809,6 +921,110 @@ mod tests {
             server.call_count(),
             1,
             "a 4xx must not trigger any retry attempts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Network-error / timeout-error retry alignment (js/v0.15.2 "Retry
+    // network errors more times and with bigger delay",
+    // `reference/client/js/CHANGELOG.md`; constants verified against the
+    // current v0.19 pin in `apiService.ts`). Delays are overridden to a few
+    // milliseconds via `with_test_delays_ms` so the attempt COUNT can be
+    // asserted without a real multi-second wait.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn network_and_timeout_retry_constants_match_js_reference() {
+        // reference/client/js/src/internal/apiService/apiService.ts:25,30,62,67
+        assert_eq!(NETWORK_ERROR_MAX_ATTEMPTS, 3);
+        assert_eq!(NETWORK_ERROR_RETRY_DELAY_SECS, 5);
+        assert_eq!(TIMEOUT_ERROR_MAX_ATTEMPTS, 3);
+        assert_eq!(TIMEOUT_ERROR_RETRY_DELAY_SECS, 1);
+    }
+
+    #[tokio::test]
+    async fn network_error_exhausts_retry_budget_then_fails() {
+        // Bind to grab a free loopback port, then drop the listener
+        // immediately: nothing is listening on the port, so connecting to it
+        // fails at the TCP layer (connection refused), which reqwest
+        // surfaces via `is_connect()`.
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind throwaway listener");
+            listener.local_addr().expect("listener local addr")
+        };
+
+        let client = ReqwestHttpClient::new(format!("http://{addr}"), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient")
+            .with_test_delays_ms(1, 1);
+
+        let start = Instant::now();
+        let err = client
+            .request_json(get_request())
+            .await
+            .expect_err("connection-refused should exhaust the network-error retry budget");
+        let elapsed = start.elapsed();
+
+        match err {
+            Error::Network(msg) => assert!(
+                msg.contains("network error after 3 attempts"),
+                "expected exactly NETWORK_ERROR_MAX_ATTEMPTS (3) attempts, got: {msg}"
+            ),
+            other => panic!("expected Error::Network, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "elapsed {elapsed:?} suggests the real (multi-second) retry delay leaked through instead of the test override"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_error_exhausts_retry_budget_then_fails() {
+        // Server accepts every connection but never writes a response, so
+        // every attempt hits the client's own request timeout (`is_timeout()`).
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf).await; // drain, never respond
+                    // Hold the connection open past the client's own timeout
+                    // instead of closing it, so the failure is a genuine
+                    // request timeout rather than a reset/EOF.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                });
+            }
+        });
+
+        let client = ReqwestHttpClient::new(format!("http://{addr}"), "test@0.0.0-stable")
+            .expect("build ReqwestHttpClient")
+            .with_test_delays_ms(1, 1)
+            .with_test_request_timeout_ms(50);
+
+        let start = Instant::now();
+        let err = client
+            .request_json(get_request())
+            .await
+            .expect_err("a server that never responds should exhaust the timeout retry budget");
+        let elapsed = start.elapsed();
+
+        match err {
+            Error::Network(msg) => assert!(
+                msg.contains("timeout error after 3 attempts"),
+                "expected exactly TIMEOUT_ERROR_MAX_ATTEMPTS (3) attempts, got: {msg}"
+            ),
+            other => panic!("expected Error::Network, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "elapsed {elapsed:?} suggests the real (multi-second) retry delay leaked through instead of the test override"
         );
     }
 }

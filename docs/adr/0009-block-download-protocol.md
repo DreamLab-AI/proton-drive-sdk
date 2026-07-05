@@ -78,6 +78,15 @@ Port `client/js/src/internal/download/` happy path 1:1 into `proton-drive-core::
   `verify_xattr` (`download.rs`) logs a warning and still returns the decrypted
   modification time. Only a **missing** ManifestSignature is a hard abort; a
   size/SHA1/ModificationTime XAttr disagreement never is.
+- **Update 2026-07-05 (wp/c2-resilience, cs/v0.15.0 alignment):** the
+  "claimed size only for progress reporting" use noted just above is now
+  itself ported — `FileDownloader::claimed_size()` decrypts the XAttr
+  independently (a single extra revision-page fetch) and returns
+  `Common.Size`, which `pdtui`'s transfer layer uses as the download's
+  progress-gauge total, mirroring the C# SDK's `RevisionOperations.
+  GetClaimedSizeAsync`/`DownloadState.ClaimedSize`. This is *not* the
+  size/SHA1 cross-check described above (still non-fatal, unchanged) — it's
+  a separate, best-effort read of the same field for UI purposes only.
 
 ## What is NOT ported
 
