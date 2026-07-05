@@ -306,6 +306,18 @@ pub mod nodes {
     pub struct GetChildrenResponse {
         pub links: Vec<Link>,
         /// Non-zero means more pages exist; fetch with next `Page` index.
+        ///
+        /// **Not part of the current wire schema.** The vendored OpenAPI spec
+        /// for this deprecated endpoint
+        /// (`get_drive-shares-{shareID}-folders-{linkID}-children` in
+        /// `reference/client/js/src/internal/apiService/driveTypes.ts`)
+        /// defines the response as `{ Code, AllowSorting, Links }` only — no
+        /// `More`/cursor field. This defaults to `0` on every real response,
+        /// so callers must not treat `more == 0` alone as end-of-pagination;
+        /// compare the returned page length against the requested `PageSize`
+        /// instead (see `ProtonDriveClient::fetch_folder_children`). Kept (and
+        /// still read) only for tolerance of a possible future/undocumented
+        /// server-side `More` signal.
         #[serde(default)]
         pub more: u8,
     }
@@ -328,7 +340,10 @@ pub mod nodes {
         /// treats it as `MIMEType || undefined`); only files carry a real type.
         #[serde(rename = "MIMEType", default)]
         pub mime_type: Option<String>,
-        pub state: u8, // 1 = active, 2 = trashed, 3 = deleted
+        // `LinkTransformer.State` (driveTypes.ts): 0 = draft, 1 = active,
+        // 2 = trashed. Not currently branched on by domain conversion (see
+        // `trashed`, a separate nullable timestamp field, for trash status).
+        pub state: u8,
         pub size: u64,
         /// Proton's field is `CreateTime` (not `CreatedTime`); `CreationTime`
         /// is a deprecated alias. Required on link responses.
@@ -352,7 +367,16 @@ pub mod nodes {
         /// Optional on the wire (`ContentKeyPacket?`).
         #[serde(default)]
         pub content_key_packet: Option<String>,
+        /// Optional key on the wire (`ContentKeyPacketSignature?: string` in
+        /// `ExtendedLinkTransformer.FileProperties`,
+        /// `reference/client/js/src/internal/apiService/driveTypes.ts`).
+        /// `Option<T>` fields deserialize a missing key as `None` without
+        /// needing `#[serde(default)]` (serde derive special-cases `Option`),
+        /// so this already tolerates absence.
         pub content_key_packet_signature: Option<String>,
+        /// Optional key on the wire (`ActiveRevision?:`) — absent for files
+        /// with no committed revision (e.g. still-draft uploads surfaced in
+        /// a listing). Same `Option<T>`-absence tolerance as above.
         pub active_revision: Option<Revision>,
     }
 
@@ -370,6 +394,10 @@ pub mod nodes {
     pub struct Revision {
         #[serde(rename = "ID", default)]
         pub id: String,
+        /// `RevisionState` (driveTypes.ts: `0 | 1 | 2`; mirrored client-side
+        /// as `APIRevisionState` in
+        /// `client/js/src/internal/nodes/apiService.ts`): 0 = draft,
+        /// 1 = active, 2 = obsolete/superseded.
         #[serde(default)]
         pub state: u8,
         /// Proton's field is `CreateTime`; optional within `ActiveRevision`.
@@ -377,7 +405,12 @@ pub mod nodes {
         pub created_time: i64,
         #[serde(default)]
         pub size: u64,
+        /// Optional key on the wire (`ManifestSignature?: string` within
+        /// `ExtendedLinkTransformer.FileProperties.ActiveRevision` in
+        /// driveTypes.ts) — `Option<T>` already tolerates a missing key.
         pub manifest_signature: Option<String>,
+        /// Optional key on the wire (`SignatureEmail?: string`), same
+        /// `Option<T>`-absence tolerance.
         pub signature_email: Option<String>,
     }
 }
@@ -547,15 +580,30 @@ pub mod download {
     pub struct RevisionWithBlocks {
         #[serde(rename = "ID")]
         pub id: String,
-        /// Revision state: 1 = active, 2 = draft, 3 = superseded.
+        /// `RevisionState` (`DetailedRevisionResponseDto.State` in
+        /// driveTypes.ts: `0 | 1 | 2`): 0 = draft, 1 = active,
+        /// 2 = obsolete/superseded.
         pub state: Option<u8>,
         pub blocks: Vec<BlockResponse>,
+        /// Optional key on the wire (`ManifestSignature?: PGPSignature | null`
+        /// in `DetailedRevisionResponseDto`) — absent for draft/uncommitted
+        /// revisions. `Option<T>` fields already deserialize a missing key
+        /// as `None` (serde derive special-cases `Option`), so this
+        /// tolerates absence without needing `#[serde(default)]`.
         pub manifest_signature: Option<String>,
-        /// Armored PKESK packet: wraps the content session key for the node key.
+        /// Armored PKESK packet: wraps the content session key for the node
+        /// key. **Not present at all** on `DetailedRevisionResponseDto` in
+        /// the current vendored OpenAPI spec (content-key material lives on
+        /// the file's `FileProperties` from `GET .../links/{linkID}`
+        /// instead, see `nodes::FileProperties`) — `Option<T>`'s built-in
+        /// missing-key tolerance means this still round-trips regardless.
+        /// download.rs's `FileDownloader` prefers its own cached
+        /// `FileProperties` value and only falls back to this field.
         pub content_key_packet: Option<String>,
         pub content_key_packet_signature: Option<String>,
         /// Encrypted extended attributes (modification time, size, SHA1 digest).
-        /// May be absent for legacy revisions.
+        /// Optional key on the wire (`XAttr?: PGPMessage | null`) — absent for
+        /// legacy/draft revisions.
         pub x_attr: Option<String>,
         /// Email of the address that signed this revision's content.
         pub signature_email: Option<String>,
@@ -726,6 +774,38 @@ mod tests {
         assert_eq!(resp.links[0].r#type, 1);
         assert!(resp.links[0].folder_properties.is_some());
         assert_eq!(resp.more, 0);
+    }
+
+    /// The real wire shape for the deprecated legacy children endpoint
+    /// (`get_drive-shares-{shareID}-folders-{linkID}-children` response in
+    /// `reference/client/js/src/internal/apiService/driveTypes.ts`) is
+    /// `{ Code, AllowSorting, Links }` — there is no `More`/cursor field at
+    /// all (that only exists on the v2 volume-scoped sibling endpoint). This
+    /// must still deserialize (`more` defaulting to `0`); pagination
+    /// continuation must NOT be decided by `more` alone — see
+    /// `ProtonDriveClient::fetch_folder_children` in `proton-drive-core`.
+    #[test]
+    fn deserialize_children_response_without_more_field() {
+        let body = r#"{
+            "Code": 1000,
+            "AllowSorting": true,
+            "Links": [{
+                "LinkID": "l1", "ParentLinkID": "root",
+                "Type": 1, "Name": "encrypted-name", "Hash": "hex",
+                "MIMEType": "Folder", "State": 1, "Size": 0,
+                "CreateTime": 1, "ModifyTime": 2,
+                "NodeKey": "armored", "NodePassphrase": "armored",
+                "NodePassphraseSignature": "armored",
+                "FolderProperties": { "NodeHashKey": "armored" }
+            }]
+        }"#;
+        let resp: nodes::GetChildrenResponse = serde_json::from_str(body)
+            .expect("must parse the real wire shape lacking a More field");
+        assert_eq!(resp.links.len(), 1);
+        assert_eq!(
+            resp.more, 0,
+            "absent More key defaults to 0 — callers must not treat this as authoritative"
+        );
     }
 
     #[test]
