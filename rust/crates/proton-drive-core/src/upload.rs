@@ -808,11 +808,18 @@ impl ProtonFileUploader {
         let address_email = self.account.primary_email().to_owned();
         let address_priv = self.account.address_private_key(&address_email).await?;
 
-        let share_priv = crate::download::decrypt_share_key(
+        // Upload's parent-context resolution doesn't (yet) verify
+        // PassphraseSignature/NodePassphraseSignature — pass no verification
+        // keys, preserving prior (pre-verification) behaviour exactly. See
+        // `ProtonDriveClient::resolve_share_key`/`resolve_node_key_via_chain`
+        // in `client.rs` for the download path's non-fatal verification.
+        let (share_priv, _verified) = crate::download::decrypt_share_key(
             &self.openpgp,
             &share.key,
             &share.passphrase,
+            &share.passphrase_signature,
             &address_priv,
+            &[],
         )
         .await?;
 
@@ -838,11 +845,13 @@ impl ProtonFileUploader {
             env.inner.link
         };
 
-        let parent_node_priv = crate::download::decrypt_node_private_key(
+        let (parent_node_priv, _verified) = crate::download::decrypt_node_private_key(
             &self.openpgp,
             &link.node_key,
             &link.node_passphrase,
+            &link.node_passphrase_signature,
             &share_priv,
+            &[],
         )
         .await?;
 

@@ -21,10 +21,17 @@ use crate::error::{Error, Result};
 use crate::http::{BlobRequest, HttpMethod, JsonRequest, ProtonDriveHttpClient};
 use crate::nodes::NodeUid;
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
-use proton_drive_api::download::{BlockResponse, GetRevisionResponse};
+use proton_drive_api::download::{BlockResponse, GetRevisionResponse, RevisionWithBlocks};
 use proton_drive_api::nodes::GetLinkResponse;
 use proton_drive_api::shares::GetShareResponse;
-use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, VerificationStatus};
+use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey, VerificationStatus};
+
+/// Blocks-per-page for the revision-blocks GET, matching the JS reference's
+/// `BLOCKS_PAGE_SIZE` (`js/sdk/src/internal/download/apiService.ts`). The
+/// server paginates this endpoint; a request without `PageSize`/
+/// `FromBlockIndex` risks a silently truncated `Blocks` array on revisions
+/// with more blocks than a single page.
+const BLOCKS_PAGE_SIZE: u32 = 20;
 
 // ── public types ──────────────────────────────────────────────────────────────
 
@@ -83,6 +90,19 @@ pub struct FileDownloader {
     /// wrapping the content session key to the node key). The revision endpoint
     /// does not return it — it lives on the node, like JS `base64ContentKeyPacket`.
     pub(crate) content_key_packet: Option<String>,
+    /// Armored detached signature over the ContentKeyPacket's decrypted
+    /// session key, from the file link's `FileProperties` (falls back to the
+    /// revision's own field if the link doesn't carry one — same fallback
+    /// shape as `content_key_packet`). `None` when absent (legacy nodes).
+    pub(crate) content_key_packet_signature: Option<String>,
+    /// Verification keys for the ContentKeyPacketSignature: JS
+    /// `decryptContentKeyPacket` verifies against `[nodeKey, ...
+    /// keyVerificationKeys]`, where `keyVerificationKeys` comes from the
+    /// node's own `SignatureEmail` (`Link.signature_email`) — which can differ
+    /// from the revision's signer. The node's own key is added automatically
+    /// in `download_to_writer`; this field carries only the resolved address
+    /// key set (empty when the node has no signer address).
+    pub(crate) content_key_verification_pubs: Vec<proton_drive_crypto::PublicKey>,
 }
 
 impl FileDownloader {
@@ -100,8 +120,9 @@ impl FileDownloader {
     /// caller already received.
     ///
     /// Steps:
-    /// 1. `GET .../revisions/{id}` — fetch blocks + manifest + content key
-    /// 2. Decrypt content session key from `ContentKeyPacket`
+    /// 1. `GET .../revisions/{id}` — fetch blocks (paginated) + manifest + content key
+    /// 2. Decrypt content session key from `ContentKeyPacket`, non-fatally
+    ///    verifying `ContentKeyPacketSignature`
     /// 3. For each block: fetch → SHA-256 hash check → decrypt → write
     /// 4. Verify manifest signature (over the block hashes) → `signature_verified`
     /// 5. XAttr cross-check (size + SHA1); missing XAttr is warned, not fatal
@@ -109,8 +130,15 @@ impl FileDownloader {
         self,
         mut writer: impl AsyncWrite + Unpin + Send,
     ) -> Result<DownloadStats> {
-        // ── Step 1: fetch revision ───────────────────────────────────────────
-        let revision = self.fetch_revision().await?;
+        // ── Step 1: fetch revision, paginating the Blocks array ──────────────
+        // Mirrors JS `iterateRevisionBlocks`: the endpoint is paginated by
+        // `PageSize`/`FromBlockIndex`, and the server may cap `Blocks` per
+        // response even when those params are omitted — a single unpaginated
+        // GET risks silently truncating revisions with more blocks than one
+        // page. The first page carries the top-level fields (manifest
+        // signature, content key packet, XAttr); JS only reads those from the
+        // first page too, since they are constant across pages.
+        let mut revision = self.fetch_revision_page(1).await?;
 
         if revision.blocks.is_empty() {
             // Server guarantees active revisions have at least one block.
@@ -118,6 +146,29 @@ impl FileDownloader {
                 "protocol violation: active revision has no blocks".into(),
             ));
         }
+
+        let mut all_blocks = std::mem::take(&mut revision.blocks);
+        // `all_blocks` is non-empty here (checked above), so `.last()` always
+        // succeeds; the fallback is unreachable defensive code.
+        let mut from_block_index = all_blocks.last().map(|b| b.index + 1).unwrap_or(1);
+
+        loop {
+            // JS keeps requesting the next page as long as the previous page
+            // returned at least one block — even a short final page (fewer
+            // than PageSize) — stopping only once a page returns zero blocks.
+            let page = self.fetch_revision_page(from_block_index).await?;
+            if page.blocks.is_empty() {
+                break;
+            }
+            from_block_index = page
+                .blocks
+                .last()
+                .map(|b| b.index + 1)
+                .unwrap_or(from_block_index + 1);
+            all_blocks.extend(page.blocks);
+        }
+
+        revision.blocks = all_blocks;
 
         // A *missing* manifest signature means there is no integrity guarantee
         // at all — abort before any block is fetched or decrypted (no plaintext
@@ -153,11 +204,61 @@ impl FileDownloader {
             .await
             .map_err(|e| Error::Decryption(format!("content session key: {e}")))?;
 
-        // ContentKeyPacketSignature is intentionally not verified here. JS
-        // `getContentKeyPacketSessionKey` decrypts with empty verification keys
-        // (`decryptAndVerifySessionKey(..., nodeKey, [])`); download integrity is
-        // guaranteed by the manifest signature and the SHA-256 ciphertext hash
-        // checks below.
+        // ContentKeyPacketSignature: verified non-fatally against
+        // `[node_key, ...address_keys]`, mirroring JS `decryptContentKeyPacket`
+        // -> `decryptAndVerifySessionKey(base64ContentKeyPacket,
+        // armoredContentKeyPacketSignature, key, [key, ...keyVerificationKeys])`
+        // (`reference/js/sdk/src/internal/nodes/cryptoService.ts:517-534`). The
+        // signature covers the *decrypted session key bytes*, not the
+        // ciphertext packet. A present-but-invalid or missing signature never
+        // aborts the download — like JS's non-fatal `contentKeyPacketAuthor`,
+        // this only degrades an authorship claim; the manifest signature
+        // (Step 4) and per-block SHA-256 hash checks (Step 3) remain the
+        // fatal integrity/authenticity gates.
+        let content_key_packet_signature = self
+            .content_key_packet_signature
+            .as_deref()
+            .or(revision.content_key_packet_signature.as_deref());
+        if let Some(ckp_sig_armored) = content_key_packet_signature {
+            let node_pub = self.crypto.public_key(&self.node_private_key).await?;
+            let mut verification_keys =
+                Vec::with_capacity(1 + self.content_key_verification_pubs.len());
+            verification_keys.push(node_pub);
+            verification_keys.extend(self.content_key_verification_pubs.iter().cloned());
+
+            let sig_bytes = base64::engine::general_purpose::STANDARD
+                .decode(ckp_sig_armored)
+                .unwrap_or_else(|_| ckp_sig_armored.as_bytes().to_vec());
+
+            match self
+                .crypto
+                .verify(&session_key.data, &sig_bytes, &verification_keys)
+                .await
+            {
+                Ok(VerificationStatus::Ok) => {}
+                Ok(other) => {
+                    tracing::warn!(
+                        node = %self.node_uid.node_id,
+                        status = ?other,
+                        "ContentKeyPacketSignature present but unverifiable — content key \
+                         still used (non-fatal, mirrors JS contentKeyPacketAuthor)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        node = %self.node_uid.node_id,
+                        "ContentKeyPacketSignature verify error: {e} — treated as \
+                         unverified (non-fatal)"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                node = %self.node_uid.node_id,
+                "no ContentKeyPacketSignature present — skipping content-key \
+                 authorship check (legacy node)"
+            );
+        }
 
         let mut sorted_blocks = revision.blocks.clone();
         sorted_blocks.sort_by_key(|b| b.index);
@@ -211,9 +312,43 @@ impl FileDownloader {
         })
     }
 
+    /// Execute the full download protocol writing decrypted plaintext to a
+    /// file at `path`. Convenience wrapper over [`Self::download_to_writer`]
+    /// that owns the destination file's lifecycle: it creates/truncates
+    /// `path`, and on *any* failure from the protocol (bad block, missing or
+    /// unverifiable manifest signature check, network error, …) removes the
+    /// file it just opened, so a failed download never leaves a truncated,
+    /// same-named file masquerading as a complete one at the caller's
+    /// destination (B6). Only the file this call itself
+    /// created/truncated is ever touched — a caller whose own setup fails
+    /// before reaching this method (e.g. `file_downloader` construction)
+    /// never had `path` opened in the first place, so nothing here runs.
+    pub async fn download_to_path(self, path: &std::path::Path) -> Result<DownloadStats> {
+        let file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| Error::Internal(format!("create {}: {e}", path.display())))?;
+
+        match self.download_to_writer(file).await {
+            Ok(stats) => Ok(stats),
+            Err(err) => {
+                if let Err(remove_err) = tokio::fs::remove_file(path).await {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to remove partial download after error: {remove_err}"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    async fn fetch_revision(&self) -> Result<proton_drive_api::download::RevisionWithBlocks> {
+    /// Fetch one page of the revision's blocks, starting at `from_block_index`
+    /// (1-based). Mirrors JS `iterateRevisionBlocks`'s
+    /// `?PageSize=20&FromBlockIndex=N` query — the endpoint is paginated, and
+    /// omitting these params risks the server silently capping `Blocks`.
+    async fn fetch_revision_page(&self, from_block_index: u32) -> Result<RevisionWithBlocks> {
         // GET drive/v2/volumes/{VolumeID}/files/{linkID}/revisions/{revisionID}
         let path = format!(
             "/drive/v2/volumes/{}/files/{}/revisions/{}",
@@ -222,7 +357,10 @@ impl FileDownloader {
         let req = JsonRequest {
             method: HttpMethod::Get,
             path,
-            query: vec![],
+            query: vec![
+                ("PageSize".to_owned(), BLOCKS_PAGE_SIZE.to_string()),
+                ("FromBlockIndex".to_owned(), from_block_index.to_string()),
+            ],
             headers: vec![],
             body: None,
         };
@@ -352,6 +490,14 @@ impl FileDownloader {
         // issue on the blocks should be considered serious integrity issue").
         // Authenticity is established by the manifest signature; the SHA-256
         // hash check above guards data integrity.
+        //
+        // `block.encrypted_signature` (`EncSignature` on the wire, a per-block
+        // detached signature) is deliberately never read here — this is
+        // JS-faithful, not an oversight: the JS reference has no code path
+        // that decrypts or verifies it either (only the manifest signature
+        // over the block hashes, checked in `verify_manifest`, establishes
+        // per-revision authenticity). It is only ever fetched because the
+        // wire response includes it.
         let (plaintext, _sig_status) = self
             .crypto
             .decrypt_and_verify(&ciphertext, session_key, &[])
@@ -555,6 +701,39 @@ pub async fn resolve_active_revision(
     Ok((revision_id, signature_email))
 }
 
+/// Verify a detached signature over already-decrypted plaintext, non-fatally.
+/// Never returns `Err` for a verification failure — only for a hard crypto
+/// error, which is itself downgraded to a logged, unverified result here so
+/// callers (node/share passphrase unlock) never abort key derivation over a
+/// signature problem. Mirrors JS's non-fatal `verified`/`verificationErrors`
+/// handling (e.g. `driveCrypto.decryptKey`, which "doesn't throw in case of
+/// verification issue").
+///
+/// `armored_signature` empty means "no signature was supplied at all", which
+/// JS treats as a verification error too (`decryptArmoredAndVerifyDetached`:
+/// "Signature is missing") rather than skipping the check outright.
+async fn verify_detached_non_fatal(
+    crypto: &Arc<dyn OpenPgpCrypto>,
+    data: &[u8],
+    armored_signature: &str,
+    verification_keys: &[PublicKey],
+) -> VerificationStatus {
+    if armored_signature.trim().is_empty() {
+        return VerificationStatus::NoSignature;
+    }
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(armored_signature)
+        .unwrap_or_else(|_| armored_signature.as_bytes().to_vec());
+
+    match crypto.verify(data, &sig_bytes, verification_keys).await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!("passphrase signature verify error: {e} — treated as unverified");
+            VerificationStatus::SignatureInvalid
+        }
+    }
+}
+
 /// Full node key decryption: decrypt passphrase from NodePassphrase, then
 /// unlock the NodeKey armored private key with that passphrase.
 ///
@@ -562,12 +741,26 @@ pub async fn resolve_active_revision(
 /// share root node, or the parent **node** key for any nested node. Callers
 /// walk the parent chain (see `ProtonDriveClient::resolve_node_key_via_chain`)
 /// to assemble the right `parent_key` for nested nodes.
+///
+/// `node_passphrase_signature_armored` (`NodePassphraseSignature` on the wire)
+/// is verified against `verification_keys` — the signer address's public keys
+/// when the node has a `SignatureEmail`, else the caller's parent-key
+/// fallback (JS `decryptNode`'s `keyVerificationKeys`) — non-fatally, exactly
+/// like JS `cryptoService.decryptKey` ->
+/// `driveCrypto.decryptKey(armoredKey, armoredNodePassphrase,
+/// armoredNodePassphraseSignature, [parentKey], verificationKeys)`
+/// (`reference/js/sdk/src/internal/nodes/cryptoService.ts:307-338`): a
+/// present-but-invalid or missing signature never aborts key derivation, it
+/// is only surfaced as an authorship result via the returned
+/// [`VerificationStatus`] (mirrors JS's non-fatal `keyAuthor`).
 pub async fn decrypt_node_private_key(
     crypto: &Arc<dyn OpenPgpCrypto>,
     node_key_armored: &str,
     node_passphrase_encrypted_b64: &str,
+    node_passphrase_signature_armored: &str,
     parent_key: &PrivateKey,
-) -> Result<PrivateKey> {
+    verification_keys: &[PublicKey],
+) -> Result<(PrivateKey, VerificationStatus)> {
     // Decrypt the node passphrase by using parent key to unwrap PKESK.
     // NodePassphrase is an armored PGPMessage on the wire; older callers may
     // pass base64-encoded binary. Try base64 first, else use the raw bytes —
@@ -581,6 +774,12 @@ pub async fn decrypt_node_private_key(
         .await
         .map_err(|e| Error::Decryption(format!("node passphrase session key: {e}")))?;
 
+    // NodePassphrase itself carries no embedded signature — NodePassphraseSignature
+    // is a separate *detached* signature (a distinct wire field), so the
+    // decrypt here uses no verification keys; the detached signature is
+    // checked separately below (mirrors JS's `decryptArmoredAndVerifyDetached`
+    // split between decrypting `armoredPassphrase` and verifying
+    // `armoredPassphraseSignature` against the resulting plaintext).
     let (passphrase_bytes, _) = crypto
         .decrypt_and_verify(&ckp_bytes, &passphrase_session_key, &[])
         .await
@@ -588,6 +787,15 @@ pub async fn decrypt_node_private_key(
 
     // Secret material: wipe the heap buffer on drop (ADR-0011).
     let passphrase = Zeroizing::new(passphrase_bytes);
+
+    let verified = verify_detached_non_fatal(
+        crypto,
+        &passphrase,
+        node_passphrase_signature_armored,
+        verification_keys,
+    )
+    .await;
+
     let passphrase_str = std::str::from_utf8(&passphrase)
         .map_err(|e| Error::Internal(format!("passphrase utf-8: {e}")))?;
 
@@ -596,16 +804,26 @@ pub async fn decrypt_node_private_key(
         .await
         .map_err(|e| Error::Decryption(format!("node key unlock: {e}")))?;
 
-    Ok(node_priv)
+    Ok((node_priv, verified))
 }
 
 /// Decrypt the share key using the user's address private key.
+///
+/// `share_passphrase_signature_armored` (`PassphraseSignature` on the wire) is
+/// verified non-fatally against `verification_keys` (the share creator's
+/// address public keys), mirroring JS `SharesCryptoService.decryptRootShare`
+/// -> `driveCrypto.decryptKey(..., addressPublicKeys)`
+/// (`reference/js/sdk/src/internal/shares/cryptoService.ts:75-103`): a
+/// present-but-invalid or missing signature never aborts share-key
+/// derivation, only degrades the returned [`VerificationStatus`].
 pub async fn decrypt_share_key(
     crypto: &Arc<dyn OpenPgpCrypto>,
     share_key_armored: &str,
     share_passphrase_encrypted_b64: &str,
+    share_passphrase_signature_armored: &str,
     address_key: &PrivateKey,
-) -> Result<PrivateKey> {
+    verification_keys: &[PublicKey],
+) -> Result<(PrivateKey, VerificationStatus)> {
     // Share Passphrase is an armored PGPMessage on the wire; older callers may
     // pass base64-encoded binary. Try base64 first, else use the raw bytes.
     let pp_bytes = base64::engine::general_purpose::STANDARD
@@ -617,6 +835,9 @@ pub async fn decrypt_share_key(
         .await
         .map_err(|e| Error::Decryption(format!("share passphrase session key: {e}")))?;
 
+    // Same decrypt/verify split as `decrypt_node_private_key`: the passphrase
+    // message carries no embedded signature; PassphraseSignature is detached
+    // and checked separately below.
     let (pp_bytes_plain, _) = crypto
         .decrypt_and_verify(&pp_bytes, &pp_session_key, &[])
         .await
@@ -624,6 +845,15 @@ pub async fn decrypt_share_key(
 
     // Secret material: wipe the heap buffer on drop (ADR-0011).
     let passphrase = Zeroizing::new(pp_bytes_plain);
+
+    let verified = verify_detached_non_fatal(
+        crypto,
+        &passphrase,
+        share_passphrase_signature_armored,
+        verification_keys,
+    )
+    .await;
+
     let passphrase_str = std::str::from_utf8(&passphrase)
         .map_err(|e| Error::Internal(format!("share passphrase utf-8: {e}")))?;
 
@@ -632,7 +862,7 @@ pub async fn decrypt_share_key(
         .await
         .map_err(|e| Error::Decryption(format!("share key unlock: {e}")))?;
 
-    Ok(share_priv)
+    Ok((share_priv, verified))
 }
 
 /// Decrypt an armored node name with the parent node's private key.
@@ -673,32 +903,56 @@ mod tests {
 
     // ── mock HTTP client for protocol tests ───────────────────────────────────
 
-    /// HTTP responses keyed by path prefix.
+    /// HTTP responses keyed by path prefix. `request_json` serves each key's
+    /// bodies in order across successive matching calls (the last body
+    /// repeats once the list is exhausted), which lets the pagination tests
+    /// simulate distinct pages of the same `revisions/{id}` path; `add`
+    /// registers a single fixed response served on every call, unaffected.
     struct MockHttpClient {
-        /// (path_prefix, response_body)
-        responses: std::collections::HashMap<String, Bytes>,
+        responses: std::collections::HashMap<String, Vec<Bytes>>,
+        calls: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     }
 
     impl MockHttpClient {
         fn new() -> Self {
             Self {
                 responses: Default::default(),
+                calls: Default::default(),
             }
         }
+        /// Register a single fixed response served on every matching call.
         fn add(&mut self, path: impl Into<String>, body: impl Into<Bytes>) {
-            self.responses.insert(path.into(), body.into());
+            self.responses.insert(path.into(), vec![body.into()]);
+        }
+        /// Register a sequence of responses served in order on successive
+        /// calls to the same matching path (used to simulate paginated GETs).
+        fn add_sequence(&mut self, path: impl Into<String>, bodies: Vec<Bytes>) {
+            self.responses.insert(path.into(), bodies);
         }
     }
 
     #[async_trait::async_trait]
     impl ProtonDriveHttpClient for MockHttpClient {
         async fn request_json(&self, req: JsonRequest) -> Result<JsonResponse> {
-            let body = self
+            let Some((key, bodies)) = self
                 .responses
                 .iter()
                 .find(|(k, _)| req.path.contains(k.as_str()))
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| Bytes::from(r#"{"Code":2501,"Error":"not found"}"#.to_owned()));
+            else {
+                return Ok(JsonResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::from(r#"{"Code":2501,"Error":"not found"}"#.to_owned()),
+                });
+            };
+            let mut calls = self.calls.lock().unwrap();
+            let idx = calls.entry(key.clone()).or_insert(0);
+            let body = bodies
+                .get(*idx)
+                .or_else(|| bodies.last())
+                .cloned()
+                .unwrap_or_default();
+            *idx += 1;
             Ok(JsonResponse {
                 status: 200,
                 headers: vec![],
@@ -711,7 +965,7 @@ mod tests {
                 .responses
                 .iter()
                 .find(|(k, _)| req.path.contains(k.as_str()))
-                .map(|(_, v)| v.clone())
+                .and_then(|(_, v)| v.first().cloned())
                 .ok_or_else(|| Error::NotFound(format!("mock: no response for {}", req.path)))?;
             Ok(JsonResponse {
                 status: 200,
@@ -740,6 +994,25 @@ mod tests {
         use sha2::Digest;
         let h = sha2::Sha256::digest(ciphertext);
         base64::engine::general_purpose::STANDARD.encode(h)
+    }
+
+    /// A "no more blocks" continuation page, registered as the *second* mock
+    /// response for `revisions/{id}` so the paginating download loop
+    /// terminates after the first (real) page — mirroring the real server's
+    /// final empty-`Blocks` page. Field values other than `Blocks` are
+    /// irrelevant: `download_to_writer` only reads `revision.blocks` from
+    /// pages after the first.
+    fn empty_continuation_page(revision_id: &str) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": revision_id, "State": null,
+                "Blocks": [],
+                "ManifestSignature": null, "ContentKeyPacket": null,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string()
     }
 
     // ── protocol unit tests ───────────────────────────────────────────────────
@@ -840,7 +1113,13 @@ mod tests {
 
         let block_url_key = "block-1";
         let mut mock = MockHttpClient::new();
-        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
         mock.add(block_url_key, Bytes::from(ciphertext.clone()));
 
         let downloader = FileDownloader {
@@ -857,6 +1136,8 @@ mod tests {
             node_private_key: sign_key,
             signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut output = Vec::new();
@@ -930,7 +1211,13 @@ mod tests {
         .to_string();
 
         let mut mock = MockHttpClient::new();
-        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
         mock.add("cdn/block", Bytes::from(ciphertext));
 
         let downloader = FileDownloader {
@@ -949,6 +1236,8 @@ mod tests {
             // also fails to verify other_key's signature.
             signature_address_pubs: Vec::new(),
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut out = Vec::new();
@@ -1020,7 +1309,13 @@ mod tests {
         .to_string();
 
         let mut mock = MockHttpClient::new();
-        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
         mock.add("cdn/block", Bytes::from(tampered));
 
         let downloader = FileDownloader {
@@ -1036,6 +1331,8 @@ mod tests {
             node_private_key: sign_key,
             signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut out = Vec::new();
@@ -1068,6 +1365,8 @@ mod tests {
             node_private_key: sign_key,
             signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut out = Vec::new();
@@ -1121,7 +1420,13 @@ mod tests {
         .to_string();
 
         let mut mock = MockHttpClient::new();
-        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
         mock.add("cdn/block", Bytes::from(ciphertext));
 
         let downloader = FileDownloader {
@@ -1137,6 +1442,8 @@ mod tests {
             node_private_key: sign_key,
             signature_address_pubs: vec![sign_pub],
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut out = Vec::new();
@@ -1200,7 +1507,13 @@ mod tests {
         .to_string();
 
         let mut mock = MockHttpClient::new();
-        mock.add("revisions/rev-1", Bytes::from(revision_json));
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
         mock.add("cdn/block", Bytes::from(ciphertext));
 
         let downloader = FileDownloader {
@@ -1216,12 +1529,698 @@ mod tests {
             node_private_key: node_key,
             signature_address_pubs: Vec::new(),
             content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
         };
 
         let mut out = Vec::new();
         let stats = downloader.download_to_writer(&mut out).await.unwrap();
         assert_eq!(out, plaintext);
         assert_eq!(stats.blocks, 1);
+    }
+
+    /// A revision whose blocks span multiple pages must be assembled in full,
+    /// not just from the first page. Mirrors JS `iterateRevisionBlocks`: page
+    /// 1 returns blocks 1-2 (simulating a short page), page 2 returns block
+    /// 3, page 3 returns zero blocks (the terminating page).
+    #[tokio::test]
+    async fn download_paginates_across_multiple_block_pages() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let mut plaintexts = Vec::new();
+        let mut ciphertexts = Vec::new();
+        let mut hashes = Vec::new();
+        for i in 0..3u8 {
+            let pt = format!("block-{i}-data").into_bytes();
+            let ct = crypto
+                .encrypt_and_sign(&pt, &session_key, &[], &sign_key, EncryptOptions::default())
+                .await
+                .unwrap();
+            hashes.push(block_hash_b64(&ct));
+            plaintexts.push(pt);
+            ciphertexts.push(ct);
+        }
+
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        // manifest payload = concatenated raw hash bytes across ALL
+        // blocks/pages, in ascending index order.
+        let mut manifest_payload = Vec::new();
+        for h in &hashes {
+            manifest_payload.extend(base64::engine::general_purpose::STANDARD.decode(h).unwrap());
+        }
+        let manifest_sig = crypto.sign(&manifest_payload, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        fn block_json(index: u32, url: &str, hash: &str, size: u64) -> serde_json::Value {
+            serde_json::json!({
+                "Index": index, "BareURL": url, "Token": format!("tok-{index}"),
+                "Hash": hash, "EncryptedSignature": null, "Size": size,
+            })
+        }
+
+        let page1 = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [
+                    block_json(1, "https://cdn/block-1", &hashes[0], ciphertexts[0].len() as u64),
+                    block_json(2, "https://cdn/block-2", &hashes[1], ciphertexts[1].len() as u64),
+                ],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let page2 = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [
+                    block_json(3, "https://cdn/block-3", &hashes[2], ciphertexts[2].len() as u64),
+                ],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let page3 = empty_continuation_page("rev-1");
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![Bytes::from(page1), Bytes::from(page2), Bytes::from(page3)],
+        );
+        mock.add("cdn/block-1", Bytes::from(ciphertexts[0].clone()));
+        mock.add("cdn/block-2", Bytes::from(ciphertexts[1].clone()));
+        mock.add("cdn/block-3", Bytes::from(ciphertexts[2].clone()));
+
+        let downloader = FileDownloader {
+            http: Arc::new(mock),
+            crypto: crypto.clone(),
+            node_uid: NodeUid {
+                volume_id: "v".into(),
+                node_id: "l".into(),
+            },
+            volume_id: "v".into(),
+            share_id: "s".into(),
+            revision_id: "rev-1".into(),
+            node_private_key: sign_key,
+            signature_address_pubs: vec![sign_pub],
+            content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+
+        let expected: Vec<u8> = plaintexts.concat();
+        assert_eq!(
+            out, expected,
+            "blocks from every page must be assembled, in order"
+        );
+        assert_eq!(
+            stats.blocks, 3,
+            "must fetch blocks across all pages, not just the first"
+        );
+        assert!(stats.signature_verified);
+    }
+
+    /// Shared fixture for the mid-stream-failure tests below: a 3-block
+    /// revision where block 2's declared hash doesn't match the (tampered)
+    /// bytes actually served, while blocks 1 and 3 are valid. Returns the
+    /// crypto/http/key material needed to construct a fresh `FileDownloader`
+    /// per test (each is consumed by value by `download_to_writer`/
+    /// `download_to_path`).
+    async fn mid_stream_tampered_fixture() -> (
+        Arc<dyn OpenPgpCrypto>,
+        Arc<dyn ProtonDriveHttpClient>,
+        PrivateKey,
+        Vec<PublicKey>,
+    ) {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto: Arc<dyn OpenPgpCrypto> = Arc::new(crypto);
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let good1 = crypto
+            .encrypt_and_sign(
+                b"block-one-ok",
+                &session_key,
+                &[],
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let good2_real = crypto
+            .encrypt_and_sign(
+                b"block-two-real",
+                &session_key,
+                &[],
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let good3 = crypto
+            .encrypt_and_sign(
+                b"block-three-ok",
+                &session_key,
+                &[],
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let hash1 = block_hash_b64(&good1);
+        // Server declares block 2's hash as the *untampered* ciphertext's
+        // hash, but serves tampered bytes — the fatal ciphertext-integrity
+        // gate (Step 3b) must catch this.
+        let hash2 = block_hash_b64(&good2_real);
+        let hash3 = block_hash_b64(&good3);
+
+        let mut tampered2 = good2_real.clone();
+        tampered2[0] ^= 0xff;
+
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+
+        let mut manifest_payload = Vec::new();
+        for h in [&hash1, &hash2, &hash3] {
+            manifest_payload.extend(base64::engine::general_purpose::STANDARD.decode(h).unwrap());
+        }
+        let manifest_sig = crypto.sign(&manifest_payload, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [
+                    {"Index": 1, "BareURL": "https://cdn/block-1", "Token": "t1",
+                     "Hash": hash1, "EncryptedSignature": null, "Size": good1.len() as u64},
+                    {"Index": 2, "BareURL": "https://cdn/block-2", "Token": "t2",
+                     "Hash": hash2, "EncryptedSignature": null, "Size": tampered2.len() as u64},
+                    {"Index": 3, "BareURL": "https://cdn/block-3", "Token": "t3",
+                     "Hash": hash3, "EncryptedSignature": null, "Size": good3.len() as u64},
+                ],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
+        mock.add("cdn/block-1", Bytes::from(good1));
+        mock.add("cdn/block-2", Bytes::from(tampered2));
+        mock.add("cdn/block-3", Bytes::from(good3));
+
+        let http: Arc<dyn ProtonDriveHttpClient> = Arc::new(mock);
+        (crypto, http, sign_key, vec![sign_pub])
+    }
+
+    fn build_downloader(
+        http: Arc<dyn ProtonDriveHttpClient>,
+        crypto: Arc<dyn OpenPgpCrypto>,
+        node_private_key: PrivateKey,
+        signature_address_pubs: Vec<PublicKey>,
+    ) -> FileDownloader {
+        FileDownloader {
+            http,
+            crypto,
+            node_uid: NodeUid {
+                volume_id: "v".into(),
+                node_id: "l".into(),
+            },
+            volume_id: "v".into(),
+            share_id: "s".into(),
+            revision_id: "rev-1".into(),
+            node_private_key,
+            signature_address_pubs,
+            content_key_packet: None,
+            content_key_packet_signature: None,
+            content_key_verification_pubs: Vec::new(),
+        }
+    }
+
+    /// B6 (partial-write half): a failure on block 2 (of 3) must leave the
+    /// writer holding exactly block 1's already-written plaintext — proving
+    /// the streaming writer really does deliver a truncated prefix mid-stream
+    /// on failure, not nothing at all.
+    #[tokio::test]
+    async fn mid_stream_block_failure_writer_already_has_earlier_blocks() {
+        let (crypto, http, node_key, sig_pubs) = mid_stream_tampered_fixture().await;
+        let downloader = build_downloader(http, crypto, node_key, sig_pubs);
+
+        let mut out = Vec::new();
+        let err = downloader.download_to_writer(&mut out).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "expected Integrity, got {err:?}"
+        );
+        assert_eq!(
+            out, b"block-one-ok",
+            "block 1's plaintext must already be written before block 2 fails"
+        );
+    }
+
+    /// B6 (cleanup half): the same mid-stream failure, but through
+    /// `download_to_path` — the partially-written destination file must be
+    /// removed, not left behind as a truncated same-named file.
+    #[tokio::test]
+    async fn mid_stream_block_failure_removes_partial_file() {
+        let (crypto, http, node_key, sig_pubs) = mid_stream_tampered_fixture().await;
+        let downloader = build_downloader(http, crypto, node_key, sig_pubs);
+
+        let dest = std::env::temp_dir().join(format!(
+            "pdtui-test-midfail-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = tokio::fs::remove_file(&dest).await;
+
+        let err = downloader.download_to_path(&dest).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "expected Integrity, got {err:?}"
+        );
+        assert!(
+            tokio::fs::metadata(&dest).await.is_err(),
+            "partial file left after mid-stream failure must be removed"
+        );
+    }
+
+    /// `download_to_path` happy path: file is created and holds the exact
+    /// decrypted bytes.
+    #[tokio::test]
+    async fn download_to_path_writes_file_on_success() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto = Arc::new(crypto);
+
+        let plaintext = b"download_to_path happy path";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                std::slice::from_ref(&sign_pub),
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash = block_hash_b64(&ciphertext);
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+        let hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&hash)
+            .unwrap();
+        let manifest_sig = crypto.sign(&hash_bytes, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
+                             "Hash": hash, "EncryptedSignature": null,
+                             "Size": ciphertext.len() as u64}],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
+        mock.add("cdn/block", Bytes::from(ciphertext));
+
+        let downloader = build_downloader(Arc::new(mock), crypto, sign_key, vec![sign_pub]);
+
+        let dest = std::env::temp_dir().join(format!(
+            "pdtui-test-ok-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = tokio::fs::remove_file(&dest).await;
+
+        let stats = downloader.download_to_path(&dest).await.unwrap();
+        let content = tokio::fs::read(&dest).await.unwrap();
+        assert_eq!(content, plaintext);
+        assert_eq!(stats.bytes, plaintext.len() as u64);
+        let _ = tokio::fs::remove_file(&dest).await;
+    }
+
+    /// ContentKeyPacketSignature verification is non-fatal: a signature that
+    /// cannot be resolved to any known key must never abort the download —
+    /// only the manifest signature and per-block hash checks are fatal gates.
+    #[tokio::test]
+    async fn content_key_packet_signature_failure_is_non_fatal() {
+        let (crypto, sign_key, sign_pub) = make_crypto_material("sign-pass").await;
+        let crypto = Arc::new(crypto);
+        let (_c2, other_key, _other_pub) = make_crypto_material("other-pass").await;
+
+        let plaintext = b"ckp signature is only a soft check";
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let ciphertext = crypto
+            .encrypt_and_sign(
+                plaintext,
+                &session_key,
+                std::slice::from_ref(&sign_pub),
+                &sign_key,
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let hash = block_hash_b64(&ciphertext);
+        let ckp_bytes = crypto
+            .encrypt_session_key(&session_key, std::slice::from_ref(&sign_pub))
+            .await
+            .unwrap();
+        let ckp_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_bytes);
+        let hash_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&hash)
+            .unwrap();
+        let manifest_sig = crypto.sign(&hash_bytes, &sign_key, "").await.unwrap();
+        let manifest_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&manifest_sig);
+
+        // ContentKeyPacketSignature signed by a key that is neither the node
+        // key nor in `content_key_verification_pubs` — cannot verify.
+        let ckp_sig = crypto
+            .sign(&session_key.data, &other_key, "")
+            .await
+            .unwrap();
+        let ckp_sig_b64 = base64::engine::general_purpose::STANDARD.encode(&ckp_sig);
+
+        let revision_json = serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "rev-1", "State": 1,
+                "Blocks": [{"Index": 1, "BareURL": "https://cdn/block", "Token": "t",
+                             "Hash": hash, "EncryptedSignature": null,
+                             "Size": ciphertext.len() as u64}],
+                "ManifestSignature": manifest_sig_b64, "ContentKeyPacket": ckp_b64,
+                "ContentKeyPacketSignature": null, "XAttr": null, "SignatureEmail": null,
+            }
+        })
+        .to_string();
+
+        let mut mock = MockHttpClient::new();
+        mock.add_sequence(
+            "revisions/rev-1",
+            vec![
+                Bytes::from(revision_json),
+                Bytes::from(empty_continuation_page("rev-1")),
+            ],
+        );
+        mock.add("cdn/block", Bytes::from(ciphertext));
+
+        let mut downloader = build_downloader(Arc::new(mock), crypto, sign_key, vec![sign_pub]);
+        downloader.content_key_packet_signature = Some(ckp_sig_b64);
+        // Left empty: nothing resolves the wrong signer, so the check must
+        // fail — and the download must still succeed regardless.
+
+        let mut out = Vec::new();
+        let stats = downloader.download_to_writer(&mut out).await.unwrap();
+        assert_eq!(
+            out, plaintext,
+            "an unverifiable CKP signature must never block delivery"
+        );
+        assert!(
+            stats.signature_verified,
+            "manifest signature is unaffected by CKP signature outcome"
+        );
+    }
+
+    // ── node/share passphrase signature verification tests ────────────────────
+
+    /// `decrypt_node_private_key` verifies `NodePassphraseSignature` against
+    /// the supplied verification keys and reports `VerificationStatus::Ok`
+    /// when it resolves, mirroring JS `decryptKey`.
+    #[tokio::test]
+    async fn decrypt_node_private_key_verifies_passphrase_signature() {
+        let (crypto, parent_key, _parent_pub) = make_crypto_material("parent-pass").await;
+        let crypto: Arc<dyn OpenPgpCrypto> = Arc::new(crypto);
+        let parent_pub = crypto.public_key(&parent_key).await.unwrap();
+
+        let (signer_priv, signer_pub_armored) = crypto
+            .generate_key("signer-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+        let signer_pub = PublicKey {
+            armored: signer_pub_armored,
+            fingerprint_hex: signer_priv.fingerprint_hex.clone(),
+        };
+
+        let node_unlock_passphrase = b"node-unlock-pass";
+        let (node_priv, _) = crypto
+            .generate_key("node-unlock-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let passphrase_message = crypto
+            .encrypt(
+                node_unlock_passphrase,
+                &session_key,
+                std::slice::from_ref(&parent_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&passphrase_message);
+
+        let sig_bytes = crypto
+            .sign(node_unlock_passphrase, &signer_priv, "")
+            .await
+            .unwrap();
+        let sig_armored = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+
+        let (unlocked, status) = decrypt_node_private_key(
+            &crypto,
+            &node_priv.armored,
+            &passphrase_b64,
+            &sig_armored,
+            &parent_key,
+            &[signer_pub],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, VerificationStatus::Ok);
+        assert_eq!(unlocked.fingerprint_hex, node_priv.fingerprint_hex);
+    }
+
+    /// A `NodePassphraseSignature` that cannot be resolved to any known key
+    /// (e.g. account lookup failed, or the signer key was rotated out) must
+    /// never abort node-key derivation — only degrade the reported
+    /// `VerificationStatus`, exactly like JS's non-fatal `keyAuthor`.
+    #[tokio::test]
+    async fn decrypt_node_private_key_never_aborts_on_bad_signature() {
+        let (crypto, parent_key, _parent_pub) = make_crypto_material("parent-pass").await;
+        let crypto: Arc<dyn OpenPgpCrypto> = Arc::new(crypto);
+        let parent_pub = crypto.public_key(&parent_key).await.unwrap();
+
+        let (other_priv, _) = crypto
+            .generate_key("other-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let node_unlock_passphrase = b"node-unlock-pass-2";
+        let (node_priv, _) = crypto
+            .generate_key("node-unlock-pass-2", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let passphrase_message = crypto
+            .encrypt(
+                node_unlock_passphrase,
+                &session_key,
+                std::slice::from_ref(&parent_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&passphrase_message);
+
+        // Signed by `other_priv`, which is NOT among the verification keys
+        // passed below — simulates an unresolvable/rotated-out signer.
+        let sig_bytes = crypto
+            .sign(node_unlock_passphrase, &other_priv, "")
+            .await
+            .unwrap();
+        let sig_armored = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+
+        let (unlocked, status) = decrypt_node_private_key(
+            &crypto,
+            &node_priv.armored,
+            &passphrase_b64,
+            &sig_armored,
+            &parent_key,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            unlocked.fingerprint_hex, node_priv.fingerprint_hex,
+            "key must still unlock despite an unverifiable signature"
+        );
+        assert_ne!(status, VerificationStatus::Ok);
+    }
+
+    /// An empty `NodePassphraseSignature` (no signature supplied at all) is
+    /// reported as `NoSignature`, not an abort — mirrors JS treating a
+    /// missing `armoredPassphraseSignature` as a (non-fatal) verification
+    /// error rather than skipping the check.
+    #[tokio::test]
+    async fn decrypt_node_private_key_missing_signature_is_non_fatal() {
+        let (crypto, parent_key, _parent_pub) = make_crypto_material("parent-pass").await;
+        let crypto: Arc<dyn OpenPgpCrypto> = Arc::new(crypto);
+        let parent_pub = crypto.public_key(&parent_key).await.unwrap();
+
+        let node_unlock_passphrase = b"node-unlock-pass-3";
+        let (node_priv, _) = crypto
+            .generate_key("node-unlock-pass-3", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let passphrase_message = crypto
+            .encrypt(
+                node_unlock_passphrase,
+                &session_key,
+                std::slice::from_ref(&parent_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&passphrase_message);
+
+        let (unlocked, status) = decrypt_node_private_key(
+            &crypto,
+            &node_priv.armored,
+            &passphrase_b64,
+            "",
+            &parent_key,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(unlocked.fingerprint_hex, node_priv.fingerprint_hex);
+        assert_eq!(status, VerificationStatus::NoSignature);
+    }
+
+    /// `decrypt_share_key` mirrors the same non-fatal verification contract
+    /// as `decrypt_node_private_key` for the share's own `PassphraseSignature`.
+    #[tokio::test]
+    async fn decrypt_share_key_never_aborts_on_bad_signature() {
+        let (crypto, address_key, _address_pub) = make_crypto_material("address-pass").await;
+        let crypto: Arc<dyn OpenPgpCrypto> = Arc::new(crypto);
+        let address_pub = crypto.public_key(&address_key).await.unwrap();
+
+        let (other_priv, _) = crypto
+            .generate_key("other-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let share_unlock_passphrase = b"share-unlock-pass";
+        let (share_priv, _) = crypto
+            .generate_key("share-unlock-pass", EncryptOptions::default())
+            .await
+            .unwrap();
+
+        let session_key = crypto
+            .generate_session_key(&[], EncryptOptions::default())
+            .await
+            .unwrap();
+        let passphrase_message = crypto
+            .encrypt(
+                share_unlock_passphrase,
+                &session_key,
+                std::slice::from_ref(&address_pub),
+                EncryptOptions::default(),
+            )
+            .await
+            .unwrap();
+        let passphrase_b64 = base64::engine::general_purpose::STANDARD.encode(&passphrase_message);
+
+        let sig_bytes = crypto
+            .sign(share_unlock_passphrase, &other_priv, "")
+            .await
+            .unwrap();
+        let sig_armored = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+
+        let (unlocked, status) = decrypt_share_key(
+            &crypto,
+            &share_priv.armored,
+            &passphrase_b64,
+            &sig_armored,
+            &address_key,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            unlocked.fingerprint_hex, share_priv.fingerprint_hex,
+            "share key must still unlock despite an unverifiable signature"
+        );
+        assert_ne!(status, VerificationStatus::Ok);
     }
 
     /// Round-trip test (gated `#[ignore]` — requires live credentials).

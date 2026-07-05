@@ -4,16 +4,20 @@
 //! download).  State flows monotonically:
 //!
 //!   `Pending` → `Running` → `Completed`
+//!                         ↘ `CompletedUnverified` (downloads only)
 //!                         ↘ `Failed(String)`
 //!   (`Cancelled` is accepted from any non-terminal state.)
 //!
-//! Progress is driven by a pair of watch channels:
+//! Progress is driven by three watch channels:
 //! - `progress_rx`: `u64` bytes_done, sent by the upload/download task.
-//! - `outcome_rx`: `Option<Result<(), String>>` — `None` while running,
-//!   `Some(Ok(()))` on success, `Some(Err(msg))` on failure.
+//! - `total_rx`: `Option<u64>` bytes_total, set once known (uploads set it
+//!   immediately after `stat`ing the local file; downloads leave it `None`,
+//!   matching prior behaviour since the total isn't known up front there).
+//! - `outcome_rx`: `Option<Result<TransferOutcome, String>>` — `None` while
+//!   running, `Some(Ok(outcome))` on success, `Some(Err(msg))` on failure.
 //!
-//! Both channels are polled by `Transfer::poll`, called from `App::tick`
-//! every 100 ms so the TUI stays responsive.
+//! All three channels are polled by `Transfer::poll`, called from
+//! `App::tick` every 100 ms so the TUI stays responsive.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,13 +56,21 @@ impl TransferProgress {
     }
 }
 
-/// State of a transfer.  Terminal states are `Completed` and `Failed`.
+/// State of a transfer.  Terminal states are `Completed`,
+/// `CompletedUnverified`, `Cancelled`, and `Failed`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Pending and Cancelled wired in M7 / cancel action
 pub enum TransferState {
     Pending,
     Running,
     Completed,
+    /// A download completed and every block's ciphertext hash matched, but
+    /// the manifest signature could not be verified against the signer's
+    /// known keys (e.g. an address key that has since been rotated out) —
+    /// data is intact, authenticity is unconfirmed. Mirrors
+    /// `proton_drive_core::download::DownloadStats::signature_verified ==
+    /// false`. Never set for uploads (no equivalent check exists there).
+    CompletedUnverified,
     Cancelled,
     Failed(String),
 }
@@ -67,9 +79,21 @@ impl TransferState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TransferState::Completed | TransferState::Cancelled | TransferState::Failed(_)
+            TransferState::Completed
+                | TransferState::CompletedUnverified
+                | TransferState::Cancelled
+                | TransferState::Failed(_)
         )
     }
+}
+
+/// Outcome carried by the outcome channel on a successful transfer.
+/// `signature_verified` is only meaningful for downloads — the manifest
+/// authenticity check (`DownloadStats::signature_verified`); uploads set it
+/// to `None` since no equivalent check exists on that path.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferOutcome {
+    pub signature_verified: Option<bool>,
 }
 
 /// An in-flight (or finished) transfer.
@@ -85,8 +109,11 @@ pub struct Transfer {
     pub progress: TransferProgress,
     /// Watch receiver driven by the spawned task (bytes done).
     progress_rx: watch::Receiver<u64>,
+    /// Watch receiver for the total size, once known (uploads only; `None`
+    /// forever for downloads).
+    total_rx: watch::Receiver<Option<u64>>,
     /// Outcome receiver — `None` while running, `Some` when the task ends.
-    outcome_rx: watch::Receiver<Option<Result<(), String>>>,
+    outcome_rx: watch::Receiver<Option<Result<TransferOutcome, String>>>,
     /// Cancellation token — exposed for future cancel-action binding (M7).
     #[allow(dead_code)]
     cancel: Arc<tokio_util::sync::CancellationToken>,
@@ -109,12 +136,21 @@ impl Transfer {
             self.state = TransferState::Running;
         }
 
+        let total_now = *self.total_rx.borrow();
+        let total_changed = total_now != self.progress.bytes_total;
+        if total_changed {
+            self.progress.bytes_total = total_now;
+        }
+
         // Check for task completion.
         let outcome = self.outcome_rx.borrow().clone();
         match outcome {
-            None => bytes_changed,
-            Some(Ok(())) => {
-                self.state = TransferState::Completed;
+            None => bytes_changed || total_changed,
+            Some(Ok(outcome)) => {
+                self.state = match outcome.signature_verified {
+                    Some(false) => TransferState::CompletedUnverified,
+                    _ => TransferState::Completed,
+                };
                 true
             }
             Some(Err(msg)) => {
@@ -150,7 +186,8 @@ pub fn spawn_upload(
 ) -> Transfer {
     let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
     let (progress_tx, progress_rx) = watch::channel::<u64>(0);
-    let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<(), String>>>(None);
+    let (total_tx, total_rx) = watch::channel::<Option<u64>>(None);
+    let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<TransferOutcome, String>>>(None);
 
     let file_name = local_path
         .file_name()
@@ -168,6 +205,7 @@ pub fn spawn_upload(
             parent_uid,
             file_name,
             progress_tx,
+            total_tx,
             cancel_clone,
         )
         .await;
@@ -181,6 +219,7 @@ pub fn spawn_upload(
         state: TransferState::Running,
         progress: TransferProgress::default(),
         progress_rx,
+        total_rx,
         outcome_rx,
         cancel,
     }
@@ -198,7 +237,11 @@ pub fn spawn_download(
 ) -> Transfer {
     let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
     let (progress_tx, progress_rx) = watch::channel::<u64>(0);
-    let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<(), String>>>(None);
+    // Downloads don't know the total size up front (no equivalent to
+    // upload's pre-transfer `stat`), so this channel is never written —
+    // `total_rx` simply stays `None` for the life of the transfer.
+    let (_total_tx, total_rx) = watch::channel::<Option<u64>>(None);
+    let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<TransferOutcome, String>>>(None);
 
     let label = node_name.clone();
     let uid_for_transfer = node_uid.clone();
@@ -224,6 +267,7 @@ pub fn spawn_download(
         state: TransferState::Running,
         progress: TransferProgress::default(),
         progress_rx,
+        total_rx,
         outcome_rx,
         cancel,
     }
@@ -239,8 +283,9 @@ async fn do_upload(
     parent_uid: NodeUid,
     file_name: String,
     progress_tx: watch::Sender<u64>,
+    total_tx: watch::Sender<Option<u64>>,
     cancel: Arc<tokio_util::sync::CancellationToken>,
-) -> Result<(), String> {
+) -> Result<TransferOutcome, String> {
     if cancel.is_cancelled() {
         return Err("upload cancelled before start".into());
     }
@@ -253,6 +298,11 @@ async fn do_upload(
     if file_size == 0 {
         return Err("upload: file is empty (server requires expected_size > 0)".into());
     }
+
+    // The gauge needs a known total to render a fraction/percentage instead
+    // of staying inert for the whole transfer — set it as soon as it's known,
+    // well before the byte-count updates start arriving from the uploader.
+    let _ = total_tx.send(Some(file_size));
 
     let media_type = media_type_from_path(&local_path);
     let modification_time = metadata.modified().ok();
@@ -286,7 +336,9 @@ async fn do_upload(
         .await
         .map_err(|e| format!("upload_from_stream: {e}"))?;
 
-    Ok(())
+    Ok(TransferOutcome {
+        signature_verified: None,
+    })
 }
 
 async fn do_download(
@@ -296,7 +348,7 @@ async fn do_download(
     dest_dir: PathBuf,
     progress_tx: watch::Sender<u64>,
     cancel: Arc<tokio_util::sync::CancellationToken>,
-) -> Result<(), String> {
+) -> Result<TransferOutcome, String> {
     if cancel.is_cancelled() {
         return Err("download cancelled before start".into());
     }
@@ -306,10 +358,13 @@ async fn do_download(
         .await
         .map_err(|e| format!("file_downloader: {e}"))?;
 
-    let dest_path = dest_dir.join(&node_name);
-    let file = tokio::fs::File::create(&dest_path)
-        .await
-        .map_err(|e| format!("create {}: {e}", dest_path.display()))?;
+    // `node_name` is the decrypted remote node name — plaintext chosen by
+    // whoever created/shared the node, never trustworthy as a raw path
+    // component (CWE-22). Sanitize before joining onto the local destination
+    // directory so a malicious/crafted name can never escape `dest_dir` or
+    // resolve to an absolute path.
+    let safe_name = sanitize_download_name(&node_name);
+    let dest_path = dest_dir.join(&safe_name);
 
     let _ = progress_tx.send(0);
 
@@ -317,19 +372,62 @@ async fn do_download(
         return Err("download cancelled".into());
     }
 
+    // `download_to_path` owns the destination file's lifecycle: it
+    // creates/truncates `dest_path`, and removes it again on any failure so a
+    // partial/failed download never leaves a truncated same-named file behind
+    // (B6).
     let stats = downloader
-        .download_to_writer(file)
+        .download_to_path(&dest_path)
         .await
-        .map_err(|e| format!("download_to_writer: {e}"))?;
+        .map_err(|e| format!("download_to_path: {e}"))?;
 
     let _ = progress_tx.send(stats.bytes);
 
-    Ok(())
+    Ok(TransferOutcome {
+        signature_verified: Some(stats.signature_verified),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Sanitize a decrypted remote node name before it is joined onto a local
+/// destination directory (CWE-22 path-traversal / absolute-path-escape
+/// hardening). Node names are plaintext chosen by whoever created or shared
+/// the node — including, in principle, a malicious share — and must never be
+/// trusted as a raw path component.
+///
+/// - Strips path-separator characters (`/` and `\`, the latter covers
+///   Windows-style names too) so the result can never introduce additional
+///   path segments — `dest_dir.join(&sanitized)` always yields exactly one
+///   more component under `dest_dir`, never more, never fewer.
+/// - Strips control characters (`0x00`-`0x1F`, `0x7F`), meaningless in
+///   filenames and liable to confuse terminals/filesystems.
+/// - After stripping, rejects the result being exactly `.` or `..` (the only
+///   component values a filesystem treats specially even without
+///   separators) by substituting a fixed placeholder — a name that merely
+///   *contains* dots (including a leading dot: dotfiles like `.gitignore`
+///   are legitimate and left untouched) is just an ordinary filename once
+///   separators are gone, so it is never rewritten.
+/// - Falls back to the same placeholder if stripping leaves nothing at all.
+///
+/// The output is always a single, safe path *component*: joining it onto
+/// `dest_dir` can never escape `dest_dir` and can never become an absolute
+/// path, regardless of what the original decrypted name contained.
+fn sanitize_download_name(name: &str) -> String {
+    const PLACEHOLDER: &str = "_unnamed_download";
+
+    let stripped: String = name
+        .chars()
+        .filter(|c| *c != '/' && *c != '\\' && !c.is_control())
+        .collect();
+
+    match stripped.as_str() {
+        "" | "." | ".." => PLACEHOLDER.to_owned(),
+        _ => stripped,
+    }
+}
 
 fn media_type_from_path(path: &std::path::Path) -> String {
     let ext = path
@@ -363,17 +461,21 @@ fn media_type_from_path(path: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
-    /// A `Transfer` plus the sender halves of its progress/outcome channels,
-    /// kept alive by tests so the receivers inside the `Transfer` stay open.
+    /// A `Transfer` plus the sender halves of its progress/total/outcome
+    /// channels, kept alive by tests so the receivers inside the `Transfer`
+    /// stay open.
     type TransferHarness = (
         Transfer,
         watch::Sender<u64>,
-        watch::Sender<Option<Result<(), String>>>,
+        watch::Sender<Option<u64>>,
+        watch::Sender<Option<Result<TransferOutcome, String>>>,
     );
 
     fn make_transfer(direction: TransferDirection, state: TransferState) -> TransferHarness {
         let (progress_tx, progress_rx) = watch::channel::<u64>(0);
-        let (outcome_tx, outcome_rx) = watch::channel::<Option<Result<(), String>>>(None);
+        let (total_tx, total_rx) = watch::channel::<Option<u64>>(None);
+        let (outcome_tx, outcome_rx) =
+            watch::channel::<Option<Result<TransferOutcome, String>>>(None);
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let t = Transfer {
             label: "test".into(),
@@ -385,10 +487,11 @@ mod tests {
             state,
             progress: TransferProgress::default(),
             progress_rx,
+            total_rx,
             outcome_rx,
             cancel,
         };
-        (t, progress_tx, outcome_tx)
+        (t, progress_tx, total_tx, outcome_tx)
     }
 
     // ── TransferProgress ─────────────────────────────────────────────────────
@@ -434,6 +537,7 @@ mod tests {
     #[test]
     fn terminal_states_are_terminal() {
         assert!(TransferState::Completed.is_terminal());
+        assert!(TransferState::CompletedUnverified.is_terminal());
         assert!(TransferState::Cancelled.is_terminal());
         assert!(TransferState::Failed("oops".into()).is_terminal());
     }
@@ -448,7 +552,7 @@ mod tests {
 
     #[test]
     fn cancel_sets_cancelled_state() {
-        let (mut t, _, _) = make_transfer(TransferDirection::Upload, TransferState::Running);
+        let (mut t, _, _, _) = make_transfer(TransferDirection::Upload, TransferState::Running);
         let token = t.cancel.clone();
         t.cancel();
         assert!(matches!(t.state, TransferState::Cancelled));
@@ -457,7 +561,7 @@ mod tests {
 
     #[test]
     fn cancel_on_completed_is_noop() {
-        let (mut t, _, _) = make_transfer(TransferDirection::Download, TransferState::Completed);
+        let (mut t, _, _, _) = make_transfer(TransferDirection::Download, TransferState::Completed);
         let token = t.cancel.clone();
         t.cancel();
         assert!(matches!(t.state, TransferState::Completed));
@@ -468,13 +572,13 @@ mod tests {
 
     #[test]
     fn poll_terminal_returns_false() {
-        let (mut t, _, _) = make_transfer(TransferDirection::Upload, TransferState::Completed);
+        let (mut t, _, _, _) = make_transfer(TransferDirection::Upload, TransferState::Completed);
         assert!(!t.poll());
     }
 
     #[test]
     fn poll_progress_update_returns_true() {
-        let (mut t, progress_tx, _) =
+        let (mut t, progress_tx, _, _) =
             make_transfer(TransferDirection::Upload, TransferState::Running);
         progress_tx.send(1024).unwrap();
         let changed = t.poll();
@@ -484,7 +588,7 @@ mod tests {
 
     #[test]
     fn poll_no_change_returns_false() {
-        let (mut t, _progress_tx, _outcome_tx) =
+        let (mut t, _progress_tx, _total_tx, _outcome_tx) =
             make_transfer(TransferDirection::Upload, TransferState::Running);
         // bytes_done starts at 0 and the channel also sends 0 — no change.
         let changed = t.poll();
@@ -492,17 +596,61 @@ mod tests {
     }
 
     #[test]
-    fn poll_success_outcome_transitions_completed() {
-        let (mut t, _, outcome_tx) =
+    fn poll_total_update_returns_true_and_sets_bytes_total() {
+        let (mut t, _, total_tx, _) =
             make_transfer(TransferDirection::Upload, TransferState::Running);
-        outcome_tx.send(Some(Ok(()))).unwrap();
+        total_tx.send(Some(4096)).unwrap();
+        let changed = t.poll();
+        assert!(changed, "a newly-known total must trigger a redraw");
+        assert_eq!(t.progress.bytes_total, Some(4096));
+    }
+
+    #[test]
+    fn poll_success_outcome_transitions_completed() {
+        let (mut t, _, _, outcome_tx) =
+            make_transfer(TransferDirection::Upload, TransferState::Running);
+        outcome_tx
+            .send(Some(Ok(TransferOutcome {
+                signature_verified: None,
+            })))
+            .unwrap();
         t.poll();
         assert!(matches!(t.state, TransferState::Completed));
     }
 
     #[test]
+    fn poll_verified_download_outcome_transitions_completed() {
+        let (mut t, _, _, outcome_tx) =
+            make_transfer(TransferDirection::Download, TransferState::Running);
+        outcome_tx
+            .send(Some(Ok(TransferOutcome {
+                signature_verified: Some(true),
+            })))
+            .unwrap();
+        t.poll();
+        assert!(matches!(t.state, TransferState::Completed));
+    }
+
+    #[test]
+    fn poll_unverified_download_outcome_transitions_completed_unverified() {
+        let (mut t, _, _, outcome_tx) =
+            make_transfer(TransferDirection::Download, TransferState::Running);
+        outcome_tx
+            .send(Some(Ok(TransferOutcome {
+                signature_verified: Some(false),
+            })))
+            .unwrap();
+        t.poll();
+        assert!(
+            matches!(t.state, TransferState::CompletedUnverified),
+            "got: {:?}",
+            t.state
+        );
+    }
+
+    #[test]
     fn poll_error_outcome_captures_message() {
-        let (mut t, _, outcome_tx) =
+        let (mut t, _, _, outcome_tx) =
             make_transfer(TransferDirection::Download, TransferState::Running);
         outcome_tx
             .send(Some(Err("something went wrong".into())))
@@ -539,5 +687,78 @@ mod tests {
     fn media_type_no_extension() {
         let p = std::path::Path::new("Makefile");
         assert_eq!(media_type_from_path(p), "application/octet-stream");
+    }
+
+    // ── sanitize_download_name ───────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_benign_name_is_unchanged() {
+        assert_eq!(sanitize_download_name("photo.jpg"), "photo.jpg");
+    }
+
+    #[test]
+    fn sanitize_leading_dot_is_allowed() {
+        // Dotfiles are legitimate names — only the bare "." and ".." tokens
+        // are special-cased.
+        assert_eq!(sanitize_download_name(".hidden-file"), ".hidden-file");
+    }
+
+    #[test]
+    fn sanitize_strips_path_separators_and_cannot_traverse() {
+        let dest_dir = std::path::PathBuf::from("/tmp/downloads");
+        let sanitized = sanitize_download_name("../../etc/passwd");
+
+        assert!(
+            !sanitized.contains('/') && !sanitized.contains('\\'),
+            "sanitized name must contain no path separators: {sanitized:?}"
+        );
+        let joined = dest_dir.join(&sanitized);
+        assert_eq!(
+            joined.parent(),
+            Some(dest_dir.as_path()),
+            "joined path must live directly inside dest_dir, never escape it"
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_absolute_path() {
+        let dest_dir = std::path::PathBuf::from("/tmp/downloads");
+        let sanitized = sanitize_download_name("/etc/passwd");
+
+        assert!(
+            !std::path::Path::new(&sanitized).is_absolute(),
+            "sanitized name must not be absolute: {sanitized:?}"
+        );
+        let joined = dest_dir.join(&sanitized);
+        assert_eq!(joined.parent(), Some(dest_dir.as_path()));
+    }
+
+    #[test]
+    fn sanitize_rejects_bare_parent_component() {
+        let sanitized = sanitize_download_name("..");
+        assert_ne!(sanitized, "..");
+        assert_ne!(sanitized, ".");
+        assert!(!sanitized.is_empty());
+    }
+
+    #[test]
+    fn sanitize_rejects_bare_current_component() {
+        let sanitized = sanitize_download_name(".");
+        assert_ne!(sanitized, ".");
+        assert!(!sanitized.is_empty());
+    }
+
+    #[test]
+    fn sanitize_empty_name_falls_back_to_placeholder() {
+        // A name that is nothing but separators strips down to empty.
+        let sanitized = sanitize_download_name("///");
+        assert!(!sanitized.is_empty());
+        assert!(!sanitized.contains('/'));
+    }
+
+    #[test]
+    fn sanitize_strips_control_characters() {
+        let sanitized = sanitize_download_name("bad\u{0000}name\u{0007}.txt");
+        assert_eq!(sanitized, "badname.txt");
     }
 }
