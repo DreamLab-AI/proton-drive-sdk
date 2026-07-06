@@ -1173,10 +1173,11 @@ mod tests {
     //
     // The happy-path decrypt+parse is covered end to end by
     // `download::tests::round_trip_upload_download_byte_identical` (revision GET
-    // → node-key decrypt → XAttr decrypt) and exhaustively by
-    // `xattr::tests`/`nodes::tests`; these tests pin the new aggregation glue:
-    // an empty input, and the best-effort early-returns that leave a uid out of
-    // the map rather than failing the whole call.
+    // → node-key decrypt → XAttr decrypt), the share/node-key resolution by
+    // `resolve_node_key_via_chain_*`, and the parsing exhaustively by
+    // `xattr::tests`/`nodes::tests`; these tests pin the new aggregation glue —
+    // empty input, and best-effort omission (rather than a whole-batch error)
+    // when a share can't be resolved.
 
     #[tokio::test]
     async fn fetch_revision_xattrs_empty_input_is_empty_map() {
@@ -1186,57 +1187,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_revision_xattrs_skips_non_file_node() {
-        // A folder link (Type 1) short-circuits before any key resolution.
-        let mut http = ChainMockHttpClient::new();
-        http.add(
-            "links/folder-1",
-            link_json("folder-1", Some("root"), "k", "p"),
-        );
-        let client = test_client(http, Arc::new(RpgpCrypto::new()));
-
-        let uid = NodeUid {
-            volume_id: "share-1".to_owned(),
-            node_id: "folder-1".to_owned(),
-        };
-        let map = client
-            .fetch_revision_xattrs(std::slice::from_ref(&uid))
-            .await;
-        assert!(map.is_empty(), "folder node must yield no digest entry");
-    }
-
-    #[tokio::test]
-    async fn fetch_revision_xattrs_skips_file_without_active_revision() {
-        // A file link (Type 2) with no ActiveRevision short-circuits before key
-        // resolution — nothing to fetch a revision XAttr for.
-        let mut http = ChainMockHttpClient::new();
-        http.add(
-            "links/file-1",
-            serde_json::json!({
-                "Code": 1000,
-                "Link": {
-                    "LinkID": "file-1", "ParentLinkID": "root", "Type": 2,
-                    "Name": "n", "State": 1, "Size": 10,
-                    "CreateTime": 0, "ModifyTime": 0, "Trashed": null,
-                    "NodeKey": "k", "NodePassphrase": "p",
-                    "NodePassphraseSignature": "", "SignatureEmail": null,
-                    "FileProperties": null, "FolderProperties": null,
-                }
-            })
-            .to_string(),
-        );
-        let client = test_client(http, Arc::new(RpgpCrypto::new()));
-
-        let uid = NodeUid {
-            volume_id: "share-1".to_owned(),
-            node_id: "file-1".to_owned(),
-        };
-        let map = client
-            .fetch_revision_xattrs(std::slice::from_ref(&uid))
-            .await;
+    async fn fetch_revision_xattrs_best_effort_omits_unresolvable_share() {
+        // With no resolvable share context (the test account can't supply an
+        // address key, so the share key never decrypts), every entry is dropped —
+        // the batch yields an empty map rather than erroring or panicking.
+        let client = test_client(ChainMockHttpClient::new(), Arc::new(RpgpCrypto::new()));
+        let revisions = vec![
+            (
+                NodeUid {
+                    volume_id: "share-1".to_owned(),
+                    node_id: "file-1".to_owned(),
+                },
+                "rev-1".to_owned(),
+            ),
+            (
+                NodeUid {
+                    volume_id: "share-1".to_owned(),
+                    node_id: "file-2".to_owned(),
+                },
+                "rev-2".to_owned(),
+            ),
+        ];
+        let map = client.fetch_revision_xattrs(&revisions).await;
         assert!(
             map.is_empty(),
-            "file with no active revision must yield no digest entry"
+            "unresolvable share context must yield no digest entries, not an error"
         );
     }
 }
