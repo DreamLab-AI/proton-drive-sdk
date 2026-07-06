@@ -83,6 +83,7 @@ pub async fn run() -> Result<(), String> {
         modification_time: Some(SystemTime::now()),
         additional_metadata_json: None,
         override_existing_draft_by_other_client: false,
+        expected_current_revision_id: None,
     };
     let uploader = client
         .file_uploader(&root_uid, &name, meta)

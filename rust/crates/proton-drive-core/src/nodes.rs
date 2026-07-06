@@ -86,6 +86,24 @@ pub struct Node {
     pub active_revision: Option<Revision>,
 }
 
+/// Prefix of the synthetic name [`link_to_maybe_node`] substitutes when a
+/// node's real name could not be decrypted. Single source of truth for the
+/// placeholder shape so consumers can recognise it without hard-coding the
+/// literal.
+const UNDECRYPTED_NAME_PREFIX: &str = "<encrypted-";
+
+impl Node {
+    /// `false` when [`Self::name`] is the synthetic placeholder used after a
+    /// failed name decryption (`<encrypted-{link_id}>`). Such a name is not a
+    /// stable identity: consumers that match, path-join, or sync on names (e.g.
+    /// the Sync context's `RemoteSnapshot`) must skip these nodes rather than
+    /// treat the placeholder as a real filename — otherwise a transient decrypt
+    /// failure silently forks the sync identity.
+    pub fn has_decrypted_name(&self) -> bool {
+        !self.name.starts_with(UNDECRYPTED_NAME_PREFIX)
+    }
+}
+
 /// Maybe-degraded node — mirrors JS `MaybeNode` (`Node | DegradedNode | MissingNode`).
 ///
 /// `Node` is boxed because the fully-decoded variant is far larger than the

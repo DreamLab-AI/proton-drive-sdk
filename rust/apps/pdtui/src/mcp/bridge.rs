@@ -265,15 +265,33 @@ pub fn unix_secs(t: SystemTime) -> u64 {
 
 /// Join a sync-engine relative path (forward-slash) onto a local root,
 /// component by component so it is correct regardless of the host separator.
+///
+/// `.` and `..` segments are dropped, not joined: a remote-derived path segment
+/// (a decrypted, server-supplied node name) must never be able to climb out of
+/// `local_root`. This is the join-side brace to [`proton_drive_sync::RelativePath`]'s
+/// own `..`-stripping — either alone closes the traversal, both together make it
+/// unreachable regardless of which constructor produced `rel`.
 pub fn rel_to_local(local_root: &Path, rel: &str) -> PathBuf {
     rel.split('/')
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
         .fold(local_root.to_path_buf(), |acc, seg| acc.join(seg))
 }
 
 /// The final segment of a forward-slash relative path (the file/dir name).
 pub fn last_segment(rel: &str) -> &str {
     rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// `true` if `name` is usable as a single sync path segment: non-empty, not a
+/// `.`/`..` navigation element, and free of path separators (a remote node name
+/// carrying a `/` or a null byte cannot map to one local filesystem component).
+pub fn is_safe_name_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 #[cfg(test)]
@@ -307,6 +325,38 @@ mod tests {
         assert_eq!(match_segment(std::iter::empty(), "beta"), None);
         // Case-sensitive: "Beta" != "beta".
         assert_eq!(match_segment(names.iter().copied(), "Beta"), None);
+    }
+
+    // ── path-traversal safety ────────────────────────────────────────────────
+
+    #[test]
+    fn is_safe_name_segment_rejects_unusable_names() {
+        assert!(is_safe_name_segment("report.pdf"));
+        assert!(is_safe_name_segment("a name with spaces"));
+        assert!(!is_safe_name_segment(""));
+        assert!(!is_safe_name_segment("."));
+        assert!(!is_safe_name_segment(".."));
+        assert!(!is_safe_name_segment("a/b"));
+        assert!(!is_safe_name_segment("a\\b"));
+        assert!(!is_safe_name_segment("a\0b"));
+    }
+
+    #[test]
+    fn rel_to_local_cannot_escape_root_via_parent_segments() {
+        let root = Path::new("/home/me/sync");
+        // A raw ".."-laden relative path must stay at or below the root.
+        assert_eq!(
+            rel_to_local(root, "../../etc/passwd"),
+            PathBuf::from("/home/me/sync/etc/passwd")
+        );
+        assert_eq!(
+            rel_to_local(root, "a/../b"),
+            PathBuf::from("/home/me/sync/a/b")
+        );
+        assert_eq!(
+            rel_to_local(root, "sub/file.txt"),
+            root.join("sub/file.txt")
+        );
     }
 
     // ── remote digest validation ─────────────────────────────────────────────

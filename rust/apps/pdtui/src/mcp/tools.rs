@@ -168,9 +168,11 @@ pub async fn drive_upload(
         .await
         .map_err(mcp_bad_params)?;
 
-    // New file first; on a name collision, upload a new revision of the existing
-    // node instead of failing (PRD §6.2 / user story 6). The collision is
-    // detected via the SDK's own 2500 → `NodeWithSameNameExists` mapping.
+    // New file first. On a name collision the existing file is only touched when
+    // the caller explicitly opts in (`allow_revision_on_conflict`): otherwise a
+    // create silently replacing an unrelated file is a data-safety hole, so the
+    // default is to fail and let the caller decide. The collision is detected
+    // via the SDK's own 2500 → `NodeWithSameNameExists` mapping.
     let created_revision = match run_upload(
         server,
         UploadTarget::New {
@@ -184,6 +186,14 @@ pub async fn drive_upload(
     {
         Ok(()) => false,
         Err(proton_drive::Error::NodeWithSameNameExists { .. }) => {
+            if !p.allow_revision_on_conflict {
+                return Err(mcp_bad_params(format!(
+                    "a file named '{name}' already exists under '{}'. Refusing to overwrite it. \
+                     Re-call with allow_revision_on_conflict=true to upload a new revision of the \
+                     existing file, or choose a different name.",
+                    p.remote_parent_path
+                )));
+            }
             let existing = resolve_child(server, &parent, &name, false)
                 .await
                 .map_err(|e| map_sdk_err("locate existing node", e))?;
@@ -445,6 +455,46 @@ async fn resolve_path(server: &DriveMcpServer, path: &str) -> Result<NodeUid, Mc
     Ok(current)
 }
 
+/// Resolve an existing remote folder addressed by a sync-engine relative path,
+/// walking `start` down one folder segment at a time. Returns `None` if any
+/// segment is absent (the folder does not exist remotely) — distinct from an
+/// `Err`, which is a transport/listing failure.
+///
+/// Sync's `dirs_to_create` deliberately omits directories that already back a
+/// remote file, so an `Upload` op targeting a pre-existing folder has no entry
+/// in the freshly-created `dir_uids` map; this recovers that folder's uid.
+async fn resolve_existing_dir(
+    server: &DriveMcpServer,
+    start: &NodeUid,
+    rel: &RelativePath,
+) -> Result<Option<NodeUid>, McpErrorAlias> {
+    let mut current = start.clone();
+    for seg in rel.as_str().split('/').filter(|s| !s.is_empty()) {
+        let children = server
+            .client()
+            .fetch_folder_children(&current, LIST_PAGE_SIZE)
+            .await
+            .map_err(|e| map_sdk_err("sync_apply (resolve existing dir)", e))?;
+        let mut found: Option<NodeUid> = None;
+        for child in &children {
+            if let MaybeNode::Node(n) = child
+                && !n.trashed
+                && matches!(n.node_type, NodeType::Folder)
+                && n.has_decrypted_name()
+                && n.name == seg
+            {
+                found = Some(n.uid.clone());
+                break;
+            }
+        }
+        match found {
+            Some(uid) => current = uid,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(current))
+}
+
 /// Find a non-trashed child of `parent` named `name`. `want_folder` selects
 /// Folder vs File exactly (Albums never match). Returns the uid and, for a file,
 /// its active revision uid.
@@ -507,6 +557,19 @@ async fn collect_remote_files(
         for child in &children {
             if let MaybeNode::Node(n) = child {
                 if n.trashed {
+                    continue;
+                }
+                // A node whose name failed to decrypt carries a synthetic
+                // placeholder, and a name containing a path separator or a
+                // `.`/`..` segment is not a valid sync identity — folding either
+                // into the tree would fork or misplace the identity (a transient
+                // decrypt failure would masquerade as a distinct remote file).
+                // Skip and report to stderr; the transport stays on stdout.
+                if !n.has_decrypted_name() || !bridge::is_safe_name_segment(&n.name) {
+                    eprintln!(
+                        "sync_plan: skipping remote node {} — name is not a usable sync identity ('{}')",
+                        n.uid.node_id, n.name
+                    );
                     continue;
                 }
                 let rel = if prefix.is_empty() {
@@ -686,13 +749,23 @@ async fn apply_approved(
     for dir in approved.dirs_to_create() {
         let parent = match dir.parent() {
             None => Some(remote_root.clone()),
-            Some(p) => dir_uids.get(&p).cloned(),
+            // A new dir's parent may itself be new (in dir_uids) or a
+            // pre-existing remote folder (never in dir_uids, because
+            // dirs_to_create omits already-backed dirs) — resolve the latter by
+            // walking, so scaffolding e.g. "a/b" with "a" already remote works.
+            Some(p) => match dir_uids.get(&p).cloned() {
+                Some(uid) => Some(uid),
+                None => resolve_existing_dir(server, remote_root, &p)
+                    .await
+                    .ok()
+                    .flatten(),
+            },
         };
         let Some(parent) = parent else {
             results.push(bridge::OpResult::err(
                 dir.to_string(),
                 "mkdir",
-                "parent directory was not created (its own creation failed)",
+                "parent directory could not be created or resolved",
             ));
             continue;
         };
@@ -723,6 +796,29 @@ async fn apply_approved(
                 "mkdir",
                 format!("create_folder: {e}"),
             )),
+        }
+    }
+
+    // 1b. Resolve parents of Upload ops that live in *pre-existing* remote
+    //     folders. dirs_to_create omits dirs already backed by a remote file, so
+    //     their uids are absent from dir_uids; without this an Upload into any
+    //     non-empty remote folder would fail with "remote parent not available".
+    //     Done sequentially before the concurrent phase so the resolution walk
+    //     is not repeated per-op and dir_uids can stay an immutable shared ref.
+    let mut parents_needed: Vec<RelativePath> = approved
+        .ops()
+        .iter()
+        .filter(|op| matches!(op.kind, SyncOpKind::Upload))
+        .filter_map(|op| op.path.parent())
+        .filter(|p| !dir_uids.contains_key(p))
+        .collect();
+    parents_needed.sort();
+    parents_needed.dedup();
+    for parent in parents_needed {
+        // Left absent on None/Err → the Upload op reports a clear per-op error
+        // rather than the whole apply failing.
+        if let Ok(Some(uid)) = resolve_existing_dir(server, remote_root, &parent).await {
+            dir_uids.insert(parent, uid);
         }
     }
 
@@ -778,19 +874,7 @@ async fn exec_op(
             };
             let name = bridge::last_segment(op.path.as_str());
             let local_file = bridge::rel_to_local(local_root, op.path.as_str());
-            match upload_file(
-                server,
-                UploadTarget::New {
-                    parent: &parent,
-                    name,
-                },
-                &local_file,
-            )
-            .await
-            {
-                Ok(()) => bridge::OpResult::ok(path_str, "upload"),
-                Err(msg) => bridge::OpResult::err(path_str, "upload", msg),
-            }
+            exec_upload_new(server, &parent, name, &local_file, path_str).await
         }
 
         SyncOpKind::UploadRevision => {
@@ -825,12 +909,17 @@ async fn exec_op(
                 }
             }
             let local_file = bridge::rel_to_local(local_root, op.path.as_str());
+            // Thread the plan's revision uid to the server as CurrentRevisionID
+            // so its guard rejects the draft if the active revision moved after
+            // the plan was computed — closing the window between the staleness
+            // re-read above and the draft POST that the re-read alone leaves open.
             match upload_file(
                 server,
                 UploadTarget::Revision {
                     node: &remote.node_uid,
                 },
                 &local_file,
+                Some(remote.revision_uid.clone()),
             )
             .await
             {
@@ -851,6 +940,34 @@ async fn exec_op(
                 );
             };
             let dest = bridge::rel_to_local(local_root, op.path.as_str());
+            // Local staleness guard, symmetric to UploadRevision's remote guard:
+            // a Download truncates `dest`, so refuse if the on-disk file no
+            // longer matches what the plan decided against (post-plan local
+            // edits, or a file that appeared where the plan expected none).
+            match &op.local {
+                Some(local) => match sha1_hex_of_file(&dest).await {
+                    // Unchanged since the plan → safe to overwrite.
+                    Ok(cur) if cur == local.content_hash.as_str() => {}
+                    Ok(_) => {
+                        return bridge::OpResult::err(
+                            path_str,
+                            "download",
+                            "local file changed since the plan was computed — refusing to overwrite (re-plan)",
+                        );
+                    }
+                    // Missing/unreadable now: nothing on disk to lose, proceed.
+                    Err(_) => {}
+                },
+                None => {
+                    if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+                        return bridge::OpResult::err(
+                            path_str,
+                            "download",
+                            "a local file appeared at this path since the plan — refusing to overwrite (re-plan)",
+                        );
+                    }
+                }
+            }
             match download_file(server, &remote.node_uid, &dest).await {
                 Ok(_) => bridge::OpResult::ok(path_str, "download"),
                 Err(msg) => bridge::OpResult::err(path_str, "download", msg),
@@ -921,6 +1038,7 @@ async fn build_upload_meta(local_file: &Path) -> Result<(UploadMetadata, String)
         modification_time,
         additional_metadata_json: None,
         override_existing_draft_by_other_client: false,
+        expected_current_revision_id: None,
     };
     Ok((meta, sha1))
 }
@@ -947,13 +1065,79 @@ async fn run_upload(
     Ok(())
 }
 
+/// Execute a sync `Upload` op (new file) with idempotent re-apply semantics.
+///
+/// A stored plan may be re-applied after a partial apply (the plan store does
+/// not consume plans — domain invariant 4). So a name collision here is not
+/// automatically a failure: if the remote file already carries the *same*
+/// content hash as the local file, the upload already happened on a prior run
+/// and the op reports success; only a collision with *different* remote content
+/// is an error (the plan is stale — re-plan). It never auto-overwrites, matching
+/// the plan/apply safety contract.
+async fn exec_upload_new(
+    server: &DriveMcpServer,
+    parent: &NodeUid,
+    name: &str,
+    local_file: &Path,
+    path_str: String,
+) -> bridge::OpResult {
+    let (meta, local_sha1) = match build_upload_meta(local_file).await {
+        Ok(v) => v,
+        Err(msg) => return bridge::OpResult::err(path_str, "upload", msg),
+    };
+    match run_upload(server, UploadTarget::New { parent, name }, local_file, meta).await {
+        Ok(()) => bridge::OpResult::ok(path_str, "upload"),
+        Err(proton_drive::Error::NodeWithSameNameExists { .. }) => {
+            // Locate the colliding remote file and compare content by digest.
+            let existing = match resolve_child(server, parent, name, false).await {
+                Ok(Some((uid, Some(rev)))) => Some((uid, rev)),
+                Ok(_) => None,
+                Err(e) => {
+                    return bridge::OpResult::err(
+                        path_str,
+                        "upload",
+                        format!("name collision, and locating the existing file failed: {e}"),
+                    );
+                }
+            };
+            let Some((uid, rev)) = existing else {
+                return bridge::OpResult::err(
+                    path_str,
+                    "upload",
+                    "name already exists remotely but the existing file could not be located",
+                );
+            };
+            let digests = fetch_digests(server.client_arc(), vec![(uid.clone(), rev)]).await;
+            match digests.get(&uid).and_then(|x| x.content_sha1.as_deref()) {
+                Some(remote_sha1) if remote_sha1 == local_sha1 => {
+                    // Same content already present → this op succeeded on a
+                    // prior apply. Idempotent success, not an overwrite.
+                    bridge::OpResult::ok(path_str, "upload").with_node(&uid, None)
+                }
+                _ => bridge::OpResult::err(
+                    path_str,
+                    "upload",
+                    "a different file already exists remotely at this name — refusing to overwrite (re-plan)",
+                ),
+            }
+        }
+        Err(e) => bridge::OpResult::err(path_str, "upload", e.to_string()),
+    }
+}
+
 /// Upload wrapper returning a plain message on failure (for per-op results).
 async fn upload_file(
     server: &DriveMcpServer,
     target: UploadTarget<'_>,
     local_file: &Path,
+    expected_current_revision_id: Option<String>,
 ) -> Result<(), String> {
-    let (meta, _sha1) = build_upload_meta(local_file).await?;
+    let (mut meta, _sha1) = build_upload_meta(local_file).await?;
+    // Carry the plan's revision token to the server for a revision upload so
+    // its optimistic-concurrency guard fires on the plan-time revision, not a
+    // fresh read (closes the between-reads race the local staleness check
+    // cannot). `None` for a new-file upload.
+    meta.expected_current_revision_id = expected_current_revision_id;
     run_upload(server, target, local_file, meta)
         .await
         .map_err(|e| e.to_string())

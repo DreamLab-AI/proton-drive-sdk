@@ -25,12 +25,17 @@ impl RelativePath {
     /// Build a `RelativePath` from an already-normalised forward-slash string.
     ///
     /// Leading/trailing slashes are trimmed and empty segments collapsed so
-    /// that `"a//b/"` and `"a/b"` are the same identity.
+    /// that `"a//b/"` and `"a/b"` are the same identity. `.` and `..` segments
+    /// are dropped: a remote node name is a decrypted, server-supplied string,
+    /// so a name of `..` must never be allowed to climb out of the sync root
+    /// when this identity is later joined onto a local path — dropping it here
+    /// keeps the identity in-tree (the belt to [`crate::path`] callers'
+    /// join-side braces).
     pub fn new(raw: impl AsRef<str>) -> Self {
         let cleaned: Vec<&str> = raw
             .as_ref()
             .split('/')
-            .filter(|s| !s.is_empty() && *s != ".")
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
             .collect();
         Self(cleaned.join("/"))
     }
@@ -156,6 +161,15 @@ mod tests {
     fn parent_of_nested_path() {
         let p = RelativePath::new("a/b/c.txt");
         assert_eq!(p.parent(), Some(RelativePath::new("a/b")));
+    }
+
+    #[test]
+    fn new_strips_parent_dir_segments_to_prevent_escape() {
+        // A remote node named ".." must not survive into the identity — it would
+        // let a later local-path join climb out of the sync root.
+        assert_eq!(RelativePath::new("../evil.txt").as_str(), "evil.txt");
+        assert_eq!(RelativePath::new("a/../../b").as_str(), "a/b");
+        assert_eq!(RelativePath::new("..").as_str(), "");
     }
 
     #[test]

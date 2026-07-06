@@ -322,6 +322,7 @@ async fn do_upload(
         modification_time,
         additional_metadata_json: None,
         override_existing_draft_by_other_client: false,
+        expected_current_revision_id: None,
     };
 
     let uploader = client

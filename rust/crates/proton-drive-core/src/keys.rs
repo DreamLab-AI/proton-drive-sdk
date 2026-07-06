@@ -14,7 +14,10 @@
 //! identical everywhere — closing the B2 upload-half gap where upload used to
 //! resolve only the share-root parent (see `docs/IMPLEMENTATION-STATUS.md`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
 use proton_drive_api::nodes::Link;
@@ -205,6 +208,100 @@ pub(crate) async fn resolve_node_key_and_link(
     Ok((node_key, target_link))
 }
 
+/// A batch-scoped memo of resolved node private keys, keyed by link id.
+///
+/// Shared across the per-file resolutions of a single [`fetch_revision_xattrs`]
+/// batch so a subtree of N files at depth D costs O(unique folders) link GETs +
+/// key decrypts instead of O(N·D): each file's climb stops at the first ancestor
+/// already unlocked by a sibling.
+///
+/// [`fetch_revision_xattrs`]: crate::ProtonDriveClient::fetch_revision_xattrs
+pub(crate) type NodeKeyCache = Mutex<HashMap<String, PrivateKey>>;
+
+/// Like [`resolve_node_key_via_chain`], but consults and populates a
+/// batch-scoped [`NodeKeyCache`] so ancestor keys shared across a set of target
+/// links are unlocked once, not once per target.
+///
+/// Semantically identical to the uncached walk (same fold order, same
+/// non-fatal signature handling); the cache only elides redundant work. The
+/// lock is taken solely for map get/insert and is never held across an `await`.
+pub(crate) async fn resolve_node_key_via_chain_cached(
+    http: &Arc<dyn ProtonDriveHttpClient>,
+    openpgp: &Arc<dyn OpenPgpCrypto>,
+    account: &Arc<dyn ProtonDriveAccount>,
+    share_id: &str,
+    link_id: &str,
+    share_priv: &PrivateKey,
+    cache: &NodeKeyCache,
+) -> Result<PrivateKey> {
+    // Climb target → root, but stop at the first link whose key a sibling has
+    // already cached; seed the fold from that key rather than re-deriving it.
+    let mut chain: Vec<(String, Link)> = Vec::new();
+    let mut current_id = link_id.to_owned();
+    let mut seed: Option<PrivateKey> = None;
+
+    loop {
+        if let Some(cached) = cache.lock().await.get(&current_id).cloned() {
+            seed = Some(cached);
+            break;
+        }
+        if chain.len() >= MAX_CHAIN_DEPTH {
+            return Err(Error::Internal(format!(
+                "node key chain exceeded depth {MAX_CHAIN_DEPTH} (cyclic parent links?)"
+            )));
+        }
+        let path = format!("/drive/shares/{share_id}/links/{current_id}");
+        let resp: proton_drive_api::nodes::GetLinkResponse = api_get(http, &path).await?;
+        let link = resp.link;
+        let parent = link.parent_link_id.clone();
+        chain.push((current_id.clone(), link));
+        match parent {
+            Some(p) => current_id = p,
+            None => break,
+        }
+    }
+
+    // Fold from the deepest uncached ancestor down to the target, unlocking and
+    // caching each. `parent_ref` is the cached seed (if the climb stopped early)
+    // or the share key (if it reached the root).
+    let mut current = seed;
+    for (id, entry) in chain.iter().rev() {
+        let parent_ref: &PrivateKey = current.as_ref().unwrap_or(share_priv);
+
+        let verification_keys: Vec<PublicKey> = match &entry.signature_email {
+            Some(email) => account.address_public_keys(email).await.unwrap_or_default(),
+            None => match openpgp.public_key(parent_ref).await {
+                Ok(pk) => vec![pk],
+                Err(_) => Vec::new(),
+            },
+        };
+
+        let (next, verified) = decrypt_node_private_key(
+            openpgp,
+            &entry.node_key,
+            &entry.node_passphrase,
+            &entry.node_passphrase_signature,
+            parent_ref,
+            &verification_keys,
+        )
+        .await?;
+
+        if verified != VerificationStatus::Ok {
+            tracing::warn!(
+                signature_email = ?entry.signature_email,
+                status = ?verified,
+                "node NodePassphraseSignature present but unverifiable \
+                 (non-fatal, JS-faithful) — key still unlocked"
+            );
+        }
+
+        cache.lock().await.insert(id.clone(), next.clone());
+        current = Some(next);
+    }
+
+    current.ok_or_else(|| Error::Internal("empty node key chain".into()))
+}
+
 /// Resolve the full upload parent context (parent node key + decrypted
 /// `NodeHashKey`) for a parent folder at **any depth**.
 ///
@@ -274,7 +371,11 @@ async fn api_get<T: serde::de::DeserializeOwned>(
     };
     let resp = http.request_json(req).await?;
     let env: ResponseEnvelope<T> = serde_json::from_slice(&resp.body)
-        .map_err(|e| Error::Internal(format!("JSON parse: {e}")))?;
+        // Name the endpoint that produced the malformed body — a chained
+        // share/parent-link resolution issues several GETs, and a bare
+        // "JSON parse" gave no clue which one Proton answered with HTML/an
+        // error page. Diagnosability, not behaviour.
+        .map_err(|e| Error::Internal(format!("JSON parse ({path}): {e}")))?;
     if env.code != CODE_OK {
         return Err(map_api_error(env.code, env.error));
     }

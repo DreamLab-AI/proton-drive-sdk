@@ -3129,6 +3129,7 @@ mod tests {
                 modification_time: None,
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
+                expected_current_revision_id: None,
             },
             telemetry: None,
         };

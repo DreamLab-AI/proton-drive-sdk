@@ -178,6 +178,12 @@ pub(crate) struct DriveUploadParams {
     /// Remote name; defaults to the local file's basename.
     #[serde(default)]
     pub name: Option<String>,
+    /// If the name already exists remotely: when `false` (default) the upload
+    /// fails rather than touch the existing file; when `true` a new revision of
+    /// the existing node is uploaded (replacing its active content). Off by
+    /// default so a create can never silently overwrite an unrelated file.
+    #[serde(default)]
+    pub allow_revision_on_conflict: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -299,16 +299,23 @@ impl ProtonDriveClient {
         // fn) here trips rustc's HRTB `Send` false-negative (#102211) inside
         // `buffer_unordered`, which would force `Send` consumers (pdtui's MCP
         // tool futures) onto a blocking thread.
+        // One key-chain memo shared across the whole batch: files sharing a
+        // parent folder unlock its key once, not once each (finding: O(N·depth)
+        // link GETs + decrypts otherwise — minutes of wall time and 429 risk on
+        // Proton's shared rate limits for a deep subtree).
+        let cache: Arc<keys::NodeKeyCache> = Arc::new(keys::NodeKeyCache::default());
         let concurrency = self.opts.config.max_parallel_transfers.max(1);
         let jobs: Vec<_> = revisions
             .iter()
             .map(|(uid, revision_id)| {
                 let ctx = shares.get(uid.volume_id.as_str()).and_then(Clone::clone);
-                (uid.clone(), revision_id.clone(), ctx)
+                (uid.clone(), revision_id.clone(), ctx, Arc::clone(&cache))
             })
             .collect();
         stream::iter(jobs)
-            .map(|(uid, revision_id, ctx)| self.fetch_one_revision_xattr(uid, revision_id, ctx))
+            .map(|(uid, revision_id, ctx, cache)| {
+                self.fetch_one_revision_xattr(uid, revision_id, ctx, cache)
+            })
             .buffer_unordered(concurrency)
             .filter_map(|entry| async move { entry })
             .collect()
@@ -322,11 +329,12 @@ impl ProtonDriveClient {
         uid: NodeUid,
         revision_id: String,
         share_ctx: Option<Arc<(String, PrivateKey)>>,
+        cache: Arc<keys::NodeKeyCache>,
     ) -> Option<(NodeUid, RevisionXAttr)> {
         let ctx = share_ctx?;
         let (volume_id, share_priv) = ctx.as_ref();
         let xattr = self
-            .resolve_revision_xattr(&uid, &revision_id, volume_id, share_priv)
+            .resolve_revision_xattr(&uid, &revision_id, volume_id, share_priv, &cache)
             .await?;
         Some((uid, xattr))
     }
@@ -370,11 +378,19 @@ impl ProtonDriveClient {
         revision_id: &str,
         volume_id: &str,
         share_priv: &PrivateKey,
+        cache: &keys::NodeKeyCache,
     ) -> Option<RevisionXAttr> {
-        let node_priv = self
-            .resolve_node_key_via_chain(&uid.volume_id, &uid.node_id, share_priv)
-            .await
-            .ok()?;
+        let node_priv = keys::resolve_node_key_via_chain_cached(
+            &self.opts.http_client,
+            &self.opts.openpgp,
+            &self.opts.account,
+            &uid.volume_id,
+            &uid.node_id,
+            share_priv,
+            cache,
+        )
+        .await
+        .ok()?;
 
         // Fetch + decrypt the revision's XAttr. Best-effort: no verification
         // keys (metadata surfacing, not an authenticity gate — the download path

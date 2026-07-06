@@ -128,6 +128,14 @@ pub struct UploadMetadata {
     pub additional_metadata_json: Option<String>,
     /// If true, override any existing draft owned by another client.
     pub override_existing_draft_by_other_client: bool,
+    /// For a revision upload: the revision uid the caller *expects* to be
+    /// current, posted verbatim as `CurrentRevisionID` so the server rejects
+    /// the draft if the active revision moved since the caller last observed it.
+    /// `None` falls back to the freshly-read active revision (drive_upload's own
+    /// 2500-collision path, which has no plan token). Threading a plan-time
+    /// token closes the race between the SDK's own re-read and the draft POST
+    /// that a fresh read cannot (domain-model-sync invariant 2).
+    pub expected_current_revision_id: Option<String>,
 }
 
 impl UploadMetadata {
@@ -1208,13 +1216,19 @@ impl ProtonRevisionUploader {
             .as_ref()
             .ok_or_else(|| Error::Internal("file link missing FileProperties".into()))?;
         // Optimistic-concurrency guard — the server rejects the draft if the
-        // active revision has moved since we read it here (JS
-        // `createDraftRevision`'s `currentRevisionUid: node.activeRevision.value.uid`).
-        let current_revision_id = file_props
-            .active_revision
-            .as_ref()
-            .map(|r| r.id.clone())
-            .ok_or_else(|| Error::NotFound("file has no active revision".into()))?;
+        // active revision has moved (JS `createDraftRevision`'s
+        // `currentRevisionUid: node.activeRevision.value.uid`). Prefer the
+        // caller's plan-time token when supplied: a fresh read here would paper
+        // over a revision that landed between the caller's plan and this call,
+        // exactly the race the server guard exists to close.
+        let current_revision_id = match &self.metadata.expected_current_revision_id {
+            Some(expected) => expected.clone(),
+            None => file_props
+                .active_revision
+                .as_ref()
+                .map(|r| r.id.clone())
+                .ok_or_else(|| Error::NotFound("file has no active revision".into()))?,
+        };
         let content_key_packet = file_props
             .content_key_packet
             .clone()
@@ -1664,6 +1678,7 @@ mod tests {
             modification_time: None,
             additional_metadata_json: None,
             override_existing_draft_by_other_client: false,
+            expected_current_revision_id: None,
         };
         let r = meta.validate();
         assert!(matches!(r, Err(Error::Validation(_))));
@@ -1678,6 +1693,7 @@ mod tests {
             modification_time: None,
             additional_metadata_json: None,
             override_existing_draft_by_other_client: false,
+            expected_current_revision_id: None,
         };
         let r = meta.validate();
         assert!(matches!(r, Err(Error::Validation(_))));
@@ -1692,6 +1708,7 @@ mod tests {
             modification_time: None,
             additional_metadata_json: None,
             override_existing_draft_by_other_client: false,
+            expected_current_revision_id: None,
         };
         assert!(meta.validate().is_ok());
     }
@@ -1705,6 +1722,7 @@ mod tests {
             modification_time: None,
             additional_metadata_json: None,
             override_existing_draft_by_other_client: false,
+            expected_current_revision_id: None,
         };
         assert!(matches!(meta.validate(), Err(Error::Validation(_))));
     }
@@ -2347,6 +2365,7 @@ mod tests {
                 modification_time: None,
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
+                expected_current_revision_id: None,
             },
             telemetry: None,
         };
@@ -2544,6 +2563,7 @@ mod tests {
                 modification_time: None,
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
+                expected_current_revision_id: None,
             },
             telemetry: None,
         }
@@ -2966,6 +2986,7 @@ mod tests {
                 modification_time: None,
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
+                expected_current_revision_id: None,
             },
             telemetry: None,
         }
@@ -3209,6 +3230,7 @@ mod tests {
                 modification_time: None,
                 additional_metadata_json: None,
                 override_existing_draft_by_other_client: false,
+                expected_current_revision_id: None,
             },
             telemetry: None,
         };

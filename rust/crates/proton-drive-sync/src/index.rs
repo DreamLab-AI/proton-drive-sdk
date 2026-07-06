@@ -336,15 +336,30 @@ fn hash_file(path: &Path) -> Result<ContentHash, SyncError> {
     Ok(ContentHash::from_hex(hex_lower(&hasher.finalize())))
 }
 
-/// Split a `SystemTime` into whole seconds + sub-second nanos relative to the
-/// unix epoch, handling pre-epoch times without panicking.
+/// Split a `SystemTime` into floored whole seconds + sub-second nanos relative
+/// to the unix epoch, handling pre-epoch times without panicking.
+///
+/// `nanos` always counts *forward* from `secs` (i.e. `secs` is the floor), so a
+/// pre-epoch instant and its mirror-image post-epoch instant never collapse to
+/// the same `(secs, nanos)` pair. The naive `(-secs, subsec_nanos)` encoding
+/// did collide — e.g. 0.3 s before and 0.3 s after the epoch both mapped to
+/// `(0, 300_000_000)`, letting a `HashCache` record validate against the wrong
+/// mtime and return a stale digest for a changed file.
 fn split_mtime(t: SystemTime) -> (i64, u32) {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
         Err(e) => {
-            // Time is before the epoch: represent as negative seconds.
+            // `e.duration()` is the absolute distance *before* the epoch. Floor
+            // it: -0.3 s → (-1, 700_000_000), distinct from +0.3 s →
+            // (0, 300_000_000); a whole-second pre-epoch time keeps nanos 0.
             let d = e.duration();
-            (-(d.as_secs() as i64), d.subsec_nanos())
+            let secs = d.as_secs() as i64;
+            let nanos = d.subsec_nanos();
+            if nanos == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - nanos)
+            }
         }
     }
 }
@@ -358,4 +373,49 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn split_mtime_pre_and_post_epoch_do_not_collide() {
+        // The exact regression: 0.3 s before and 0.3 s after the epoch must not
+        // encode to the same (secs, nanos), or a HashCache record validates
+        // against the wrong mtime and returns a stale digest for a changed file.
+        let before = split_mtime(SystemTime::UNIX_EPOCH - Duration::from_millis(300));
+        let after = split_mtime(SystemTime::UNIX_EPOCH + Duration::from_millis(300));
+        assert_ne!(before, after);
+        assert_eq!(before, (-1, 700_000_000));
+        assert_eq!(after, (0, 300_000_000));
+    }
+
+    #[test]
+    fn split_mtime_whole_second_pre_epoch_keeps_zero_nanos() {
+        assert_eq!(
+            split_mtime(SystemTime::UNIX_EPOCH - Duration::from_secs(5)),
+            (-5, 0)
+        );
+    }
+
+    #[test]
+    fn split_mtime_is_monotonic_across_the_epoch() {
+        // Ordering the (secs, nanos) tuples must agree with time ordering.
+        let times = [
+            SystemTime::UNIX_EPOCH - Duration::from_millis(1500),
+            SystemTime::UNIX_EPOCH - Duration::from_millis(300),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(300),
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1500),
+        ];
+        let encoded: Vec<(i64, u32)> = times.iter().copied().map(split_mtime).collect();
+        let mut sorted = encoded.clone();
+        sorted.sort();
+        assert_eq!(
+            encoded, sorted,
+            "encoding must preserve chronological order"
+        );
+    }
 }
