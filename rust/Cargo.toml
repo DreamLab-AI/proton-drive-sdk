@@ -45,6 +45,12 @@ prost-types = "0.14"
 protoc-bin-vendored = "3.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
+# MCP server surface for `pdtui mcp` (ADR-0013). Scoped to apps/pdtui — kept out
+# of every proton-drive-* SDK crate. Feature set verified against rmcp 2.1's own
+# feature map: a stdio-only tool server needs server + macros + transport-io +
+# schemars (the `client`/HTTP transports are deliberately omitted).
+rmcp = { version = "2.1", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

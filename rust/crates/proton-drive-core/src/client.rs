@@ -274,7 +274,7 @@ impl ProtonDriveClient {
         // typically all one share (My Files), so this avoids repeating the share
         // GET / volume GET / share-key decrypt for every node (shared rate limits,
         // ADR operational constraints).
-        let mut shares: HashMap<&str, Option<(String, PrivateKey)>> = HashMap::new();
+        let mut shares: HashMap<String, Option<Arc<(String, PrivateKey)>>> = HashMap::new();
         for (uid, _) in revisions {
             if !shares.contains_key(uid.volume_id.as_str()) {
                 let ctx = self
@@ -287,27 +287,48 @@ impl ProtonDriveClient {
                              skipping its nodes (non-fatal)"
                         );
                     })
-                    .ok();
-                shares.insert(uid.volume_id.as_str(), ctx);
+                    .ok()
+                    .map(Arc::new);
+                shares.insert(uid.volume_id.clone(), ctx);
             }
         }
 
+        // Each job owns its data (cloned uid/revision id, `Arc`-shared share
+        // context) so the per-entry future borrows nothing with a
+        // higher-ranked lifetime: an `async` block (or reference-taking named
+        // fn) here trips rustc's HRTB `Send` false-negative (#102211) inside
+        // `buffer_unordered`, which would force `Send` consumers (pdtui's MCP
+        // tool futures) onto a blocking thread.
         let concurrency = self.opts.config.max_parallel_transfers.max(1);
-        stream::iter(revisions.iter())
+        let jobs: Vec<_> = revisions
+            .iter()
             .map(|(uid, revision_id)| {
-                let share_ctx = shares.get(uid.volume_id.as_str()).and_then(|c| c.as_ref());
-                async move {
-                    let (volume_id, share_priv) = share_ctx?;
-                    let xattr = self
-                        .resolve_revision_xattr(uid, revision_id, volume_id, share_priv)
-                        .await?;
-                    Some((uid.clone(), xattr))
-                }
+                let ctx = shares.get(uid.volume_id.as_str()).and_then(Clone::clone);
+                (uid.clone(), revision_id.clone(), ctx)
             })
+            .collect();
+        stream::iter(jobs)
+            .map(|(uid, revision_id, ctx)| self.fetch_one_revision_xattr(uid, revision_id, ctx))
             .buffer_unordered(concurrency)
             .filter_map(|entry| async move { entry })
             .collect()
             .await
+    }
+
+    /// One entry of [`Self::fetch_revision_xattrs`]. Takes owned data (see the
+    /// HRTB note at the call site) so the returned future is provably `Send`.
+    async fn fetch_one_revision_xattr(
+        &self,
+        uid: NodeUid,
+        revision_id: String,
+        share_ctx: Option<Arc<(String, PrivateKey)>>,
+    ) -> Option<(NodeUid, RevisionXAttr)> {
+        let ctx = share_ctx?;
+        let (volume_id, share_priv) = ctx.as_ref();
+        let xattr = self
+            .resolve_revision_xattr(&uid, &revision_id, volume_id, share_priv)
+            .await?;
+        Some((uid, xattr))
     }
 
     /// Resolve the private key of a folder node, used to decrypt its children's

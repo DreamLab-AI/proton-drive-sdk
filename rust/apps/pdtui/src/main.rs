@@ -17,6 +17,7 @@ mod auth;
 mod events_bridge;
 mod http;
 mod keymap;
+mod mcp;
 mod mvp;
 mod panes;
 mod probe;
@@ -46,6 +47,7 @@ async fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("login") => run_login().await,
         Some("mvp") => run_mvp().await,
+        Some("mcp") => run_mcp().await,
         Some("probe") => run_probe().await,
         Some("logout") => run_logout().await,
         Some("where") => {
@@ -73,6 +75,7 @@ USAGE:
     pdtui                 launch the TUI
     pdtui login           authenticate via SRP and persist session
     pdtui mvp             live round-trip: list root, upload + download a file
+    pdtui mcp             serve the MCP tool surface over stdio (agent control)
     pdtui probe           run live-API diagnostic probes (M1 + M3 e2e)
     pdtui logout          clear keyring + truncate session.json
     pdtui where           print where the session config file should live
@@ -104,6 +107,18 @@ async fn run_mvp() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mvp failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_mcp() -> ExitCode {
+    // stdout is the MCP transport — never print to it on this path; the tracing
+    // subscriber (init_tracing) writes diagnostics to stderr.
+    match mcp::run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mcp failed: {e}");
             ExitCode::FAILURE
         }
     }

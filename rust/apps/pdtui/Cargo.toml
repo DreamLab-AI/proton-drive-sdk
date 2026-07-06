@@ -48,6 +48,7 @@ reqwest.workspace = true
 rpassword = "7"
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync", "io-util", "fs"] }
@@ -57,10 +58,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 thiserror.workspace = true
 futures.workspace = true
+# MCP server (`pdtui mcp`, ADR-0013). rmcp is a pdtui-only dependency — never
+# pulled into a proton-drive-* SDK crate.
+rmcp.workspace = true
+schemars.workspace = true
 proton-drive = { path = "../../crates/proton-drive" }
 proton-drive-api = { path = "../../crates/proton-drive-api" }
 proton-drive-cache = { path = "../../crates/proton-drive-cache" }
 proton-drive-crypto = { path = "../../crates/proton-drive-crypto" }
+# Direct deps for the MCP surface: the sync engine (WP3) and the core crate's
+# events/volume-resolution free functions the events_poll tool drives.
+proton-drive-core = { path = "../../crates/proton-drive-core" }
+proton-drive-sync = { path = "../../crates/proton-drive-sync" }
 
 # Test-only: a hand-rolled loopback HTTP/1.1 mock server for
 # ReqwestHttpClient retry/backoff tests (src/http.rs) needs `net`. No
@@ -69,3 +78,5 @@ proton-drive-crypto = { path = "../../crates/proton-drive-crypto" }
 # unchanged.
 [dev-dependencies]
 tokio = { workspace = true, features = ["net"] }
+# Used by the mcp::bridge plan-store unit test to build a real (empty) LocalIndex.
+tempfile.workspace = true
