@@ -2375,6 +2375,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "proton-drive-sync"
+version = "0.1.0"
+dependencies = [
+ "proton-drive-core",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "proton-drive-telemetry"
 version = "0.1.0"
 dependencies = [

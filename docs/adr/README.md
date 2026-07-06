@@ -14,5 +14,6 @@
 | [0010](0010-session-lifecycle-and-refresh.md) | Session lifecycle and token refresh | Accepted |
 | [0011](0011-zeroize-secret-material.md) | Zeroize all credential and key material on drop | Accepted |
 | [0012](0012-wire-format-validation.md) | Wire-format validation via JS-encoded fixtures | Accepted |
+| [0013](0013-mcp-server-surface.md) | MCP server surface (`pdtui mcp`) | Accepted |
 
 New ADRs: copy [`0000-template.md`](0000-template.md) and bump the number.

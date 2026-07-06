@@ -44,7 +44,7 @@ pub struct DownloadStats {
     pub blocks: u32,
     /// Modification time from the XAttr (if present, decryptable, and
     /// parsed as one of the accepted formats — see
-    /// [`parse_xattr_modification_time`]).
+    /// [`crate::xattr::modification_time`]).
     pub last_modification_time: Option<std::time::SystemTime>,
     /// Set when `Common.ModificationTime` was present in the (decrypted)
     /// XAttr JSON but was not a value we could parse into a time — e.g. the
@@ -390,10 +390,15 @@ impl FileDownloader {
         let Some(xattr_armored) = revision.x_attr.as_deref() else {
             return Ok(None);
         };
-        Ok(self
-            .decrypt_xattr_json(xattr_armored)
-            .await
-            .and_then(|xattr| xattr["Common"]["Size"].as_u64()))
+        Ok(crate::xattr::decrypt_xattr_json(
+            &self.crypto,
+            &self.node_private_key,
+            &self.node_uid.node_id,
+            xattr_armored,
+        )
+        .await
+        .as_ref()
+        .and_then(crate::xattr::size))
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -561,79 +566,6 @@ impl FileDownloader {
         Ok(plaintext)
     }
 
-    /// Decrypt a revision's armored `XAttr` blob to its plaintext JSON.
-    ///
-    /// XAttr decryption is best-effort for MVP: if undecryptable or not valid
-    /// UTF-8/JSON, we warn and return `None` (JS does the same fallback).
-    /// Shared by `verify_xattr` (post-download cross-check) and
-    /// `claimed_size` (pre-download progress total) so both read the same
-    /// bytes the same way.
-    ///
-    /// XAttr is an armored PGP message (`armoredExtendedAttributes`):
-    /// encrypted to the node key, signed by the address key. Decrypt the
-    /// session key with the node key, then the message body; verification is
-    /// best-effort (empty keys → no signature check), mirroring JS where a
-    /// failed XAttr decrypt is non-fatal.
-    async fn decrypt_xattr_json(&self, xattr_armored: &str) -> Option<serde_json::Value> {
-        let xattr_bytes = xattr_armored.as_bytes();
-        let session_key = match self
-            .crypto
-            .decrypt_session_key(xattr_bytes, std::slice::from_ref(&self.node_private_key))
-            .await
-        {
-            Ok(sk) => sk,
-            Err(e) => {
-                tracing::warn!(
-                    node_id = %self.node_uid.node_id,
-                    "XAttr session-key decrypt failed: {e} — skipping cross-check"
-                );
-                return None;
-            }
-        };
-
-        let plaintext = match self
-            .crypto
-            .decrypt_and_verify(xattr_bytes, &session_key, &[])
-            .await
-        {
-            Ok((pt, _)) => pt,
-            Err(e) => {
-                tracing::warn!(
-                    node_id = %self.node_uid.node_id,
-                    "XAttr decrypt failed: {e} — skipping cross-check"
-                );
-                return None;
-            }
-        };
-
-        let json_str = match std::str::from_utf8(&plaintext) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    node_id = %self.node_uid.node_id,
-                    "XAttr plaintext not UTF-8: {e}"
-                );
-                return None;
-            }
-        };
-
-        match serde_json::from_str(json_str) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                // Show what was actually in the JSON (digits redacted, matching
-                // cs `Iso8601DateTimeResultJsonConverter`'s redaction) rather
-                // than just the serde_json parse error — that error alone
-                // doesn't say what shape the payload had.
-                tracing::warn!(
-                    node_id = %self.node_uid.node_id,
-                    "XAttr JSON parse failed: {e}; payload was: {}",
-                    redact_digits(json_str)
-                );
-                None
-            }
-        }
-    }
-
     /// Attempt to cross-check the assembled file against XAttr metadata.
     ///
     /// XAttr decryption is best-effort for MVP: if absent or undecryptable,
@@ -643,31 +575,43 @@ impl FileDownloader {
     /// - `Common.Size` matches `total_bytes`
     /// - `Common.Digests.SHA1` matches `sha1_digest`
     /// - `Common.ModificationTime`, if present, parses as one of the accepted
-    ///   date formats (see [`parse_xattr_modification_time`]); an unparseable
-    ///   value is reported via [`XAttrModificationTime::error`] but never
-    ///   aborts the download — mirrors cs `DtoToMetadataConverter` treating a
-    ///   modification-time parse failure as a per-node degradation, not a
-    ///   fatal error.
+    ///   date formats (see [`crate::xattr::modification_time`]); an unparseable
+    ///   value is reported via [`crate::xattr::XAttrModificationTime::error`]
+    ///   but never aborts the download — mirrors cs `DtoToMetadataConverter`
+    ///   treating a modification-time parse failure as a per-node degradation,
+    ///   not a fatal error.
+    ///
+    /// Decryption + parsing live in [`crate::xattr`], shared with the
+    /// listing/fetch path; this method adds only the download-specific
+    /// cross-checks that compare the claimed values against the bytes actually
+    /// downloaded.
     async fn verify_xattr(
         &self,
         xattr_armored: Option<&str>,
         total_bytes: u64,
         sha1_digest: &[u8],
-    ) -> XAttrModificationTime {
+    ) -> crate::xattr::XAttrModificationTime {
         let Some(xattr_raw) = xattr_armored else {
             tracing::debug!(
                 node_id = %self.node_uid.node_id,
                 "no XAttr on revision — skipping XAttr cross-check (legacy revision)"
             );
-            return XAttrModificationTime::default();
+            return crate::xattr::XAttrModificationTime::default();
         };
 
-        let Some(xattr) = self.decrypt_xattr_json(xattr_raw).await else {
-            return XAttrModificationTime::default();
+        let Some(xattr) = crate::xattr::decrypt_xattr_json(
+            &self.crypto,
+            &self.node_private_key,
+            &self.node_uid.node_id,
+            xattr_raw,
+        )
+        .await
+        else {
+            return crate::xattr::XAttrModificationTime::default();
         };
 
         // Verify size.
-        if let Some(claimed_size) = xattr["Common"]["Size"].as_u64() {
+        if let Some(claimed_size) = crate::xattr::size(&xattr) {
             if claimed_size != total_bytes {
                 tracing::error!(
                     node_id = %self.node_uid.node_id,
@@ -678,7 +622,7 @@ impl FileDownloader {
         }
 
         // Verify SHA1.
-        if let Some(claimed_sha1) = xattr["Common"]["Digests"]["SHA1"].as_str() {
+        if let Some(claimed_sha1) = crate::xattr::content_sha1(&xattr) {
             let actual_sha1_hex = hex::encode(sha1_digest);
             if claimed_sha1 != actual_sha1_hex {
                 tracing::error!(
@@ -688,203 +632,15 @@ impl FileDownloader {
             }
         }
 
-        // Extract modification time. `ModificationTime` is a JSON *string* on
-        // the wire (`dateToIsoString` — `reference/client/js/src/internal/nodes/extendedAttributes.ts`),
-        // never a number — the previous `.as_i64()` here could never match a
-        // real payload.
-        match xattr.get("Common").and_then(|c| c.get("ModificationTime")) {
-            None | Some(serde_json::Value::Null) => XAttrModificationTime::default(),
-            Some(serde_json::Value::String(raw)) => match parse_xattr_modification_time(raw) {
-                Some(time) => XAttrModificationTime {
-                    time: Some(time),
-                    error: None,
-                },
-                None => {
-                    let msg = format!(
-                        "XAttr ModificationTime \"{}\" is not a recognized date format",
-                        redact_digits(raw)
-                    );
-                    tracing::warn!(node_id = %self.node_uid.node_id, "{msg}");
-                    XAttrModificationTime {
-                        time: None,
-                        error: Some(msg),
-                    }
-                }
-            },
-            Some(other) => {
-                let msg = format!(
-                    "XAttr ModificationTime has unexpected JSON type (expected string): {}",
-                    redact_digits(&other.to_string())
-                );
-                tracing::warn!(node_id = %self.node_uid.node_id, "{msg}");
-                XAttrModificationTime {
-                    time: None,
-                    error: Some(msg),
-                }
-            }
+        // Extract modification time (per-node degradation on parse failure,
+        // never a download error — the error is logged here, then surfaced via
+        // the returned struct for the caller's DownloadStats).
+        let mtime = crate::xattr::modification_time(&xattr);
+        if let Some(err) = &mtime.error {
+            tracing::warn!(node_id = %self.node_uid.node_id, "{err}");
         }
+        mtime
     }
-}
-
-/// Outcome of best-effort `Common.ModificationTime` extraction from a
-/// decrypted XAttr document — mirrors cs's `Result<DateTime,
-/// ProtonDriveError>?` on `CommonExtendedAttributes.ModificationTime`
-/// (`reference/client/cs/src/Proton.Drive.Sdk/Api/Files/CommonExtendedAttributes.cs`):
-/// absent, present-and-valid, or present-but-unparseable. The last case is a
-/// per-node degradation surfaced to the caller, never a download failure.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct XAttrModificationTime {
-    time: Option<std::time::SystemTime>,
-    error: Option<String>,
-}
-
-/// Redact ASCII digits from a string for safe inclusion in logs/error text —
-/// mirrors cs `Iso8601DateTimeResultJsonConverter`'s `redactedValue`
-/// (`char.IsDigit(c) ? '#' : c`): shows the *shape* of what was actually in
-/// the JSON without leaking the exact claimed timestamp.
-fn redact_digits(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-        .collect()
-}
-
-/// Parse an XAttr `Common.ModificationTime` string into a `SystemTime`.
-///
-/// Accepts the format set upstream both writes and reads:
-/// - JS `Date.prototype.toISOString()` (`extendedAttributes.ts`
-///   `dateToIsoString`) — always UTC, always exactly 3 fractional digits:
-///   `YYYY-MM-DDTHH:MM:SS.sssZ`.
-/// - C# round-trip (`"O"`) format
-///   (`Iso8601DateTimeResultJsonConverter.Write`) — always UTC, always
-///   exactly 7 fractional digits: `YYYY-MM-DDTHH:MM:SS.fffffffZ`.
-/// - The general RFC 3339 shape cs's reader also accepts (`TryGetDateTimeOffset`
-///   plus its `DateTimeOffset.TryParse` fallback): any fractional-second
-///   digit count from 0 to 9, and either a `Z` suffix or a numeric
-///   `+HH:MM`/`-HH:MM` offset in place of `Z` — covering values written by
-///   other first-party clients (desktop/mobile), not just this SDK's own
-///   writer.
-///
-/// Returns `None` — not an error — for anything else. The caller ([`FileDownloader::verify_xattr`])
-/// treats `None` as a per-node degradation (mirrors cs recording an
-/// `ExtendedAttributesDeserializationError` against the node), never a fatal
-/// download error.
-fn parse_xattr_modification_time(raw: &str) -> Option<std::time::SystemTime> {
-    let bytes = raw.as_bytes();
-    // Shortest valid form: "YYYY-MM-DDTHH:MM:SS" + "Z" == 20 bytes.
-    if bytes.len() < 20 {
-        return None;
-    }
-
-    let digit = |i: usize| -> Option<i64> {
-        let c = *bytes.get(i)?;
-        if c.is_ascii_digit() {
-            Some((c - b'0') as i64)
-        } else {
-            None
-        }
-    };
-    let two = |i: usize| -> Option<i64> { Some(digit(i)? * 10 + digit(i + 1)?) };
-    let four = |i: usize| -> Option<i64> {
-        Some(digit(i)? * 1000 + digit(i + 1)? * 100 + digit(i + 2)? * 10 + digit(i + 3)?)
-    };
-
-    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let year = four(0)?;
-    let month = two(5)?;
-    let day = two(8)?;
-
-    let t = bytes.get(10)?;
-    if *t != b'T' && *t != b't' {
-        return None;
-    }
-    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
-        return None;
-    }
-    let hour = two(11)?;
-    let minute = two(14)?;
-    let second = two(17)?;
-
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=59).contains(&second)
-    {
-        return None;
-    }
-
-    let mut cursor = 19usize;
-    let mut nanos: i64 = 0;
-    if bytes.get(cursor) == Some(&b'.') {
-        cursor += 1;
-        let frac_start = cursor;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-            cursor += 1;
-        }
-        let frac_len = cursor - frac_start;
-        if !(1..=9).contains(&frac_len) {
-            return None;
-        }
-        let mut value: i64 = 0;
-        for i in frac_start..cursor {
-            value = value * 10 + digit(i)?;
-        }
-        let scale = 10i64.pow(9 - frac_len as u32);
-        nanos = value * scale;
-    }
-
-    let offset_minutes: i64 = match bytes.get(cursor) {
-        Some(b'Z') | Some(b'z') => {
-            cursor += 1;
-            0
-        }
-        Some(b'+') | Some(b'-') => {
-            let sign = if bytes[cursor] == b'+' { 1 } else { -1 };
-            let offset_hour = two(cursor + 1)?;
-            if bytes.get(cursor + 3) != Some(&b':') {
-                return None;
-            }
-            let offset_minute = two(cursor + 4)?;
-            cursor += 6;
-            sign * (offset_hour * 60 + offset_minute)
-        }
-        _ => return None,
-    };
-
-    // Trailing garbage after a well-formed timestamp+offset is not tolerated.
-    if cursor != bytes.len() {
-        return None;
-    }
-
-    // days_from_civil (Howard Hinnant, http://howardhinnant.github.io/date_algorithms.html)
-    // — the inverse of `upload::system_time_to_iso8601`'s `civil_from_days`.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (month + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_since_epoch = era * 146_097 + doe - 719_468;
-
-    let seconds_of_day = hour * 3_600 + minute * 60 + second;
-    let total_seconds = days_since_epoch * 86_400 + seconds_of_day - offset_minutes * 60;
-
-    // `std::time::SystemTime`'s `Duration`-based API cannot represent an
-    // instant before `UNIX_EPOCH` on all platforms; treat as unparseable
-    // rather than panicking or silently clamping to the epoch (the previous
-    // behaviour here for the — never actually reachable — negative-integer
-    // branch).
-    if total_seconds < 0 {
-        return None;
-    }
-
-    Some(
-        std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(total_seconds as u64)
-            + std::time::Duration::from_nanos(nanos as u64),
-    )
 }
 
 // ── factory helpers (used by ProtonDriveClient) ───────────────────────────────
@@ -3433,89 +3189,12 @@ mod tests {
         );
     }
 
-    // ── XAttr ModificationTime: format parsing + per-node degradation ────────
-
-    /// Pure unit tests for [`parse_xattr_modification_time`] — no crypto or
-    /// HTTP setup needed, so the accepted-format matrix is cheap to cover
-    /// exhaustively here; the end-to-end behavioural guarantee (download
-    /// still succeeds when the value is garbage) is covered separately below
-    /// via `download_with_xattr_common`.
-    mod parse_xattr_modification_time_tests {
-        use super::super::parse_xattr_modification_time;
-        use std::time::{Duration, UNIX_EPOCH};
-
-        // 1_700_000_000s since epoch == 2023-11-14T22:13:20.000Z (same constant
-        // `upload::tests::xattr_json_with_mtime` uses for the writer side).
-        const EPOCH_SECS: u64 = 1_700_000_000;
-
-        #[test]
-        fn accepts_js_millisecond_format() {
-            assert_eq!(
-                parse_xattr_modification_time("2023-11-14T22:13:20.000Z"),
-                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
-            );
-        }
-
-        #[test]
-        fn accepts_no_fractional_seconds() {
-            assert_eq!(
-                parse_xattr_modification_time("2023-11-14T22:13:20Z"),
-                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
-            );
-        }
-
-        #[test]
-        fn accepts_cs_seven_digit_round_trip_format() {
-            assert_eq!(
-                parse_xattr_modification_time("2023-11-14T22:13:20.1234567Z"),
-                Some(
-                    UNIX_EPOCH
-                        + Duration::from_secs(EPOCH_SECS)
-                        + Duration::from_nanos(123_456_700)
-                )
-            );
-        }
-
-        #[test]
-        fn accepts_positive_numeric_offset() {
-            // 23:13:20+01:00 == 22:13:20Z.
-            assert_eq!(
-                parse_xattr_modification_time("2023-11-14T23:13:20+01:00"),
-                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
-            );
-        }
-
-        #[test]
-        fn accepts_negative_numeric_offset() {
-            // 21:13:20-01:00 == 22:13:20Z.
-            assert_eq!(
-                parse_xattr_modification_time("2023-11-14T21:13:20-01:00"),
-                Some(UNIX_EPOCH + Duration::from_secs(EPOCH_SECS))
-            );
-        }
-
-        #[test]
-        fn rejects_empty_and_truncated_strings() {
-            assert_eq!(parse_xattr_modification_time(""), None);
-            assert_eq!(parse_xattr_modification_time("2023-11-14"), None);
-        }
-
-        #[test]
-        fn rejects_non_date_garbage() {
-            assert_eq!(parse_xattr_modification_time("not-a-date-at-all!!"), None);
-        }
-
-        #[test]
-        fn rejects_out_of_range_components() {
-            assert_eq!(parse_xattr_modification_time("2023-13-14T22:13:20Z"), None); // month 13
-            assert_eq!(parse_xattr_modification_time("2023-11-14T25:13:20Z"), None); // hour 25
-        }
-
-        #[test]
-        fn rejects_missing_offset_or_z() {
-            assert_eq!(parse_xattr_modification_time("2023-11-14T22:13:20"), None);
-        }
-    }
+    // ── XAttr ModificationTime: per-node degradation (end-to-end) ────────────
+    //
+    // The accepted-format matrix for the underlying parser now lives with the
+    // parser itself in `crate::xattr` (`parse_modification_time_tests`); the
+    // end-to-end behavioural guarantee (download still succeeds when the value
+    // is garbage) is covered below via `download_with_xattr_common`.
 
     /// Builds a single-block revision whose XAttr is
     /// `{"Common": <xattr_common_json>}`, downloads it end to end (real

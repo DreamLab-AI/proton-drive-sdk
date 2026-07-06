@@ -53,6 +53,8 @@ Two distinct event streams in the JS model, both preserved:
 
 An **EventSubscription** is an aggregate root with a single lifetime: born from `subscribe_drive_events`, dies on `cancel()` or process exit. It owns the cursor (`latestEventId`) and is the only sanctioned way to keep a UI fresh — polling is forbidden.
 
+See `domain-model-sync.md` for the separate **Sync** context (local↔remote hash-based reconciliation) that consumes this event stream to detect snapshot staleness.
+
 ### 1.5 Crypto (supporting)
 Defined in ADR-0002. Aggregates here are pure value objects:
 

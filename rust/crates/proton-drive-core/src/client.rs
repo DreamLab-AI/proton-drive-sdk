@@ -19,8 +19,8 @@ use crate::events::{
 };
 use crate::http::{HttpMethod, JsonRequest, ProtonDriveHttpClient};
 use crate::nodes::{
-    CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, NodeUid, link_to_maybe_node,
-    map_api_error,
+    CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, NodeUid, RevisionXAttr,
+    link_to_maybe_node, map_api_error,
 };
 use crate::upload::{FileUploader, ProtonFileUploader, UploadMetadata};
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
@@ -122,7 +122,13 @@ impl ProtonDriveClient {
 
         // Root node name is always "root" per Proton's volume bootstrap.
         // TODO MC-followup: verify by decrypting link.name with share key.
-        Ok(link_to_maybe_node(link, &share_id, Some("root".to_owned())))
+        // The root is a folder — no file revision, so no XAttr to surface.
+        Ok(link_to_maybe_node(
+            link,
+            &share_id,
+            Some("root".to_owned()),
+            RevisionXAttr::default(),
+        ))
     }
 
     /// Fetch a single node by its uid.
@@ -134,7 +140,16 @@ impl ProtonDriveClient {
     pub async fn node(&self, uid: &NodeUid) -> Result<MaybeNode> {
         let path = format!("/drive/shares/{}/links/{}", uid.volume_id, uid.node_id);
         let resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&path).await?;
-        Ok(link_to_maybe_node(resp.link, &uid.volume_id, None))
+        // Name decryption is deferred here (no key context resolved), so the
+        // revision XAttr — which needs the node's own key — is likewise left
+        // unpopulated; the listing path (`fetch_folder_children`) is where key
+        // material is resolved and both are surfaced.
+        Ok(link_to_maybe_node(
+            resp.link,
+            &uid.volume_id,
+            None,
+            RevisionXAttr::default(),
+        ))
     }
 
     /// Iterate all children of a folder.
@@ -197,7 +212,18 @@ impl ProtonDriveClient {
                         .ok(),
                     None => None,
                 };
-                results.push(link_to_maybe_node(link, &parent.volume_id, name));
+                // The legacy v1 children endpoint does not return the active
+                // revision's XAttr (its `ExtendedLinkTransformer.ActiveRevision`
+                // has no XAttr field — only the v2 `POST .../links` bulk-metadata
+                // shape does), so the content SHA1 / mtime are left unset here
+                // and populated on demand via `fetch_revision_xattrs` from the
+                // per-revision GET. See that method for the wire-truth citation.
+                results.push(link_to_maybe_node(
+                    link,
+                    &parent.volume_id,
+                    name,
+                    RevisionXAttr::default(),
+                ));
             }
 
             let full_page = returned >= page_size as usize;
@@ -210,6 +236,82 @@ impl ProtonDriveClient {
         Ok(results)
     }
 
+    /// Fetch and decrypt the content SHA1 digest and claimed modification time
+    /// for a set of `(file node, active-revision id)` pairs, populating the same
+    /// [`Revision::content_sha1`](crate::nodes::Revision::content_sha1) /
+    /// [`Revision::xattr_modification_time`](crate::nodes::Revision::xattr_modification_time)
+    /// values — **on demand only**, never as a side effect of listing.
+    ///
+    /// This is the designated caller path for the sync engine's remote-snapshot
+    /// builder (WP4 bridges it into `proton-drive-sync`'s `RemoteEntry`), which
+    /// needs the content SHA1 as the remote content identity
+    /// (`docs/domain-model-sync.md`). **Digests are exclusively on-demand:**
+    /// [`Self::fetch_folder_children`] does not and cannot populate them, because
+    /// the legacy v1 children endpoint the port lists with does **not** return the
+    /// active revision's XAttr — its `ExtendedLinkTransformer.FileProperties.ActiveRevision`
+    /// carries no XAttr field (only the v2 `POST drive/v2/volumes/{volumeId}/links`
+    /// bulk-metadata shape does — `reference/client/js/src/internal/nodes/apiService.ts:619-620,736`).
+    /// The reliable live source is the per-revision GET the downloader already
+    /// uses (`RevisionWithBlocks.XAttr`), which this decrypts with each node's own
+    /// key.
+    ///
+    /// Callers pass the active revision id alongside each uid — the listing
+    /// already carries it (`Revision::uid`), so this never re-fetches a node just
+    /// to rediscover its revision. Work is bounded to `config.max_parallel_transfers`
+    /// concurrent per-revision fetches (default 3 — the transfer-queue convention),
+    /// and each distinct share's volume id + share key are resolved once up front
+    /// rather than per node.
+    ///
+    /// Best-effort throughout: an unresolvable share, a node whose key can't be
+    /// derived, an absent/undecryptable XAttr, or any per-entry error simply
+    /// yields no map entry for that uid — the whole call never fails (a missing
+    /// digest degrades sync precision, it is not a correctness gate).
+    pub async fn fetch_revision_xattrs(
+        &self,
+        revisions: &[(NodeUid, String)],
+    ) -> std::collections::HashMap<NodeUid, RevisionXAttr> {
+        use std::collections::HashMap;
+
+        // Resolve each distinct share's (volume id, share key) once — a batch is
+        // typically all one share (My Files), so this avoids repeating the share
+        // GET / volume GET / share-key decrypt for every node (shared rate limits,
+        // ADR operational constraints).
+        let mut shares: HashMap<&str, Option<(String, PrivateKey)>> = HashMap::new();
+        for (uid, _) in revisions {
+            if !shares.contains_key(uid.volume_id.as_str()) {
+                let ctx = self
+                    .resolve_share_context(&uid.volume_id)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            share_id = %uid.volume_id,
+                            "could not resolve share context for revision XAttr fetch: {e} — \
+                             skipping its nodes (non-fatal)"
+                        );
+                    })
+                    .ok();
+                shares.insert(uid.volume_id.as_str(), ctx);
+            }
+        }
+
+        let concurrency = self.opts.config.max_parallel_transfers.max(1);
+        stream::iter(revisions.iter())
+            .map(|(uid, revision_id)| {
+                let share_ctx = shares.get(uid.volume_id.as_str()).and_then(|c| c.as_ref());
+                async move {
+                    let (volume_id, share_priv) = share_ctx?;
+                    let xattr = self
+                        .resolve_revision_xattr(uid, revision_id, volume_id, share_priv)
+                        .await?;
+                    Some((uid.clone(), xattr))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .filter_map(|entry| async move { entry })
+            .collect()
+            .await
+    }
+
     /// Resolve the private key of a folder node, used to decrypt its children's
     /// names. The chain is: address key → share key → root node key → … →
     /// target node key. Each node's passphrase is encrypted to its *parent*
@@ -220,6 +322,84 @@ impl ProtonDriveClient {
         let share_priv = self.resolve_share_key(share_id).await?;
         self.resolve_node_key_via_chain(share_id, &parent.node_id, &share_priv)
             .await
+    }
+
+    /// Resolve a share's true volume id and decrypted share key together — the
+    /// per-share context [`Self::fetch_revision_xattrs`] resolves once and reuses
+    /// across every revision in that share.
+    async fn resolve_share_context(&self, share_id: &str) -> Result<(String, PrivateKey)> {
+        let volume_id = resolve_volume_id(&self.opts.http_client, share_id).await?;
+        let share_priv = self.resolve_share_key(share_id).await?;
+        Ok((volume_id, share_priv))
+    }
+
+    /// Best-effort resolve of one file node's revision extended attributes via
+    /// the per-revision GET — the reliable live source of the XAttr (see
+    /// [`Self::fetch_revision_xattrs`] for why the v1 listing endpoint can't
+    /// supply it). Uses the already-resolved share context (`volume_id`,
+    /// `share_priv`), walks the parent chain to the node's own key (as
+    /// `file_downloader` does — the XAttr is encrypted to that key), and decrypts
+    /// the XAttr fetched from
+    /// `GET drive/v2/volumes/{volumeID}/files/{linkID}/revisions/{revisionID}`.
+    ///
+    /// Returns `None` on any best-effort failure (key can't be derived,
+    /// absent/undecryptable XAttr, network/crypto error): a missing digest
+    /// degrades sync precision, it is never a correctness gate.
+    async fn resolve_revision_xattr(
+        &self,
+        uid: &NodeUid,
+        revision_id: &str,
+        volume_id: &str,
+        share_priv: &PrivateKey,
+    ) -> Option<RevisionXAttr> {
+        let node_priv = self
+            .resolve_node_key_via_chain(&uid.volume_id, &uid.node_id, share_priv)
+            .await
+            .ok()?;
+
+        // Fetch + decrypt the revision's XAttr. Best-effort: no verification
+        // keys (metadata surfacing, not an authenticity gate — the download path
+        // remains the integrity gate).
+        let xattr_armored = self
+            .fetch_revision_xattr_blob(volume_id, &uid.node_id, revision_id)
+            .await?;
+        let value = crate::xattr::decrypt_xattr_json(
+            &self.opts.openpgp,
+            &node_priv,
+            &uid.node_id,
+            &xattr_armored,
+        )
+        .await?;
+
+        let mtime = crate::xattr::modification_time(&value);
+        if let Some(err) = &mtime.error {
+            tracing::debug!(link_id = %uid.node_id, "{err}");
+        }
+        Some(RevisionXAttr {
+            content_sha1: crate::xattr::content_sha1(&value),
+            modification_time: mtime.time,
+        })
+    }
+
+    /// Fetch just the active revision's armored XAttr from the per-revision GET
+    /// (`GET drive/v2/volumes/{volumeID}/files/{linkID}/revisions/{revisionID}`),
+    /// requesting a single block page since only the top-level XAttr field is
+    /// needed (it is constant across block pages). `None` when the revision
+    /// carries no XAttr (legacy revisions) or on any error.
+    async fn fetch_revision_xattr_blob(
+        &self,
+        volume_id: &str,
+        link_id: &str,
+        revision_id: &str,
+    ) -> Option<String> {
+        let path = format!("/drive/v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}");
+        let query = vec![
+            ("PageSize".to_owned(), "1".to_owned()),
+            ("FromBlockIndex".to_owned(), "1".to_owned()),
+        ];
+        let resp: proton_drive_api::download::GetRevisionResponse =
+            self.api_get_with_query(&path, query).await.ok()?;
+        resp.revision.x_attr
     }
 
     /// Decrypt the share private key for `share_id` via the user's address key.
@@ -1056,6 +1236,77 @@ mod tests {
             ids,
             vec!["child-1", "child-2", "child-3", "child-4", "child-5"],
             "all three pages must be walked even though the wire never sends a More field: {ids:?}"
+        );
+    }
+
+    // ── fetch_revision_xattrs: best-effort aggregation (on-demand digest fetch) ──
+    //
+    // The happy-path decrypt+parse is covered end to end by
+    // `download::tests::round_trip_upload_download_byte_identical` (revision GET
+    // → node-key decrypt → XAttr decrypt) and exhaustively by
+    // `xattr::tests`/`nodes::tests`; these tests pin the new aggregation glue:
+    // an empty input, and the best-effort early-returns that leave a uid out of
+    // the map rather than failing the whole call.
+
+    #[tokio::test]
+    async fn fetch_revision_xattrs_empty_input_is_empty_map() {
+        let client = test_client(ChainMockHttpClient::new(), Arc::new(RpgpCrypto::new()));
+        let map = client.fetch_revision_xattrs(&[]).await;
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_revision_xattrs_skips_non_file_node() {
+        // A folder link (Type 1) short-circuits before any key resolution.
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/folder-1",
+            link_json("folder-1", Some("root"), "k", "p"),
+        );
+        let client = test_client(http, Arc::new(RpgpCrypto::new()));
+
+        let uid = NodeUid {
+            volume_id: "share-1".to_owned(),
+            node_id: "folder-1".to_owned(),
+        };
+        let map = client
+            .fetch_revision_xattrs(std::slice::from_ref(&uid))
+            .await;
+        assert!(map.is_empty(), "folder node must yield no digest entry");
+    }
+
+    #[tokio::test]
+    async fn fetch_revision_xattrs_skips_file_without_active_revision() {
+        // A file link (Type 2) with no ActiveRevision short-circuits before key
+        // resolution — nothing to fetch a revision XAttr for.
+        let mut http = ChainMockHttpClient::new();
+        http.add(
+            "links/file-1",
+            serde_json::json!({
+                "Code": 1000,
+                "Link": {
+                    "LinkID": "file-1", "ParentLinkID": "root", "Type": 2,
+                    "Name": "n", "State": 1, "Size": 10,
+                    "CreateTime": 0, "ModifyTime": 0, "Trashed": null,
+                    "NodeKey": "k", "NodePassphrase": "p",
+                    "NodePassphraseSignature": "", "SignatureEmail": null,
+                    "FileProperties": null, "FolderProperties": null,
+                }
+            })
+            .to_string(),
+        );
+        let client = test_client(http, Arc::new(RpgpCrypto::new()));
+
+        let uid = NodeUid {
+            volume_id: "share-1".to_owned(),
+            node_id: "file-1".to_owned(),
+        };
+        let map = client
+            .fetch_revision_xattrs(std::slice::from_ref(&uid))
+            .await;
+        assert!(
+            map.is_empty(),
+            "file with no active revision must yield no digest entry"
         );
     }
 }

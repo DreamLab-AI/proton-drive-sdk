@@ -412,6 +412,17 @@ pub mod nodes {
         /// Optional key on the wire (`SignatureEmail?: string`), same
         /// `Option<T>`-absence tolerance.
         pub signature_email: Option<String>,
+        /// Encrypted extended attributes on the active revision
+        /// (`XAttr?: PGPMessage | null` in driveTypes.ts). Only the v2 bulk
+        /// metadata load (`POST drive/v2/volumes/{volumeID}/links`,
+        /// apiService.ts:619-620/736) populates this; the legacy v1 children
+        /// listing the port currently uses (see IMPLEMENTATION-STATUS row B8)
+        /// carries XAttr at the *link* level only (driveTypes.ts:4205-4206),
+        /// so this deserializes to `None` on today's live listing path and
+        /// self-heals under a future v2 migration. Live digest reads go via
+        /// the per-revision GET (`fetch_revision_xattrs`) instead.
+        #[serde(rename = "XAttr", default)]
+        pub x_attr: Option<String>,
     }
 }
 

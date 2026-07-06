@@ -24,6 +24,7 @@ pub mod shares;
 pub mod sharing;
 pub mod sharing_public;
 pub mod upload;
+pub mod xattr;
 
 pub use account::{Author, ProtonDriveAccount};
 pub use client::{ProtonDriveClient, ProtonDriveClientOptions};
@@ -37,6 +38,6 @@ pub use events::{
 pub use http::ProtonDriveHttpClient;
 pub use nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, Node, NodeType, NodeUid, Revision,
-    make_node_uid,
+    RevisionXAttr, make_node_uid,
 };
 pub use upload::{FileUploader, ProtonFileUploader, UploadController, UploadMetadata};

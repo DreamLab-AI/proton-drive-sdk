@@ -44,6 +44,31 @@ pub struct Revision {
     pub size_bytes: Option<u64>,
     pub created_at: SystemTime,
     pub author: Author,
+    /// Content SHA1 digest claimed by the revision's decrypted extended
+    /// attributes (`Common.Digests.SHA1`, 40-hex lowercase from any first-party
+    /// writer). `None` when the XAttr is absent, undecryptable, or carries no
+    /// digest. This is the remote counterpart of the sync content identity
+    /// (`docs/domain-model-sync.md` — `ContentHash`); mirrors JS
+    /// `FileExtendedAttributesParsed.claimedDigests.sha1` (`extendedAttributes.ts`).
+    pub content_sha1: Option<String>,
+    /// Claimed modification time from the revision's decrypted extended
+    /// attributes (`Common.ModificationTime`). `None` when the XAttr is absent,
+    /// undecryptable, or the value is not a parseable date. Mirrors JS
+    /// `FileExtendedAttributesParsed.claimedModificationTime`.
+    pub xattr_modification_time: Option<SystemTime>,
+}
+
+/// Decrypted extended-attribute values lifted onto the active revision during
+/// listing/fetch. The subset of JS `FileExtendedAttributesParsed`
+/// (`extendedAttributes.ts`) the port currently surfaces onto [`Revision`]:
+/// the content SHA1 digest and the claimed modification time. Decryption +
+/// parsing live in [`crate::xattr`]; callers that have resolved the node's key
+/// pass the result into [`link_to_maybe_node`], while callers without key
+/// context (or non-file nodes) pass [`RevisionXAttr::default`].
+#[derive(Debug, Clone, Default)]
+pub struct RevisionXAttr {
+    pub content_sha1: Option<String>,
+    pub modification_time: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +124,7 @@ pub fn link_to_maybe_node(
     link: Link,
     volume_id: &str,
     decrypted_name: Option<String>,
+    revision_xattr: RevisionXAttr,
 ) -> MaybeNode {
     let uid = make_node_uid(volume_id, &link.link_id);
     let parent = link
@@ -135,6 +161,8 @@ pub fn link_to_maybe_node(
                 size_bytes: Some(rev.size),
                 created_at: rev_created,
                 author: Author::Anonymous,
+                content_sha1: revision_xattr.content_sha1.clone(),
+                xattr_modification_time: revision_xattr.modification_time,
             }
         })
     });
@@ -209,6 +237,7 @@ pub struct ShareKeyMaterial {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -263,5 +292,67 @@ mod tests {
     fn map_api_error_unknown_code_is_internal() {
         let err = map_api_error(9999, None);
         assert!(matches!(err, Error::Internal(msg) if msg == "API error 9999"));
+    }
+
+    /// Deserialize a minimal file `Link` carrying an active revision. The
+    /// listing path decrypts the revision's XAttr separately and passes the
+    /// derived values in via [`RevisionXAttr`]; these tests exercise only the
+    /// threading of those values onto the domain [`Revision`].
+    fn file_link_with_active_revision() -> Link {
+        serde_json::from_value(serde_json::json!({
+            "LinkID": "link-file",
+            "Type": 2,
+            "Name": "enc-name",
+            "State": 1,
+            "Size": 4096,
+            "CreateTime": 1_700_000_000,
+            "ModifyTime": 1_700_000_100,
+            "NodeKey": "k",
+            "NodePassphrase": "np",
+            "NodePassphraseSignature": "nps",
+            "FileProperties": {
+                "ActiveRevision": { "ID": "rev-1", "State": 1, "Size": 4096 }
+            }
+        }))
+        .expect("valid file Link JSON")
+    }
+
+    #[test]
+    fn link_to_maybe_node_threads_revision_xattr_onto_active_revision() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let node = link_to_maybe_node(
+            file_link_with_active_revision(),
+            "vol-1",
+            Some("name.bin".into()),
+            RevisionXAttr {
+                content_sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
+                modification_time: Some(mtime),
+            },
+        );
+        let MaybeNode::Node(n) = node else {
+            panic!("expected a decoded Node");
+        };
+        let rev = n.active_revision.expect("active revision present");
+        assert_eq!(
+            rev.content_sha1.as_deref(),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
+        assert_eq!(rev.xattr_modification_time, Some(mtime));
+    }
+
+    #[test]
+    fn link_to_maybe_node_default_xattr_leaves_revision_fields_none() {
+        let node = link_to_maybe_node(
+            file_link_with_active_revision(),
+            "vol-1",
+            Some("name.bin".into()),
+            RevisionXAttr::default(),
+        );
+        let MaybeNode::Node(n) = node else {
+            panic!("expected a decoded Node");
+        };
+        let rev = n.active_revision.expect("active revision present");
+        assert_eq!(rev.content_sha1, None);
+        assert_eq!(rev.xattr_modification_time, None);
     }
 }

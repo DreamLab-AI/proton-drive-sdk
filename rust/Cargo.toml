@@ -6,6 +6,7 @@ members = [
     "crates/proton-drive-api",
     "crates/proton-drive-crypto",
     "crates/proton-drive-cache",
+    "crates/proton-drive-sync",
     "crates/proton-drive-telemetry",
     "apps/pdtui",
 ]
@@ -48,6 +49,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs"] }
 tokio-stream = "0.1"
@@ -58,6 +60,7 @@ tracing = "0.1"
 proton-drive-api = { path = "crates/proton-drive-api" }
 proton-drive-cache = { path = "crates/proton-drive-cache" }
 proton-drive-core = { path = "crates/proton-drive-core" }
+proton-drive-sync = { path = "crates/proton-drive-sync" }
 proton-drive-crypto = { path = "crates/proton-drive-crypto" }
 proton-drive-telemetry = { path = "crates/proton-drive-telemetry" }
 
