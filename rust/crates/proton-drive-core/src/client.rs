@@ -8,24 +8,22 @@ use serde::de::DeserializeOwned;
 
 use crate::account::ProtonDriveAccount;
 use crate::config::ProtonDriveConfig;
-use crate::download::{
-    FileDownloader, decrypt_node_name, decrypt_node_private_key, decrypt_share_key,
-    resolve_volume_id,
-};
+use crate::download::{FileDownloader, decrypt_node_name, resolve_volume_id};
 use crate::error::{Error, Result};
 use crate::events::{
     DriveListener, EventSubscription, InMemoryLatestEventId, LatestEventIdProvider,
     spawn_volume_event_loop,
 };
 use crate::http::{HttpMethod, JsonRequest, ProtonDriveHttpClient};
+use crate::keys;
 use crate::nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, NodeUid, link_to_maybe_node,
     map_api_error,
 };
-use crate::upload::{FileUploader, ProtonFileUploader, UploadMetadata};
+use crate::upload::{FileUploader, ProtonFileUploader, ProtonRevisionUploader, UploadMetadata};
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
 use proton_drive_cache::ProtonDriveCache;
-use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, PublicKey, SrpModule, VerificationStatus};
+use proton_drive_crypto::{OpenPgpCrypto, PrivateKey, SrpModule};
 use proton_drive_telemetry::Telemetry;
 
 /// All host-supplied dependencies for the SDK.
@@ -224,163 +222,39 @@ impl ProtonDriveClient {
 
     /// Decrypt the share private key for `share_id` via the user's address key.
     ///
-    /// Non-fatally verifies the share's `PassphraseSignature` against the
-    /// creator address's public keys (JS `SharesCryptoService.decryptRootShare`
-    /// -> `account.getPublicKeys(share.creatorEmail)`); an unresolvable or
-    /// unverifiable signature is only logged, never aborts share-key
-    /// derivation.
+    /// Thin wrapper over [`keys::resolve_share_key`] (the single source of
+    /// truth shared with the upload/folder-creation write paths).
     async fn resolve_share_key(&self, share_id: &str) -> Result<PrivateKey> {
-        let share_resp: proton_drive_api::shares::GetShareResponse =
-            self.api_get(&format!("/drive/shares/{share_id}")).await?;
-        let share = share_resp.share;
-
-        let address_email = self.opts.account.primary_email();
-        let address_key = self.opts.account.address_private_key(address_email).await?;
-
-        let verification_keys = match &share.creator_email {
-            Some(email) => match self.opts.account.address_public_keys(email).await {
-                Ok(keys) => keys,
-                Err(e) => {
-                    tracing::warn!(
-                        email = %email,
-                        "could not resolve share creator public keys for \
-                         PassphraseSignature verification: {e}"
-                    );
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        };
-
-        let (share_priv, verified) = decrypt_share_key(
+        keys::resolve_share_key(
+            &self.opts.http_client,
             &self.opts.openpgp,
-            &share.key,
-            &share.passphrase,
-            &share.passphrase_signature,
-            &address_key,
-            &verification_keys,
+            &self.opts.account,
+            share_id,
         )
-        .await?;
-
-        if verified != VerificationStatus::Ok {
-            tracing::warn!(
-                share_id = %share_id,
-                status = ?verified,
-                "share PassphraseSignature present but unverifiable (non-fatal, \
-                 JS-faithful) — key still unlocked"
-            );
-        }
-
-        Ok(share_priv)
+        .await
     }
 
     /// Resolve a node's private key by walking the parent chain to the share
     /// root and folding key derivation top-down.
     ///
-    /// A node's `NodePassphrase` is encrypted to its **parent node's** key
-    /// (JS `getParentKeys`); only the share root's passphrase is encrypted to
-    /// the share key directly. To unlock an arbitrarily nested node we collect
-    /// the ancestor links bottom-up (target → … → root) by following
-    /// `ParentLinkID`, then derive keys top-down starting from `share_priv`.
-    ///
-    /// `MAX_CHAIN_DEPTH` guards against a malformed/cyclic parent chain.
-    ///
-    /// Each node's `NodePassphraseSignature` is verified non-fatally against
-    /// the resolved verification keys — the signer address's public keys
-    /// when the node carries a `SignatureEmail`, else the parent key's own
-    /// public portion (JS `decryptNode`'s `keyVerificationKeys` /
-    /// `nodeParentKeys` fallback). An unresolvable/invalid signature is only
-    /// logged; it never aborts key derivation (JS-faithful, non-fatal
-    /// `keyAuthor`).
+    /// Thin wrapper over [`keys::resolve_node_key_via_chain`]; see that
+    /// function for the full-chain rationale and non-fatal signature
+    /// verification behaviour.
     async fn resolve_node_key_via_chain(
         &self,
         share_id: &str,
         link_id: &str,
         share_priv: &PrivateKey,
     ) -> Result<PrivateKey> {
-        const MAX_CHAIN_DEPTH: usize = 64;
-
-        struct ChainLink {
-            node_key: String,
-            node_passphrase: String,
-            node_passphrase_signature: String,
-            signature_email: Option<String>,
-        }
-
-        // Collect the chain from the target up to the root.
-        let mut chain: Vec<ChainLink> = Vec::new();
-        let mut current_id = link_id.to_owned();
-
-        loop {
-            if chain.len() >= MAX_CHAIN_DEPTH {
-                return Err(Error::Internal(format!(
-                    "node key chain exceeded depth {MAX_CHAIN_DEPTH} (cyclic parent links?)"
-                )));
-            }
-
-            let path = format!("/drive/shares/{share_id}/links/{current_id}");
-            let resp: proton_drive_api::nodes::GetLinkResponse = self.api_get(&path).await?;
-            let link = resp.link;
-            let parent = link.parent_link_id.clone();
-            chain.push(ChainLink {
-                node_key: link.node_key,
-                node_passphrase: link.node_passphrase,
-                node_passphrase_signature: link.node_passphrase_signature,
-                signature_email: link.signature_email,
-            });
-
-            match parent {
-                Some(p) => current_id = p,
-                None => break,
-            }
-        }
-
-        // Fold from the root down: the deepest ancestor (last pushed) unlocks
-        // with the share key, each descendant with its parent's node key.
-        let mut current: Option<PrivateKey> = None;
-        for entry in chain.iter().rev() {
-            let parent_ref: &PrivateKey = current.as_ref().unwrap_or(share_priv);
-
-            let verification_keys: Vec<PublicKey> = match &entry.signature_email {
-                Some(email) => match self.opts.account.address_public_keys(email).await {
-                    Ok(keys) => keys,
-                    Err(e) => {
-                        tracing::warn!(
-                            email = %email,
-                            "could not resolve node signature address public keys: {e}"
-                        );
-                        Vec::new()
-                    }
-                },
-                None => match self.opts.openpgp.public_key(parent_ref).await {
-                    Ok(pk) => vec![pk],
-                    Err(_) => Vec::new(),
-                },
-            };
-
-            let (next, verified) = decrypt_node_private_key(
-                &self.opts.openpgp,
-                &entry.node_key,
-                &entry.node_passphrase,
-                &entry.node_passphrase_signature,
-                parent_ref,
-                &verification_keys,
-            )
-            .await?;
-
-            if verified != VerificationStatus::Ok {
-                tracing::warn!(
-                    signature_email = ?entry.signature_email,
-                    status = ?verified,
-                    "node NodePassphraseSignature present but unverifiable \
-                     (non-fatal, JS-faithful) — key still unlocked"
-                );
-            }
-
-            current = Some(next);
-        }
-
-        current.ok_or_else(|| Error::Internal("empty node key chain".into()))
+        keys::resolve_node_key_via_chain(
+            &self.opts.http_client,
+            &self.opts.openpgp,
+            &self.opts.account,
+            share_id,
+            link_id,
+            share_priv,
+        )
+        .await
     }
 
     /// Stream children of a folder as a `BoxStream`.
@@ -440,6 +314,62 @@ impl ProtonDriveClient {
             metadata: meta,
             telemetry: self.opts.telemetry.clone(),
         }))
+    }
+
+    /// Construct a `FileUploader` that uploads a **new revision** of an
+    /// existing file `uid`, rather than creating a new node.
+    ///
+    /// Mirrors JS `FileRevisionUploader`
+    /// (`reference/client/js/src/internal/upload/fileUploader.ts:242-308`),
+    /// constructed with a `nodeUid` instead of a parent+name. The returned
+    /// uploader resolves the existing node's key material (node key via the
+    /// full parent chain, content session key by decrypting the node's existing
+    /// `ContentKeyPacket`) and reuses the exact block-upload + commit path as
+    /// new-file upload — **no** new node key, content session key, name, or
+    /// hash is generated for a revision.
+    ///
+    /// # FIXME: NodeUid naming — see MC commit f6b29b1 note
+    /// `uid.volume_id` holds the share_id from listing endpoints; the real
+    /// VolumeID is resolved lazily inside the uploader.
+    pub async fn revision_uploader(
+        &self,
+        uid: &NodeUid,
+        meta: UploadMetadata,
+    ) -> Result<Box<dyn FileUploader>> {
+        meta.validate()?;
+        Ok(Box::new(ProtonRevisionUploader {
+            http: self.opts.http_client.clone(),
+            openpgp: self.opts.openpgp.clone(),
+            account: self.opts.account.clone(),
+            node: uid.clone(),
+            metadata: meta,
+            telemetry: self.opts.telemetry.clone(),
+        }))
+    }
+
+    /// Create a new folder named `name` under `parent`, returning the new
+    /// folder's [`NodeUid`].
+    ///
+    /// Mirrors JS `NodesAPIService.createFolder` +
+    /// `NodesCryptoService.createFolder`
+    /// (`reference/client/js/src/internal/nodes/{apiService,cryptoService}.ts`):
+    /// generates the folder node key exactly as file creation does, plus a
+    /// folder-specific `NodeHashKey` (the HMAC key children hash their names
+    /// against). Works at any parent depth via the shared full-chain
+    /// parent-context resolution.
+    ///
+    /// # FIXME: NodeUid naming — see MC commit f6b29b1 note
+    /// The returned `NodeUid.volume_id` carries the parent's share_id (matching
+    /// the listing/link endpoints), not the raw VolumeID.
+    pub async fn create_folder(&self, parent: &NodeUid, name: &str) -> Result<NodeUid> {
+        crate::upload::create_folder(
+            &self.opts.http_client,
+            &self.opts.openpgp,
+            &self.opts.account,
+            parent,
+            name,
+        )
+        .await
     }
 
     /// Construct a `FileDownloader` for the given node.
@@ -641,7 +571,7 @@ mod tests {
     use super::*;
     use crate::http::JsonResponse;
     use bytes::Bytes;
-    use proton_drive_crypto::{EncryptOptions, RpgpCrypto, SrpModule};
+    use proton_drive_crypto::{EncryptOptions, PublicKey, RpgpCrypto, SrpModule};
 
     /// Account fake for tests that never actually call it: the chain-walk
     /// tests below leave every link's `SignatureEmail` as `None`, so

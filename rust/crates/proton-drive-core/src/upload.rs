@@ -42,9 +42,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use proton_drive_api::common::{CODE_OK, ResponseEnvelope};
+use proton_drive_api::folders::{CreateFolderRequest, CreateFolderResponse};
 use proton_drive_api::upload::{
     BlockUploadEntry, BlockVerifier as ApiBlockVerifier, CommitRevisionRequest, CreateFileRequest,
-    DeleteNodesRequest, DeleteNodesResponse, RequestBlockUploadRequest,
+    CreateRevisionRequest, CreateRevisionResponse, DeleteNodesRequest, DeleteNodesResponse,
+    RequestBlockUploadRequest,
 };
 use proton_drive_crypto::{
     ArmorKind, EncryptOptions, OpenPgpCrypto, PrivateKey, PublicKey, SessionKey, armor,
@@ -54,7 +56,14 @@ use proton_drive_telemetry::{MetricEvent, Telemetry};
 use crate::account::ProtonDriveAccount;
 use crate::error::{Error, Result};
 use crate::http::{BlobRequest, HttpMethod, JsonRequest, ProtonDriveHttpClient};
-use crate::nodes::{NodeUid, map_api_error};
+use crate::keys;
+use crate::nodes::{NodeUid, make_node_uid, map_api_error};
+
+/// Proton `ErrorCode.ALREADY_EXISTS` — HTTP 422 `Code` for a name/draft
+/// collision (`reference/client/js/src/internal/apiService/errorCodes.ts:26`).
+/// For a *revision* draft this signals "a revision draft already exists on this
+/// file"; unlike new-file creation the JS SDK does not auto-delete-and-retry it.
+const ERROR_CODE_ALREADY_EXISTS: u32 = 2500;
 
 /// 4 MiB — server rejects blocks larger than this.
 pub const BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -234,6 +243,24 @@ impl FileUploader for ProtonFileUploader {
     }
 }
 
+/// Shared block-upload machinery — steps 3-9 of the protocol (verification
+/// code fetch → block encrypt/upload → manifest → XAttr → commit), which are
+/// **identical** for a brand-new file and a new revision of an existing file
+/// once a draft's `link_id`/`revision_id` exist (see the technical brief:
+/// "Block upload / commit — identical to new-file path from this point on").
+///
+/// Holds only borrowed host dependencies plus the per-upload metadata, so both
+/// [`ProtonFileUploader`] (new file) and [`ProtonRevisionUploader`] (existing
+/// file) build one from their own owned fields and delegate — the block/commit
+/// code lives here exactly once, never duplicated.
+struct BlockUploadCtx<'a> {
+    http: &'a Arc<dyn ProtonDriveHttpClient>,
+    openpgp: &'a Arc<dyn OpenPgpCrypto>,
+    account: &'a Arc<dyn ProtonDriveAccount>,
+    metadata: &'a UploadMetadata,
+    telemetry: Option<&'a Arc<dyn Telemetry>>,
+}
+
 impl ProtonFileUploader {
     /// Full 5-step block-upload protocol (ADR-0008).
     async fn run_upload(
@@ -384,7 +411,14 @@ impl ProtonFileUploader {
         // original error. We mirror both here: wrap the whole post-creation
         // body, and swallow (log) any cleanup failure in
         // `delete_draft_best_effort`.
-        let body_result = self
+        let ctx = BlockUploadCtx {
+            http: &self.http,
+            openpgp: &self.openpgp,
+            account: &self.account,
+            metadata: &self.metadata,
+            telemetry: self.telemetry.as_ref(),
+        };
+        let body_result = ctx
             .upload_after_create(
                 &mut stream,
                 progress_tx,
@@ -405,12 +439,14 @@ impl ProtonFileUploader {
 
         body_result
     }
+}
 
-    /// Steps 3-9 of the block-upload protocol, run once the draft node and
-    /// revision already exist on the server (`link_id`/`revision_id`). Split
-    /// out from `run_upload` so any failure here can trigger best-effort
-    /// draft cleanup at the call site without duplicating that logic on every
-    /// early return.
+impl BlockUploadCtx<'_> {
+    /// Steps 3-9 of the block-upload protocol, run once a draft node and
+    /// revision already exist on the server (`link_id`/`revision_id`) — for
+    /// either a new file or a new revision of an existing file. Split out from
+    /// `run_upload` so any failure here can trigger best-effort draft cleanup
+    /// at the call site without duplicating that logic on every early return.
     #[allow(clippy::too_many_arguments)]
     async fn upload_after_create(
         &self,
@@ -700,7 +736,9 @@ impl ProtonFileUploader {
         let _ = progress_tx.send(total_bytes);
         Ok(())
     }
+}
 
+impl ProtonFileUploader {
     /// Best-effort draft-node cleanup after a post-creation failure.
     ///
     /// Mirrors JS `UploadManager.deleteDraftNode` (manager.ts): the delete
@@ -767,7 +805,9 @@ impl ProtonFileUploader {
             }
         }
     }
+}
 
+impl BlockUploadCtx<'_> {
     /// Encrypt a plaintext block, then self-verify it by attempting to
     /// decrypt it back with the same content session key -- this is JS's
     /// `verifyBlock` self-check for bitflips / bad hardware ("Attempt to
@@ -858,7 +898,9 @@ impl ProtonFileUploader {
                 .await;
         }
     }
+}
 
+impl ProtonFileUploader {
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
     /// Resolve the real VolumeID from a share_id.
@@ -883,119 +925,33 @@ impl ProtonFileUploader {
         Ok(env.inner.share.volume_id)
     }
 
-    /// Resolve the parent folder's node private key and its decrypted hash key.
+    /// Resolve the parent folder's node private key and its decrypted hash key,
+    /// correct at **any** parent depth.
     ///
-    /// Mirrors the download key chain plus JS `getNodeKeys`:
-    ///   1. `GET drive/shares/{shareID}` → decrypt the share key with the
-    ///      address key (address → share passphrase → share private key).
-    ///   2. `GET drive/shares/{shareID}/links/{parentLinkID}` → decrypt the
-    ///      parent node key with the share key (the new node's passphrase is
-    ///      encrypted to the parent NODE key, not the share key).
-    ///   3. Decrypt the parent's `FolderProperties.NodeHashKey` with the parent
-    ///      node key → the HMAC key used to compute child name hashes.
+    /// Delegates to [`keys::resolve_parent_context`], the single shared
+    /// full-chain resolver (also used by the read/listing path and by revision
+    /// upload / folder creation). It walks `parent.node_id`'s ancestor chain to
+    /// the share root, folds key derivation top-down, then decrypts the parent
+    /// folder's `NodeHashKey` with the resolved parent node key.
     ///
-    /// MVP restriction: only correct when `parent.node_id` is the share root.
-    /// Nested folders need an ancestor-chain walk (deferred).
-    async fn resolve_parent_context(
-        &self,
-        share_id: &str,
-    ) -> Result<(proton_drive_crypto::PrivateKey, Vec<u8>)> {
-        // ── share key ─────────────────────────────────────────────────────────
-        let share: proton_drive_api::shares::Share = {
-            let resp = self
-                .http
-                .request_json(JsonRequest {
-                    method: HttpMethod::Get,
-                    path: format!("/drive/shares/{share_id}"),
-                    query: vec![],
-                    headers: vec![],
-                    body: None,
-                })
-                .await?;
-            let env: ResponseEnvelope<proton_drive_api::shares::GetShareResponse> =
-                serde_json::from_slice(&resp.body)
-                    .map_err(|e| Error::Internal(format!("share JSON parse: {e}")))?;
-            if env.code != CODE_OK {
-                return Err(map_api_error(env.code, env.error));
-            }
-            env.inner.share
-        };
-
-        let address_email = self.account.primary_email().to_owned();
-        let address_priv = self.account.address_private_key(&address_email).await?;
-
-        // Upload's parent-context resolution doesn't (yet) verify
-        // PassphraseSignature/NodePassphraseSignature — pass no verification
-        // keys, preserving prior (pre-verification) behaviour exactly. See
-        // `ProtonDriveClient::resolve_share_key`/`resolve_node_key_via_chain`
-        // in `client.rs` for the download path's non-fatal verification.
-        let (share_priv, _verified) = crate::download::decrypt_share_key(
+    /// This is the B2 upload-half fix (see `docs/IMPLEMENTATION-STATUS.md`): the
+    /// previous implementation resolved only the share-root parent (decrypting
+    /// the parent node key directly with the share key), so uploading into a
+    /// nested (non-root) folder derived the wrong `NodeHashKey`/parent node key.
+    async fn resolve_parent_context(&self, share_id: &str) -> Result<(PrivateKey, Vec<u8>)> {
+        let ctx = keys::resolve_parent_context(
+            &self.http,
             &self.openpgp,
-            &share.key,
-            &share.passphrase,
-            &share.passphrase_signature,
-            &address_priv,
-            &[],
+            &self.account,
+            share_id,
+            &self.parent.node_id,
         )
         .await?;
-
-        // ── parent link → parent node key ──────────────────────────────────────
-        let parent_link_id = &self.parent.node_id;
-        let link: proton_drive_api::nodes::Link = {
-            let resp = self
-                .http
-                .request_json(JsonRequest {
-                    method: HttpMethod::Get,
-                    path: format!("/drive/shares/{share_id}/links/{parent_link_id}"),
-                    query: vec![],
-                    headers: vec![],
-                    body: None,
-                })
-                .await?;
-            let env: ResponseEnvelope<proton_drive_api::nodes::GetLinkResponse> =
-                serde_json::from_slice(&resp.body)
-                    .map_err(|e| Error::Internal(format!("parent link JSON parse: {e}")))?;
-            if env.code != CODE_OK {
-                return Err(map_api_error(env.code, env.error));
-            }
-            env.inner.link
-        };
-
-        let (parent_node_priv, _verified) = crate::download::decrypt_node_private_key(
-            &self.openpgp,
-            &link.node_key,
-            &link.node_passphrase,
-            &link.node_passphrase_signature,
-            &share_priv,
-            &[],
-        )
-        .await?;
-
-        // ── parent node hash key ────────────────────────────────────────────────
-        let node_hash_key_armored = link
-            .folder_properties
-            .as_ref()
-            .and_then(|f| f.node_hash_key.as_ref())
-            .ok_or_else(|| {
-                Error::Internal("parent link is not a folder or has no NodeHashKey".into())
-            })?;
-
-        // NodeHashKey is an armored PGP message (PGPMessage). The crypto layer
-        // dearmors transparently. JS `decryptNodeHashKey` does not require the
-        // signature to verify — we only need the plaintext key bytes.
-        let hash_key_bytes = node_hash_key_armored.as_bytes();
-        let hash_key_session_key = self
-            .openpgp
-            .decrypt_session_key(hash_key_bytes, std::slice::from_ref(&parent_node_priv))
-            .await?;
-        let (parent_hash_key, _status) = self
-            .openpgp
-            .decrypt_and_verify(hash_key_bytes, &hash_key_session_key, &[])
-            .await?;
-
-        Ok((parent_node_priv, parent_hash_key))
+        Ok((ctx.node_key, ctx.hash_key))
     }
+}
 
+impl BlockUploadCtx<'_> {
     /// Fetch the server-supplied verification code for a revision draft.
     ///
     /// `GET drive/v2/volumes/{volumeID}/links/{linkID}/revisions/{revisionID}/verification`
@@ -1026,7 +982,9 @@ impl ProtonFileUploader {
             .map_err(|e| Error::Internal(format!("verification code base64: {e}")))?;
         Ok(code_bytes)
     }
+}
 
+impl ProtonFileUploader {
     async fn post_create_file(
         &self,
         volume_id: &str,
@@ -1065,7 +1023,9 @@ impl ProtonFileUploader {
             })?;
         Ok((env.inner.file.link_id, env.inner.file.revision_id))
     }
+}
 
+impl BlockUploadCtx<'_> {
     async fn post_request_blocks(
         &self,
         req_body: RequestBlockUploadRequest,
@@ -1175,6 +1135,441 @@ impl ProtonFileUploader {
         }
         Ok(())
     }
+}
+
+// ── ProtonRevisionUploader ────────────────────────────────────────────────────
+
+/// Uploader that writes a **new revision** of an existing file, mirroring JS
+/// `FileRevisionUploader`
+/// (`reference/client/js/src/internal/upload/fileUploader.ts:242-308`).
+///
+/// Unlike [`ProtonFileUploader`] it generates **no** new node key, content
+/// session key, name, or hash: it resolves the *existing* node's key material
+/// (node key via the shared full parent-chain walk; content session key by
+/// decrypting the node's existing `ContentKeyPacket`) and reuses the exact same
+/// [`BlockUploadCtx`] block-upload + commit path.
+pub struct ProtonRevisionUploader {
+    pub(crate) http: Arc<dyn ProtonDriveHttpClient>,
+    pub(crate) openpgp: Arc<dyn OpenPgpCrypto>,
+    pub(crate) account: Arc<dyn ProtonDriveAccount>,
+    /// The existing file's NodeUid.
+    /// FIXME: NodeUid naming — `node.volume_id` holds the share_id.
+    pub(crate) node: NodeUid,
+    pub(crate) metadata: UploadMetadata,
+    pub(crate) telemetry: Option<Arc<dyn Telemetry>>,
+}
+
+#[async_trait::async_trait]
+impl FileUploader for ProtonRevisionUploader {
+    async fn upload_from_stream(
+        &self,
+        stream: Box<dyn AsyncRead + Send + Unpin>,
+        progress_tx: tokio::sync::watch::Sender<u64>,
+    ) -> Result<UploadController> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (progress_inner_tx, progress_rx) = tokio::sync::watch::channel::<u64>(0u64);
+
+        let result = self.run_upload(stream, &progress_tx, &cancel).await;
+
+        let _ = progress_inner_tx.send(*progress_tx.borrow());
+
+        result?;
+
+        Ok(UploadController {
+            cancel,
+            progress: progress_rx,
+        })
+    }
+}
+
+impl ProtonRevisionUploader {
+    async fn run_upload(
+        &self,
+        mut stream: Box<dyn AsyncRead + Send + Unpin>,
+        progress_tx: &tokio::sync::watch::Sender<u64>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        // FIXME: NodeUid naming — node.volume_id is actually the share_id.
+        let share_id = &self.node.volume_id;
+        let node_id = &self.node.node_id;
+
+        // ── resolve real volume_id ─────────────────────────────────────────────
+        let volume_id = crate::download::resolve_volume_id(&self.http, share_id).await?;
+
+        // ── fetch the existing node link (active revision + content key) ────────
+        let link = self.fetch_node_link(share_id, node_id).await?;
+        if link.r#type != 2 {
+            return Err(Error::Validation(
+                "revision_uploader: node is not a file (type != 2)".into(),
+            ));
+        }
+        let file_props = link
+            .file_properties
+            .as_ref()
+            .ok_or_else(|| Error::Internal("file link missing FileProperties".into()))?;
+        // Optimistic-concurrency guard — the server rejects the draft if the
+        // active revision has moved since we read it here (JS
+        // `createDraftRevision`'s `currentRevisionUid: node.activeRevision.value.uid`).
+        let current_revision_id = file_props
+            .active_revision
+            .as_ref()
+            .map(|r| r.id.clone())
+            .ok_or_else(|| Error::NotFound("file has no active revision".into()))?;
+        let content_key_packet = file_props
+            .content_key_packet
+            .clone()
+            .ok_or_else(|| Error::Internal("file link missing ContentKeyPacket".into()))?;
+
+        // ── resolve the EXISTING node's key material (no fresh keys) ────────────
+        let share_priv =
+            keys::resolve_share_key(&self.http, &self.openpgp, &self.account, share_id).await?;
+        let node_priv = keys::resolve_node_key_via_chain(
+            &self.http,
+            &self.openpgp,
+            &self.account,
+            share_id,
+            node_id,
+            &share_priv,
+        )
+        .await?;
+        let node_pub = self.openpgp.public_key(&node_priv).await?;
+
+        // Decrypt the existing ContentKeyPacket → content session key. Do NOT
+        // generate a fresh one (JS `createDraftRevision` reuses
+        // `nodeKeys.contentKeyPacketSessionKey`). The packet is base64 (PKESK)
+        // on the wire; older callers may pass base64 binary (same tolerance as
+        // `download.rs`).
+        let ckp_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&content_key_packet)
+            .unwrap_or_else(|_| content_key_packet.as_bytes().to_vec());
+        let content_session_key = self
+            .openpgp
+            .decrypt_session_key(&ckp_bytes, std::slice::from_ref(&node_priv))
+            .await?;
+
+        // ── address (signing) key — unchanged from the new-file path ────────────
+        let address_email = self.account.primary_email().to_owned();
+        let address_priv = self.account.address_private_key(&address_email).await?;
+
+        // ── create the revision draft on the existing node ──────────────────────
+        let revision_id = self
+            .post_create_revision(&volume_id, node_id, &current_revision_id)
+            .await?;
+
+        // ── steps 3-9: reuse the shared block-upload + commit path unchanged ────
+        let ctx = BlockUploadCtx {
+            http: &self.http,
+            openpgp: &self.openpgp,
+            account: &self.account,
+            metadata: &self.metadata,
+            telemetry: self.telemetry.as_ref(),
+        };
+        let body_result = ctx
+            .upload_after_create(
+                &mut stream,
+                progress_tx,
+                cancel,
+                &volume_id,
+                node_id,
+                &revision_id,
+                &address_email,
+                &address_priv,
+                &node_pub,
+                &content_session_key,
+            )
+            .await;
+
+        // A failure downstream of draft creation leaves an orphaned draft
+        // revision. Mirror JS `FileRevisionUploader.createRevisionDraft`'s catch
+        // → `manager.deleteDraftRevision(...)` (best-effort; a delete failure is
+        // only logged, never masks the original error). Unlike the new-file path
+        // there is NO delete-and-retry on a draft-exists conflict: JS never wires
+        // `handleConflictError` into the revision path, so a 2500 simply
+        // propagates from `post_create_revision` (before any draft exists to
+        // clean up).
+        if body_result.is_err() {
+            self.delete_draft_revision_best_effort(&volume_id, node_id, &revision_id)
+                .await;
+        }
+
+        body_result
+    }
+
+    /// `GET drive/shares/{shareID}/links/{linkID}` — the existing node link
+    /// (active revision id + `ContentKeyPacket`). Mirrors `file_downloader`'s
+    /// step 1 link re-fetch.
+    async fn fetch_node_link(
+        &self,
+        share_id: &str,
+        node_id: &str,
+    ) -> Result<proton_drive_api::nodes::Link> {
+        let req = JsonRequest {
+            method: HttpMethod::Get,
+            path: format!("/drive/shares/{share_id}/links/{node_id}"),
+            query: vec![],
+            headers: vec![],
+            body: None,
+        };
+        let resp = self.http.request_json(req).await?;
+        let env: ResponseEnvelope<proton_drive_api::nodes::GetLinkResponse> =
+            serde_json::from_slice(&resp.body)
+                .map_err(|e| Error::Internal(format!("node link JSON parse: {e}")))?;
+        if env.code != CODE_OK {
+            return Err(map_api_error(env.code, env.error));
+        }
+        Ok(env.inner.link)
+    }
+
+    /// Create a revision draft on the existing node.
+    ///
+    /// `POST drive/v2/volumes/{volumeID}/files/{linkID}/revisions`, mirroring JS
+    /// `UploadAPIService.createDraftRevision` (apiService.ts:137-161). On the
+    /// draft-exists conflict (`Code` 2500) a typed
+    /// [`Error::RevisionDraftConflict`] is propagated — the JS SDK deliberately
+    /// does **not** wire the new-file delete-and-retry (`handleConflictError`)
+    /// into the revision path (technical brief, "Conflict / draft-exists
+    /// handling — IMPORTANT ASYMMETRY").
+    async fn post_create_revision(
+        &self,
+        volume_id: &str,
+        link_id: &str,
+        current_revision_id: &str,
+    ) -> Result<String> {
+        // `IntendedUploadSize` is a coarse quota hint; like the new-file path
+        // (`CreateFileRequest.intended_upload_size`) this port sends `null` and
+        // lets the server re-validate at commit.
+        let req_body = CreateRevisionRequest {
+            current_revision_id: current_revision_id.to_owned(),
+            client_uid: None,
+            intended_upload_size: None,
+        };
+        let body_bytes = serde_json::to_vec(&req_body)
+            .map_err(|e| Error::Internal(format!("serialize CreateRevisionRequest: {e}")))?;
+        let req = JsonRequest {
+            method: HttpMethod::Post,
+            path: format!("/drive/v2/volumes/{volume_id}/files/{link_id}/revisions"),
+            query: vec![],
+            headers: vec![],
+            body: Some(body_bytes),
+        };
+        let resp = self.http.request_json(req).await?;
+        // Error responses omit the typed `Revision` body — probe Code/Error
+        // first (same pattern as `post_create_file`).
+        let probe: EnvelopeProbe = serde_json::from_slice(&resp.body).map_err(|e| {
+            Error::Internal(format!(
+                "CreateRevision envelope parse: {e}; body={}",
+                body_snippet(&resp.body)
+            ))
+        })?;
+        if probe.code == ERROR_CODE_ALREADY_EXISTS {
+            return Err(Error::RevisionDraftConflict);
+        }
+        if probe.code != CODE_OK {
+            return Err(map_api_error(probe.code, probe.error));
+        }
+        let env: ResponseEnvelope<CreateRevisionResponse> = serde_json::from_slice(&resp.body)
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "CreateRevisionResponse parse: {e}; body={}",
+                    body_snippet(&resp.body)
+                ))
+            })?;
+        Ok(env.inner.revision.id)
+    }
+
+    /// Best-effort draft-revision cleanup after a post-creation failure.
+    ///
+    /// `DELETE drive/v2/volumes/{volumeID}/files/{linkID}/revisions/{revisionID}`,
+    /// mirroring JS `UploadAPIService.deleteDraftRevision` (apiService.ts:296-299)
+    /// / `UploadManager.deleteDraftRevision` (manager.ts): the response body is
+    /// never inspected and a delete failure is only logged, so it can never mask
+    /// the original upload error. Simpler than the node-delete path — a bare
+    /// DELETE with no multi-status envelope.
+    async fn delete_draft_revision_best_effort(
+        &self,
+        volume_id: &str,
+        link_id: &str,
+        revision_id: &str,
+    ) {
+        let req = JsonRequest {
+            method: HttpMethod::Delete,
+            path: format!("/drive/v2/volumes/{volume_id}/files/{link_id}/revisions/{revision_id}"),
+            query: vec![],
+            headers: vec![],
+            body: None,
+        };
+        if let Err(e) = self.http.request_json(req).await {
+            tracing::error!(
+                link_id = %link_id,
+                revision_id = %revision_id,
+                "failed to delete draft revision after upload failure: {e}"
+            );
+        }
+    }
+}
+
+// ── Folder creation ────────────────────────────────────────────────────────────
+
+/// Create a new folder named `name` under `parent`, returning the new folder's
+/// [`NodeUid`].
+///
+/// Mirrors JS `NodesCryptoService.createFolder` + `NodesAPIService.createFolder`
+/// (`reference/client/js/src/internal/nodes/{cryptoService,apiService}.ts`). The
+/// folder node key is generated exactly as for a file (see
+/// `ProtonFileUploader::run_upload` step 1), **plus** a folder-specific
+/// `NodeHashKey` (`driveCrypto.generateHashKey(nodeKey)`): a fresh random
+/// passphrase encrypted-and-signed to the folder's *own* node key. There is
+/// **no** content-key material (folders hold no file content). Parent context
+/// (node key + hash key) is resolved at any depth via the shared full-chain
+/// walk, so folder creation works under nested parents.
+pub(crate) async fn create_folder(
+    http: &Arc<dyn ProtonDriveHttpClient>,
+    openpgp: &Arc<dyn OpenPgpCrypto>,
+    account: &Arc<dyn ProtonDriveAccount>,
+    parent: &NodeUid,
+    name: &str,
+) -> Result<NodeUid> {
+    // FIXME: NodeUid naming — parent.volume_id is actually the share_id.
+    let share_id = &parent.volume_id;
+
+    // ── resolve real volume_id + parent context (node key + hash key) ───────────
+    let volume_id = crate::download::resolve_volume_id(http, share_id).await?;
+    let parent_ctx =
+        keys::resolve_parent_context(http, openpgp, account, share_id, &parent.node_id).await?;
+    let parent_node_pub = openpgp.public_key(&parent_ctx.node_key).await?;
+
+    // ── address (signing) key ───────────────────────────────────────────────────
+    let address_email = account.primary_email().to_owned();
+    let address_priv = account.address_private_key(&address_email).await?;
+
+    // ── generate the folder node key (identical to file node-key generation) ────
+    let node_passphrase = openpgp.generate_passphrase();
+    let (node_priv, node_pub_armored) = openpgp
+        .generate_key(&node_passphrase, EncryptOptions::default())
+        .await?;
+    let node_pub = PublicKey {
+        armored: node_pub_armored,
+        fingerprint_hex: node_priv.fingerprint_hex.clone(),
+    };
+
+    // Encrypt the new folder's passphrase to the PARENT node key, signed by the
+    // address key. NodePassphrase is an armored PGP MESSAGE; the detached
+    // NodePassphraseSignature is over the plaintext passphrase.
+    let node_passphrase_bytes = node_passphrase.as_bytes();
+    let passphrase_session_key = openpgp
+        .generate_session_key(&[], EncryptOptions::default())
+        .await?;
+    let node_passphrase_encrypted = openpgp
+        .encrypt_and_sign(
+            node_passphrase_bytes,
+            &passphrase_session_key,
+            std::slice::from_ref(&parent_node_pub),
+            &address_priv,
+            EncryptOptions::default(),
+        )
+        .await?;
+    let node_passphrase_armored = armor(&node_passphrase_encrypted, ArmorKind::Message);
+    let passphrase_sig = openpgp
+        .sign(node_passphrase_bytes, &address_priv, "")
+        .await?;
+    let passphrase_sig_armored = armor(&passphrase_sig, ArmorKind::Signature);
+
+    // ── generate the folder's NodeHashKey (folders have one, files don't) ───────
+    // JS `driveCrypto.generateHashKey(nodeKey)`: a fresh random passphrase whose
+    // UTF-8 bytes are the hash key, encrypted-and-signed to the folder's OWN node
+    // key, armored as a PGP MESSAGE. This is the HMAC key the folder's future
+    // children will hash their names against (the read side consumes it in
+    // `resolve_folder_node_key`/`keys::decrypt_node_hash_key`).
+    let hash_key_passphrase = openpgp.generate_passphrase();
+    let hash_key_session_key = openpgp
+        .generate_session_key(&[], EncryptOptions::default())
+        .await?;
+    let node_hash_key_encrypted = openpgp
+        .encrypt_and_sign(
+            hash_key_passphrase.as_bytes(),
+            &hash_key_session_key,
+            std::slice::from_ref(&node_pub),
+            &node_priv,
+            EncryptOptions::default(),
+        )
+        .await?;
+    let node_hash_key_armored = armor(&node_hash_key_encrypted, ArmorKind::Message);
+
+    // ── encrypt folder name + compute name hash (identical to the file path) ────
+    let name_session_key = openpgp
+        .generate_session_key(&[], EncryptOptions::default())
+        .await?;
+    let encrypted_name_bytes = openpgp
+        .encrypt_and_sign(
+            name.as_bytes(),
+            &name_session_key,
+            std::slice::from_ref(&parent_node_pub),
+            &address_priv,
+            EncryptOptions::default(),
+        )
+        .await?;
+    let encrypted_name_armored = armor(&encrypted_name_bytes, ArmorKind::Message);
+    let name_hash_hex = compute_name_hash_hex(&parent_ctx.hash_key, name)?;
+
+    // ── POST create folder ──────────────────────────────────────────────────────
+    let create_req = CreateFolderRequest {
+        parent_link_id: parent.node_id.clone(),
+        // NodeKey is the armored *private* key locked with the folder passphrase
+        // (OpenAPI `PGPPrivateKey`), matching the file path's `NodeKey`.
+        node_key: node_priv.armored.clone(),
+        node_hash_key: node_hash_key_armored,
+        node_passphrase: node_passphrase_armored,
+        node_passphrase_signature: passphrase_sig_armored,
+        signature_email: address_email.clone(),
+        name: encrypted_name_armored,
+        hash: name_hash_hex,
+        x_attr: None,
+    };
+    let folder_id = post_create_folder(http, &volume_id, create_req).await?;
+
+    // NodeUid.volume_id carries the share_id (matching the listing/link
+    // endpoints), mirroring the rest of the port's NodeUid convention.
+    Ok(make_node_uid(share_id.clone(), folder_id))
+}
+
+/// `POST drive/v2/volumes/{volumeID}/folders`; returns the new folder's ID.
+async fn post_create_folder(
+    http: &Arc<dyn ProtonDriveHttpClient>,
+    volume_id: &str,
+    req_body: CreateFolderRequest,
+) -> Result<String> {
+    let body_bytes = serde_json::to_vec(&req_body)
+        .map_err(|e| Error::Internal(format!("serialize CreateFolderRequest: {e}")))?;
+    let req = JsonRequest {
+        method: HttpMethod::Post,
+        path: format!("/drive/v2/volumes/{volume_id}/folders"),
+        query: vec![],
+        headers: vec![],
+        body: Some(body_bytes),
+    };
+    let resp = http.request_json(req).await?;
+    // Error responses (e.g. 2500 name-exists) omit the typed `Folder` body —
+    // probe Code/Error first (same pattern as `post_create_file`). A folder name
+    // collision reuses the same 2500 path as file creation (JS
+    // `handleNodeWithSameNameExistsValidationError`), so `map_api_error`'s
+    // `NodeWithSameNameExists` mapping is the correct, faithful surface here.
+    let probe: EnvelopeProbe = serde_json::from_slice(&resp.body).map_err(|e| {
+        Error::Internal(format!(
+            "CreateFolder envelope parse: {e}; body={}",
+            body_snippet(&resp.body)
+        ))
+    })?;
+    if probe.code != CODE_OK {
+        return Err(map_api_error(probe.code, probe.error));
+    }
+    let env: ResponseEnvelope<CreateFolderResponse> =
+        serde_json::from_slice(&resp.body).map_err(|e| {
+            Error::Internal(format!(
+                "CreateFolderResponse parse: {e}; body={}",
+                body_snippet(&resp.body)
+            ))
+        })?;
+    Ok(env.inner.folder.id)
 }
 
 // ── XAttr builder ─────────────────────────────────────────────────────────────
@@ -2481,5 +2876,462 @@ mod tests {
             }
             other => panic!("expected BlockVerificationError, got {other:?}"),
         }
+    }
+
+    // ── WP2: revision upload / folder creation / nested-parent (B2) tests ──────
+
+    /// A file node link (Type 2) carrying a `ContentKeyPacket` and an active
+    /// revision — the shape `revision_uploader` re-fetches to learn the current
+    /// revision id and content key. `parent_link_id` sets the chain depth
+    /// (`None` = share-root child).
+    fn file_node_link_response(link_id: &str, parent_link_id: Option<&str>) -> Vec<u8> {
+        let resp = serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": link_id,
+                "ParentLinkID": parent_link_id,
+                "Type": 2,
+                "Name": "enc-name",
+                "Hash": null,
+                "MIMEType": "text/plain",
+                "State": 1,
+                "Size": 100,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "NodeKey": "FAKE_NODE_KEY",
+                "NodePassphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-node-passphrase"),
+                "NodePassphraseSignature": "SIG:fake",
+                "SignatureEmail": null,
+                "FileProperties": {
+                    "ContentKeyPacket": base64::engine::general_purpose::STANDARD.encode("FAKE_CKP"),
+                    "ContentKeyPacketSignature": null,
+                    "ActiveRevision": { "ID": "current-rev-1", "State": 1, "CreateTime": 0, "Size": 100 }
+                }
+            }
+        });
+        serde_json::to_vec(&resp).unwrap()
+    }
+
+    /// A folder node link (Type 1) advertising a specific (fake-encrypted)
+    /// `NodeHashKey`, so a test can prove *which* parent's hash key an upload /
+    /// folder-create actually used. `hash_key_plain` is the value `FakeCrypto`
+    /// yields after stripping the `FAKE_ENC:` marker.
+    fn folder_link_response(
+        link_id: &str,
+        parent_link_id: Option<&str>,
+        hash_key_plain: &str,
+    ) -> Vec<u8> {
+        let resp = serde_json::json!({
+            "Code": 1000,
+            "Link": {
+                "LinkID": link_id,
+                "ParentLinkID": parent_link_id,
+                "Type": 1,
+                "Name": "enc-name",
+                "Hash": null,
+                "MIMEType": "Folder",
+                "State": 1,
+                "Size": 0,
+                "CreateTime": 0,
+                "ModifyTime": 0,
+                "NodeKey": "FAKE_NODE_KEY",
+                "NodePassphrase": base64::engine::general_purpose::STANDARD.encode("FAKE_ENC:my-node-passphrase"),
+                "NodePassphraseSignature": "SIG:fake",
+                "SignatureEmail": null,
+                "FolderProperties": { "NodeHashKey": format!("FAKE_ENC:{hash_key_plain}") }
+            }
+        });
+        serde_json::to_vec(&resp).unwrap()
+    }
+
+    fn create_revision_ok_response() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "Code": 1000, "Revision": { "ID": "new-rev-1" } }))
+            .unwrap()
+    }
+
+    fn make_test_revision_uploader(
+        http: Arc<FakeHttpClient>,
+        expected_size: u64,
+        expected_sha1_hex: Option<String>,
+    ) -> ProtonRevisionUploader {
+        ProtonRevisionUploader {
+            http,
+            openpgp: Arc::new(FakeCrypto),
+            account: Arc::new(FakeAccount),
+            node: crate::nodes::make_node_uid("share-abc", "file-node-1"),
+            metadata: UploadMetadata {
+                media_type: "text/plain".into(),
+                expected_size,
+                expected_sha1_hex,
+                modification_time: None,
+                additional_metadata_json: None,
+                override_existing_draft_by_other_client: false,
+            },
+            telemetry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_upload_happy_path() {
+        // A revision reuses the existing node's key/content-key (no fresh
+        // generation) and drives the SAME block-upload + commit path as a new
+        // file, keyed by a freshly-created draft revision id.
+        let (share_bytes, _link, _cf, verification_bytes) = common_upload_responses();
+        let node_link = file_node_link_response("file-node-1", None);
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),           // 0: resolve_volume_id
+            (200, node_link.clone()),             // 1: fetch_node_link
+            (200, share_bytes),                   // 2: resolve_share_key
+            (200, node_link),                     // 3: resolve_node_key_via_chain
+            (200, create_revision_ok_response()), // 4: post_create_revision
+            (200, verification_bytes),            // 5: verification code
+            (200, block_req_bytes),               // 6: request block tokens
+            (200, b"{}".to_vec()),                // 7: PUT block
+            (200, commit_bytes),                  // 8: commit revision
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_revision_uploader(http.clone(), content.len() as u64, None);
+
+        let (progress_tx, _rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(result.is_ok(), "revision upload failed: {:?}", result.err());
+
+        let paths = http.recorded_paths();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("/files/file-node-1/revisions")),
+            "expected a create-revision POST, got {paths:?}"
+        );
+        // The create-revision body carries the CURRENT active revision id and
+        // no fresh node/content-key/name material.
+        let rev_body = http
+            .json_body_containing("/revisions")
+            .expect("create-revision POST body must be recorded");
+        assert_eq!(
+            rev_body["CurrentRevisionID"],
+            serde_json::json!("current-rev-1")
+        );
+        assert!(rev_body.get("NodeKey").is_none());
+        assert!(rev_body.get("ContentKeyPacket").is_none());
+        assert!(rev_body.get("Name").is_none());
+        // Commit targets the NEW revision id.
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/drive/v2/volumes/vol-xyz/files/file-node-1/revisions/new-rev-1"),
+            "commit must target the new revision, got {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_upload_2500_conflict_propagates_without_cleanup() {
+        // A draft-exists conflict (2500) on the revision draft must surface as a
+        // typed error and NOT trigger any delete-and-retry — the JS SDK never
+        // wires `handleConflictError` into the revision path (brief §"Conflict /
+        // draft-exists handling — IMPORTANT ASYMMETRY").
+        let (share_bytes, _l, _cf, _v) = common_upload_responses();
+        let node_link = file_node_link_response("file-node-1", None);
+        let conflict = serde_json::to_vec(&serde_json::json!({
+            "Code": 2500, "Error": "A draft already exists on this file"
+        }))
+        .unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()), // 0: resolve_volume_id
+            (200, node_link.clone()),   // 1: fetch_node_link
+            (200, share_bytes),         // 2: resolve_share_key
+            (200, node_link),           // 3: chain
+            (422, conflict),            // 4: post_create_revision → 2500
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_revision_uploader(http.clone(), content.len() as u64, None);
+        let (progress_tx, _rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            matches!(result, Err(Error::RevisionDraftConflict)),
+            "a 2500 on the revision draft must surface as RevisionDraftConflict, got {:?}",
+            result.err()
+        );
+
+        // No draft existed to clean up: nothing past the failed create-revision
+        // POST, and no revision-scoped DELETE.
+        let paths = http.recorded_paths();
+        assert_eq!(
+            paths.len(),
+            5,
+            "must stop at the failed create-revision POST: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("/revisions/")),
+            "no revision-scoped cleanup should occur on a draft-creation conflict: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_draft_cleanup_deletes_revision_on_block_upload_failure() {
+        // A failure downstream of draft creation (here: the block PUT fails)
+        // must trigger a best-effort DELETE of the *revision* draft (not a node
+        // delete), mirroring JS `deleteDraftRevision`.
+        let (share_bytes, _l, _cf, verification_bytes) = common_upload_responses();
+        let node_link = file_node_link_response("file-node-1", None);
+        let block_req_bytes = block_request_response();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),
+            (200, node_link.clone()),
+            (200, share_bytes),
+            (200, node_link),
+            (200, create_revision_ok_response()),
+            (200, verification_bytes),
+            (200, block_req_bytes),
+            (500, b"{}".to_vec()), // PUT block FAILS
+            (200, b"{}".to_vec()), // best-effort DELETE draft revision
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = make_test_revision_uploader(http.clone(), content.len() as u64, None);
+        let (progress_tx, _rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            matches!(result, Err(Error::IntegrityCheckFailed(_))),
+            "the original block-upload error must surface, got {:?}",
+            result.err()
+        );
+
+        let paths = http.recorded_paths();
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/drive/v2/volumes/vol-xyz/files/file-node-1/revisions/new-rev-1"),
+            "expected a best-effort DELETE of the new draft revision, got {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_folder_happy_path() {
+        // common's root link is a folder with NodeHashKey "FAKE_ENC:my-hash-key"
+        // → decrypts to "my-hash-key" (the same key NAME_HASH_KAT_HEX pins).
+        let (share_bytes, root_link_bytes, _cf, _v) = common_upload_responses();
+        let folder_resp = serde_json::to_vec(&serde_json::json!({
+            "Code": 1000, "Folder": { "ID": "new-folder-1" }
+        }))
+        .unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()), // 0: resolve_volume_id
+            (200, share_bytes),         // 1: resolve_share_key
+            (200, root_link_bytes),     // 2: parent link (root folder)
+            (200, folder_resp),         // 3: POST create folder
+        ]));
+        let http_dyn: Arc<dyn ProtonDriveHttpClient> = http.clone();
+        let openpgp: Arc<dyn OpenPgpCrypto> = Arc::new(FakeCrypto);
+        let account: Arc<dyn ProtonDriveAccount> = Arc::new(FakeAccount);
+
+        let parent = crate::nodes::make_node_uid("share-abc", "root-link");
+        let uid = create_folder(&http_dyn, &openpgp, &account, &parent, "test-file.txt")
+            .await
+            .expect("create_folder should succeed");
+
+        // Returned NodeUid carries the parent's share_id + the new folder id.
+        assert_eq!(uid.volume_id, "share-abc");
+        assert_eq!(uid.node_id, "new-folder-1");
+
+        let body = http
+            .json_body_containing("/folders")
+            .expect("create-folder POST body must be recorded");
+        assert_eq!(body["ParentLinkID"], serde_json::json!("root-link"));
+        assert_eq!(body["SignatureEmail"], serde_json::json!("test@proton.me"));
+        assert!(
+            body.get("NodeHashKey").is_some(),
+            "folders carry a NodeHashKey"
+        );
+        assert!(
+            body.get("ContentKeyPacket").is_none(),
+            "folders have no content-key material"
+        );
+        assert!(body.get("XAttr").is_none(), "absent XAttr must be omitted");
+        // Name hash uses the parent (root) folder's hash key "my-hash-key".
+        assert_eq!(body["Hash"].as_str(), Some(NAME_HASH_KAT_HEX));
+    }
+
+    #[tokio::test]
+    async fn create_file_uses_nested_parent_hash_key() {
+        // B2 upload-half regression guard: uploading into a NESTED folder must
+        // derive the name hash from the *nested* parent's NodeHashKey, not the
+        // share root's. The nested parent advertises "nested-hash-key"; the root
+        // advertises "root-hash-key".
+        let (share_bytes, _l, _cf, verification_bytes) = common_upload_responses();
+        let nested = folder_link_response("nested-folder", Some("root-link"), "nested-hash-key");
+        let root = folder_link_response("root-link", None, "root-hash-key");
+        let create_file_bytes = serde_json::to_vec(&serde_json::json!({
+            "Code": 1000, "File": { "ID": "new-file", "RevisionID": "new-rev" }
+        }))
+        .unwrap();
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()), // 0: resolve_volume_id
+            (200, share_bytes),         // 1: resolve_share_key
+            (200, nested),              // 2: chain — nested parent (target)
+            (200, root),                // 3: chain — root ancestor
+            (200, create_file_bytes),   // 4: POST create file
+            (200, verification_bytes),  // 5: verification
+            (200, block_req_bytes),     // 6: request block tokens
+            (200, b"{}".to_vec()),      // 7: PUT block
+            (200, commit_bytes),        // 8: commit
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let uploader = ProtonFileUploader {
+            http: http.clone(),
+            openpgp: Arc::new(FakeCrypto),
+            account: Arc::new(FakeAccount),
+            parent: crate::nodes::make_node_uid("share-abc", "nested-folder"),
+            name: "test-file.txt".into(),
+            metadata: UploadMetadata {
+                media_type: "text/plain".into(),
+                expected_size: content.len() as u64,
+                expected_sha1_hex: None,
+                modification_time: None,
+                additional_metadata_json: None,
+                override_existing_draft_by_other_client: false,
+            },
+            telemetry: None,
+        };
+        let (progress_tx, _rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            result.is_ok(),
+            "nested-parent upload failed: {:?}",
+            result.err()
+        );
+
+        let create_body = http
+            .json_body_containing("/files")
+            .expect("create-file POST body must be recorded");
+        let expected = compute_name_hash_hex(b"nested-hash-key", "test-file.txt").unwrap();
+        let root_hash = compute_name_hash_hex(b"root-hash-key", "test-file.txt").unwrap();
+        assert_eq!(
+            create_body["Hash"].as_str(),
+            Some(expected.as_str()),
+            "name hash must use the NESTED parent's hash key (B2 upload-half fix)"
+        );
+        assert_ne!(
+            expected, root_hash,
+            "fixture sanity: the two hash keys differ"
+        );
+        // The chain must have walked both the nested parent and its root ancestor.
+        let paths = http.recorded_paths();
+        assert!(paths.iter().any(|p| p.contains("/links/nested-folder")));
+        assert!(paths.iter().any(|p| p.contains("/links/root-link")));
+    }
+
+    #[tokio::test]
+    async fn create_folder_uses_nested_parent_hash_key() {
+        // B2: creating a subfolder under a NESTED folder must derive the name
+        // hash from the nested parent's hash key.
+        let (share_bytes, _l, _cf, _v) = common_upload_responses();
+        let nested = folder_link_response("nested-folder", Some("root-link"), "nested-hash-key");
+        let root = folder_link_response("root-link", None, "root-hash-key");
+        let folder_resp = serde_json::to_vec(&serde_json::json!({
+            "Code": 1000, "Folder": { "ID": "new-sub-folder" }
+        }))
+        .unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()), // 0: resolve_volume_id
+            (200, share_bytes),         // 1: resolve_share_key
+            (200, nested),              // 2: chain — nested parent (target)
+            (200, root),                // 3: chain — root ancestor
+            (200, folder_resp),         // 4: POST create folder
+        ]));
+        let http_dyn: Arc<dyn ProtonDriveHttpClient> = http.clone();
+        let openpgp: Arc<dyn OpenPgpCrypto> = Arc::new(FakeCrypto);
+        let account: Arc<dyn ProtonDriveAccount> = Arc::new(FakeAccount);
+
+        let parent = crate::nodes::make_node_uid("share-abc", "nested-folder");
+        let uid = create_folder(&http_dyn, &openpgp, &account, &parent, "test-file.txt")
+            .await
+            .expect("nested create_folder should succeed");
+        assert_eq!(uid.node_id, "new-sub-folder");
+
+        let body = http
+            .json_body_containing("/folders")
+            .expect("create-folder POST body must be recorded");
+        let expected = compute_name_hash_hex(b"nested-hash-key", "test-file.txt").unwrap();
+        assert_eq!(
+            body["Hash"].as_str(),
+            Some(expected.as_str()),
+            "folder name hash must use the NESTED parent's hash key (B2 fix)"
+        );
+        assert_eq!(body["ParentLinkID"], serde_json::json!("nested-folder"));
+    }
+
+    #[tokio::test]
+    async fn revision_upload_resolves_nested_node_key_chain() {
+        // A revision on a NESTED file must resolve the node key by walking the
+        // full parent chain (nested-file → mid-folder → root). Crypto
+        // correctness at depth is covered by client.rs's real-crypto chain test
+        // (`resolve_node_key_via_chain_unlocks_three_level_nesting`); here (fake
+        // crypto) we assert the chain is actually WALKED to the root — the B2
+        // property the revision path relies on.
+        let (share_bytes, _l, _cf, verification_bytes) = common_upload_responses();
+        let nested_file = file_node_link_response("nested-file", Some("mid-folder"));
+        let mid = folder_link_response("mid-folder", Some("root-link"), "mid-hash-key");
+        let root = folder_link_response("root-link", None, "root-hash-key");
+        let block_req_bytes = block_request_response();
+        let commit_bytes = serde_json::to_vec(&serde_json::json!({ "Code": 1000 })).unwrap();
+
+        let http = Arc::new(FakeHttpClient::new(vec![
+            (200, share_bytes.clone()),           // 0: resolve_volume_id
+            (200, nested_file.clone()),           // 1: fetch_node_link
+            (200, share_bytes),                   // 2: resolve_share_key
+            (200, nested_file),                   // 3: chain — nested file (target)
+            (200, mid),                           // 4: chain — mid folder
+            (200, root),                          // 5: chain — root
+            (200, create_revision_ok_response()), // 6: post_create_revision
+            (200, verification_bytes),            // 7: verification
+            (200, block_req_bytes),               // 8: request block tokens
+            (200, b"{}".to_vec()),                // 9: PUT block
+            (200, commit_bytes),                  // 10: commit
+        ]));
+
+        let content = b"hello proton drive block upload!";
+        let mut uploader = make_test_revision_uploader(http.clone(), content.len() as u64, None);
+        uploader.node = crate::nodes::make_node_uid("share-abc", "nested-file");
+
+        let (progress_tx, _rx) = tokio::sync::watch::channel(0u64);
+        let stream: Box<dyn AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(content.to_vec()));
+        let result = uploader.upload_from_stream(stream, progress_tx).await;
+        assert!(
+            result.is_ok(),
+            "nested-node revision upload failed: {:?}",
+            result.err()
+        );
+
+        let paths = http.recorded_paths();
+        assert!(paths.iter().any(|p| p.contains("/links/nested-file")));
+        assert!(paths.iter().any(|p| p.contains("/links/mid-folder")));
+        assert!(
+            paths.iter().any(|p| p.contains("/links/root-link")),
+            "revision node-key resolution must walk the full chain to the root: {paths:?}"
+        );
     }
 }

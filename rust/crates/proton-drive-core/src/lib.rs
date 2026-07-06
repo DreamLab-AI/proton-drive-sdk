@@ -18,6 +18,7 @@ pub mod download;
 pub mod error;
 pub mod events;
 pub mod http;
+pub(crate) mod keys;
 pub mod nodes;
 pub mod photos;
 pub mod shares;
@@ -39,4 +40,6 @@ pub use nodes::{
     CachedCryptoMaterial, FolderChildrenFilter, MaybeNode, Node, NodeType, NodeUid, Revision,
     make_node_uid,
 };
-pub use upload::{FileUploader, ProtonFileUploader, UploadController, UploadMetadata};
+pub use upload::{
+    FileUploader, ProtonFileUploader, ProtonRevisionUploader, UploadController, UploadMetadata,
+};

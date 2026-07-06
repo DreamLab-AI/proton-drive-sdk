@@ -455,6 +455,45 @@ pub mod upload {
         pub revision_id: String,
     }
 
+    /// `POST drive/v2/volumes/{volumeID}/files/{linkID}/revisions` request body.
+    /// Mirrors JS `UploadAPIService.createDraftRevision`'s
+    /// `PostCreateDraftRevisionRequest`
+    /// (`reference/client/js/src/internal/upload/apiService.ts:137-161`): a
+    /// revision draft on an *existing* file carries only the optimistic
+    /// concurrency guard (`CurrentRevisionID`), the per-process draft-owner id
+    /// (`ClientUID`), and the coarse size hint — **no** node key, content key,
+    /// name, or hash (those are reused from the existing node).
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreateRevisionRequest {
+        /// The currently-active revision's ID (server rejects if the active
+        /// revision has moved since the client last read it).
+        #[serde(rename = "CurrentRevisionID")]
+        pub current_revision_id: String,
+        #[serde(rename = "ClientUID")]
+        pub client_uid: Option<String>,
+        /// Coarse size hint for early quota validation; sent as `null` when
+        /// unknown (the server re-validates during commit).
+        pub intended_upload_size: Option<u64>,
+    }
+
+    /// `POST .../revisions` response — `{ "Revision": { "ID": ... } }`.
+    /// Mirrors JS `PostCreateDraftRevisionResponse` (apiService.ts:137-161):
+    /// the new draft revision's id is combined with the volume/node ids into a
+    /// `NodeRevisionUid` client-side.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreateRevisionResponse {
+        pub revision: CreatedRevision,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreatedRevision {
+        #[serde(rename = "ID")]
+        pub id: String,
+    }
+
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "PascalCase")]
     pub struct RequestBlockUploadRequest {
@@ -559,6 +598,52 @@ pub mod upload {
         pub code: u32,
         #[serde(default)]
         pub error: Option<String>,
+    }
+}
+
+pub mod folders {
+    use super::*;
+
+    /// `POST drive/v2/volumes/{volumeID}/folders` request body.
+    ///
+    /// Mirrors JS `NodesAPIService.createFolder`'s `PostCreateFolderRequest`
+    /// (`reference/client/js/src/internal/nodes/apiService.ts:498-536`). Unlike
+    /// [`super::upload::CreateFileRequest`], a folder carries a `NodeHashKey`
+    /// (the HMAC key that this folder's own children will hash their names
+    /// against — the read side consumes it in
+    /// `ProtonDriveClient::resolve_folder_node_key`) and has **no** content-key
+    /// material (there is no file content to wrap a session key for). Folder
+    /// creation also signs with `SignatureEmail`, not the file path's
+    /// `SignatureAddress`. `XAttr` is optional and omitted from the wire when
+    /// absent (JS sends it as `undefined`, which `JSON.stringify` drops).
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreateFolderRequest {
+        #[serde(rename = "ParentLinkID")]
+        pub parent_link_id: String,
+        pub node_key: String,
+        pub node_hash_key: String,
+        pub node_passphrase: String,
+        pub node_passphrase_signature: String,
+        pub signature_email: String,
+        pub name: String,
+        pub hash: String,
+        #[serde(rename = "XAttr", skip_serializing_if = "Option::is_none")]
+        pub x_attr: Option<String>,
+    }
+
+    /// `POST .../folders` response — `{ "Folder": { "ID": ... } }`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreateFolderResponse {
+        pub folder: CreatedFolder,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct CreatedFolder {
+        #[serde(rename = "ID")]
+        pub id: String,
     }
 }
 
@@ -1099,6 +1184,124 @@ mod tests {
             "Size must not be sent for content blocks"
         );
         assert_eq!(obj["Verifier"]["Token"], "tok");
+    }
+
+    /// Revision-draft create request must emit Proton's exact PascalCase keys:
+    /// `CurrentRevisionID` (uppercase ID), `ClientUID` (uppercase UID), and
+    /// `IntendedUploadSize` sent as `null` when unknown. Mirrors JS
+    /// `PostCreateDraftRevisionRequest` (apiService.ts:137-161).
+    #[test]
+    fn serialize_create_revision_request_shape() {
+        let req = upload::CreateRevisionRequest {
+            current_revision_id: "rev-current".into(),
+            client_uid: None,
+            intended_upload_size: None,
+        };
+        let v = serde_json::to_value(&req).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(
+            obj.contains_key("CurrentRevisionID"),
+            "must use CurrentRevisionID, not CurrentRevisionId"
+        );
+        assert_eq!(obj["CurrentRevisionID"], "rev-current");
+        assert!(
+            obj.contains_key("ClientUID"),
+            "must use ClientUID, not ClientUid"
+        );
+        assert!(obj["ClientUID"].is_null());
+        assert!(obj.contains_key("IntendedUploadSize"));
+        assert!(
+            obj["IntendedUploadSize"].is_null(),
+            "unknown size sent as null"
+        );
+        // No node key / content key / name / hash on a revision draft.
+        assert!(!obj.contains_key("NodeKey"));
+        assert!(!obj.contains_key("ContentKeyPacket"));
+        assert!(!obj.contains_key("Name"));
+        assert!(!obj.contains_key("Hash"));
+    }
+
+    /// `CreateRevisionResponse` deserializes the `{ "Revision": { "ID" } }`
+    /// wire shape onto `revision.id`.
+    #[test]
+    fn deserialize_create_revision_response() {
+        let body = r#"{ "Code": 1000, "Revision": { "ID": "new-rev-777" } }"#;
+        let env: common::ResponseEnvelope<upload::CreateRevisionResponse> =
+            serde_json::from_str(body).expect("parse");
+        assert_eq!(env.code, common::CODE_OK);
+        assert_eq!(env.inner.revision.id, "new-rev-777");
+    }
+
+    /// Folder-create request must emit Proton's exact PascalCase keys,
+    /// carry a `NodeHashKey` (folders have one, files don't), sign with
+    /// `SignatureEmail` (not the file path's `SignatureAddress`), send **no**
+    /// content-key material, and omit `XAttr` entirely when absent. Mirrors JS
+    /// `PostCreateFolderRequest` (nodes/apiService.ts:498-536).
+    #[test]
+    fn serialize_create_folder_request_shape() {
+        let req = folders::CreateFolderRequest {
+            parent_link_id: "parent-1".into(),
+            node_key: "nk".into(),
+            node_hash_key: "nhk".into(),
+            node_passphrase: "np".into(),
+            node_passphrase_signature: "nps".into(),
+            signature_email: "sig@addr".into(),
+            name: "enc-name".into(),
+            hash: "namehash".into(),
+            x_attr: None,
+        };
+        let v = serde_json::to_value(&req).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert!(obj.contains_key("ParentLinkID"));
+        assert!(
+            obj.contains_key("NodeHashKey"),
+            "folders carry a NodeHashKey"
+        );
+        assert!(
+            obj.contains_key("SignatureEmail"),
+            "folder create signs with SignatureEmail, not SignatureAddress"
+        );
+        assert!(!obj.contains_key("SignatureAddress"));
+        assert!(
+            !obj.contains_key("ContentKeyPacket"),
+            "folders have no content key material"
+        );
+        assert!(
+            !obj.contains_key("XAttr"),
+            "absent XAttr must be omitted from the wire entirely"
+        );
+        assert_eq!(obj["Hash"], "namehash");
+        assert_eq!(obj["Name"], "enc-name");
+    }
+
+    /// A present `XAttr` must serialize under the `XAttr` key.
+    #[test]
+    fn serialize_create_folder_request_includes_xattr_when_present() {
+        let req = folders::CreateFolderRequest {
+            parent_link_id: "parent-1".into(),
+            node_key: "nk".into(),
+            node_hash_key: "nhk".into(),
+            node_passphrase: "np".into(),
+            node_passphrase_signature: "nps".into(),
+            signature_email: "sig@addr".into(),
+            name: "enc-name".into(),
+            hash: "namehash".into(),
+            x_attr: Some("enc-xattr".into()),
+        };
+        let v = serde_json::to_value(&req).expect("serialize");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj["XAttr"], "enc-xattr");
+    }
+
+    /// `CreateFolderResponse` deserializes the `{ "Folder": { "ID" } }` wire
+    /// shape onto `folder.id`.
+    #[test]
+    fn deserialize_create_folder_response() {
+        let body = r#"{ "Code": 1000, "Folder": { "ID": "new-folder-42" } }"#;
+        let env: common::ResponseEnvelope<folders::CreateFolderResponse> =
+            serde_json::from_str(body).expect("parse");
+        assert_eq!(env.code, common::CODE_OK);
+        assert_eq!(env.inner.folder.id, "new-folder-42");
     }
 
     /// Commit request uses `XAttr` (not `XAttribute`), `ChecksumVerified`,

@@ -49,7 +49,7 @@ snapshot and is now a fully wired, tested consumer reaching into `pdtui`'s UI.
 | # | Item | Where | State |
 |---|---|---|---|
 | B1 | Name hash | `upload.rs` (`resolve_parent_context` + name-hash computation) | **Fixed.** `HMAC-SHA256(parent_hash_key, name_bytes)`, with `parent_hash_key` decrypted from the parent's `FolderProperties.NodeHashKey`. |
-| B2 | Nested-folder key derivation | download/listing: `client.rs::resolve_node_key_via_chain`; upload: `upload.rs::resolve_parent_context` | **Split state.** Download and folder-listing walk the full parent chain and work at any depth (live-verified against a 646 MB nested file). **Upload does not**: `resolve_parent_context`'s own doc comment states it is "only correct when `parent.node_id` is the share root" — uploading into a nested (non-root) folder will derive the wrong `NodeHashKey`/parent node key. This is a real, current, deliberately-deferred gap (see `audit-2026-07-05.md`), not yet fixed by any wp1–wp9 package. |
+| B2 | Nested-folder key derivation | download/listing + upload now share `keys.rs::{resolve_node_key_via_chain, resolve_parent_context}` (delegated to from `client.rs` and `upload.rs`) | **Fixed (both halves).** The full-chain parent resolution was extracted into `proton-drive-core/src/keys.rs` as the single source of truth; the download/listing path (`client.rs`) and the upload/folder-create path (`upload.rs::resolve_parent_context`, `revision_uploader`, `create_folder`) all delegate to it, so nested (non-root) parents derive the correct `NodeHashKey`/parent node key at any depth. Regression tests (WP2, `upload.rs`): `create_file_uses_nested_parent_hash_key` and `create_folder_uses_nested_parent_hash_key` assert the *nested* parent's hash key is used (not the root's); `revision_upload_resolves_nested_node_key_chain` asserts the node-key walk reaches the root for a nested file; crypto correctness at depth remains covered by `client.rs::resolve_node_key_via_chain_unlocks_three_level_nesting`. |
 | B3 | XAttr modification-time / size / SHA1 | `download.rs::verify_xattr` | **Fixed.** Modification time is decrypted and returned in `DownloadStats`. Size and SHA1 mismatches are logged at `error` level but are **deliberately non-fatal**, matching the JS SDK's own fallback behaviour (JS never asserts assembled size against `XAttr.Common.Size` either — see ADR-0009 correction). |
 | ~~B4~~ | ~~Recovered passphrases held as plain `Vec<u8>`~~ | ~~`account.rs`, `download.rs`~~ | **Fixed** — wrapped in `Zeroizing`, as before. |
 | B5 | Detached per-block `enc_signature` fetched but not independently verified | `download.rs` | **Not a bug — JS-faithful by design**, and now says so explicitly in code: the JS reference has no code path that decrypts or verifies the per-block detached signature either; only the manifest signature over block hashes establishes per-revision authenticity, and the SHA-256 hash check guards data integrity per block. |
@@ -93,7 +93,6 @@ already covered by the B-table above:
   re-validation of the fix packages above.
 - SEIPDv2 / AEAD — rejected by ADR-0006, deferred to M2.5.
 - SQLite cache — in-memory only, ADR-0003.
-- Uploading into nested (non-root-parent) folders (B2, upload half).
 
 ## Honest verdict
 
@@ -109,8 +108,10 @@ touched the core protocol shape, but that is an assumption, not a proof, until
 someone runs it against production again.
 
 Remaining known gaps are all deliberately scoped out or deferred, not
-oversights: nested-folder **upload** (B2 upload-half), the v1→v2 endpoint
-migration (B8), SEIPDv2/AEAD (ADR-0006), and B5's non-verification of
-per-block detached signatures (JS-faithful by design). None of these block the
-MVP's stated scope (SRP login → list → upload/download at the My Files root
-and nested reads).
+oversights: the v1→v2 endpoint migration (B8), SEIPDv2/AEAD (ADR-0006), and
+B5's non-verification of per-block detached signatures (JS-faithful by design).
+The B2 upload-half gap (nested-folder upload) has since been fixed by WP2 —
+upload, revision upload, and folder creation all resolve nested parent contexts
+through the shared `keys.rs` full-chain resolver. None of these remaining gaps
+block the MVP's stated scope (SRP login → list → upload/download at the My Files
+root and nested reads).
