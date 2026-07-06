@@ -38,6 +38,7 @@ cargo fmt --all                    # (CI runs --check)
 
 ./target/release/pdtui login       # live SRP login → OS keyring
 ./target/release/pdtui mvp         # headless live round-trip acceptance test
+./target/release/pdtui mcp         # serve MCP over stdio (agentic control + hash-based sync, ADR-0013)
 ./target/release/pdtui             # interactive two-pane browser
 ```
 

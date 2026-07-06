@@ -1,6 +1,13 @@
 # Implementation Status — MVP upload/download + auth
 
-Date: 2026-07-05. Branch: `audit/gap-fill` (post gap-fill, pre-merge to `main`).
+Date: 2026-07-06. Branch: `feat/mcp-agentic-sync`.
+
+This file now also documents work landed on `feat/mcp-agentic-sync` after the
+`audit/gap-fill` mesh: the MCP server surface and hash-based sync engine
+(WP1–WP4, `PRD-mcp-agentic-sync.md` / ADR-0013) — including WP2's fix of the B2
+nested-folder upload gap below — plus a docs-accuracy audit reconciling those
+docs against the code as landed. The milestone/blocker tables below carry over
+from the `audit/gap-fill` snapshot except where noted.
 
 Supersedes the 2026-05-28 snapshot. Between that snapshot and this one, a
 seven-agent audit mesh (`wp1`–`wp9`) reviewed the codebase against the JS SDK

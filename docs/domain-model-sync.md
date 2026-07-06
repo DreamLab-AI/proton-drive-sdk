@@ -46,11 +46,13 @@ hash algorithm and the same input (plaintext), so a match is authoritative:
 identical `ContentHash` on both sides means the content is unchanged, full
 stop, no size/mtime tie-break needed once hashes exist for both sides.
 
-Agents reach Sync only through MCP tool calls (`sync_plan`, `sync_resolve`,
-`sync_apply` or equivalent); Sync exposes no other public entry point. This
-mirrors the **Open Host Service** pattern the JS SDK already uses at its own
-public surface (`ProtonDriveClient`) — a small, deliberately-shaped API,
-not the internal aggregate surface.
+Agents reach Sync only through MCP tool calls (`sync_plan` then `sync_apply`);
+Sync exposes no other public entry point. There is no separate `sync_resolve`
+tool — conflict resolution folds into `sync_apply`'s `decisions` argument (a
+`path → keep_local|keep_remote|skip` map). This mirrors the **Open Host
+Service** pattern the JS SDK already uses at its own public surface
+(`ProtonDriveClient`) — a small, deliberately-shaped API, not the internal
+aggregate surface.
 
 ## 2. Aggregates, entities, value objects
 
@@ -66,19 +68,20 @@ LocalIndex
 ```
 IndexEntry (entity, keyed by RelativePath within LocalIndex)
 ├── path: RelativePath
-├── content_hash: Option<ContentHash>    // None until hashed
-├── size_bytes: u64
-├── mtime: SystemTime
-└── cached_at: (size_bytes, mtime)       // the triple the hash was computed for
+├── content_hash: ContentHash            // always present on an emitted entry
+├── size: u64
+└── mtime: SystemTime
 ```
 
-Cache-invalidation rule: an `IndexEntry`'s `content_hash` is trusted **only**
-while the live `(size_bytes, mtime)` pair still matches `cached_at`. Any
-change to either invalidates the cached hash and forces a re-hash before the
-entry can participate in planning — this is the same "trust but verify
-cheaply first" pattern the JS SDK uses nowhere else in this codebase, so it
-is Sync's own invention and documented here rather than mirrored from
-upstream.
+Cache-invalidation rule: a re-index reuses a previously-computed digest **only**
+while the file's live `(size, mtime)` pair still matches the value the digest
+was recorded for. That `(size, mtime) → sha1` validity check lives in a
+separate `HashCache` (in-memory, or the optional on-disk `cache_file`), not on
+`IndexEntry` — an emitted `IndexEntry` always carries a concrete
+`content_hash`. Any `(size, mtime)` change forces a re-hash before the entry
+participates in planning. This is the same "trust but verify cheaply first"
+pattern the JS SDK uses nowhere else in this codebase, so it is Sync's own
+invention and documented here rather than mirrored from upstream.
 
 ### RemoteSnapshot (aggregate root)
 
@@ -118,9 +121,9 @@ SyncPlan
 SyncOp (entity, ordered within SyncPlan; identity = position + target path)
 ├── path: RelativePath
 ├── kind: Upload | UploadRevision | Download | Skip | Conflict
-├── local_ref: Option<(ContentHash, size_bytes, mtime)>   // snapshot-time facts, not live re-reads
-├── remote_ref: Option<(NodeUid, RevisionId, ContentHash)>
-└── conflict: Option<ConflictOutcome>    // populated only when kind = Conflict, and only after resolution
+├── local_ref: Option<(ContentHash, size, mtime)>          // snapshot-time facts, not live re-reads; `local` in code
+├── remote_ref: Option<(NodeUid, RevisionId, ContentHash)> // `remote` in code
+└── conflict: Option<ConflictOutcome>    // set on the resolved op after resolution; `outcome` in code
 ```
 
 A `SyncPlan` is **immutable once issued.** Resolving a `Conflict` op does not
@@ -136,11 +139,11 @@ Active, never mutate in place" shape already used for `Revision` in
 ConflictOutcome = KeepLocal | KeepRemote | Skip
 ```
 
-A pure decision value, always supplied by the agent through the MCP resolve
-tool. The Sync engine never picks a `ConflictOutcome` itself — it can detect
-that both sides changed since the last common snapshot (a true conflict, not
-just a one-sided diff) but resolution authority stops there. This is the
-same boundary as `ProtonDriveAccount`/`AddressProvider` in
+A pure decision value, always supplied by the agent through `sync_apply`'s
+per-path `decisions` map (there is no separate resolve tool). The Sync engine
+never picks a `ConflictOutcome` itself — it can detect that both sides carry a
+digest and diverge (a true conflict) but resolution authority stops there. This
+is the same boundary as `ProtonDriveAccount`/`AddressProvider` in
 `domain-model.md` §1.1: the host (here, the agent) supplies a decision the
 engine cannot manufacture.
 
@@ -185,9 +188,13 @@ engine cannot manufacture.
    apply step first checks whether its target already matches the intended
    post-state (by `ContentHash`, per invariant 3) and reduces to `Skip` if so.
 5. **A `SyncPlan` in `Approved` state supersedes, never mutates, its
-   `Proposed` predecessor.** Resolving conflicts creates a new
-   `SyncPlan` (state transition `Proposed → Superseded` on the original,
-   `Approved` on the new one); no in-place edit of `ops` is ever exposed.
+   `Proposed` predecessor.** Resolving conflicts creates a new `Approved`
+   `SyncPlan` whose `superseded` field points at the original's id; the
+   original is left untouched — still `Proposed`, never edited in place.
+   Supersession is recorded on the *new* plan's `superseded` link, not by
+   mutating the old plan's state: as landed, the engine does not transition the
+   predecessor to `Superseded`, nor set `Applied` after apply. `PlanState::`
+   `Superseded`/`Applied` are defined but not yet assigned by the engine.
 6. **`ConflictOutcome` is only ever set by the agent.** The engine may detect
    and surface a conflict; it never defaults, guesses, or auto-resolves one.
 
@@ -196,6 +203,17 @@ engine cannot manufacture.
 Sync does not raise its own Drive-facing events; it **consumes** the
 existing `DriveEvent` stream (`proton-drive-core::events`, see
 `domain-model.md` §1.4) as a staleness signal for `RemoteSnapshot`:
+
+> **Status (v1, as landed): intended, not yet wired into the MCP surface.**
+> This staleness mechanism is defined and unit-tested on `RemoteSnapshot`
+> (`mark_stale`/`is_stale`), but the MCP flow does not use it: each `sync_plan`
+> call rebuilds the remote side from a fresh live walk rather than holding a
+> long-lived `RemoteSnapshot` that a `DriveEvent` could mark stale, so
+> `mark_stale` is exercised only in tests today. The operative safety guard on
+> the MCP path is instead the apply-time revision-uid re-check (invariant 2),
+> not snapshot staleness. The `events_poll` tool exposes the raw event drain to
+> the agent, which can re-plan on its own initiative. The table below describes
+> the intended wiring for when a persisted/long-lived snapshot lands.
 
 | DriveEvent | Effect on `RemoteSnapshot` |
 |---|---|

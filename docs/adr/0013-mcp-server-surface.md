@@ -40,9 +40,10 @@ computation, no network calls, so it can be unit-tested without a live
 session and reused by both `pdtui mcp` and any future interactive sync UI.
 
 Mutating operations follow a **plan/apply split**:
-- `sync_plan` is a pure dry-run — it diffs the local index against the last-
-  known remote state and returns a proposed set of operations (create,
-  update, delete, conflict) with no side effects.
+- `sync_plan` is a pure dry-run — it diffs the local index against the current
+  remote state and returns a proposed set of operations (upload,
+  upload-revision, download, skip, conflict) with no side effects. There is no
+  `delete` op: mirror deletes are a non-goal.
 - `sync_apply` executes only the specific operations the agent has approved
   from that plan — it does not recompute or re-derive changes, and it does
   not silently expand scope beyond what was approved.
@@ -73,9 +74,13 @@ dependency of any `proton-drive-*` SDK crate.
   crates (`proton-drive`, `proton-drive-core`, `proton-drive-api`,
   `proton-drive-crypto`, `proton-drive-cache`) remain untouched by MCP
   concerns.
-- Follow-on work: the plan/apply model needs a persisted "last known remote
-  state" checkpoint (owned by `proton-drive-sync`) for the diff to be
-  meaningful across process restarts — sequencing tracked outside this ADR.
+- Follow-on work — **partially addressed.** `sync_plan` now persists a
+  remote-snapshot checkpoint (the serde `RemoteSnapshot` written to
+  `$XDG_CONFIG_HOME/pdtui/mcp-checkpoints/{plan_id}.json`), but nothing yet
+  reads it back: each `sync_plan` rebuilds the remote side from a fresh live
+  walk. Consuming the checkpoint as a diff baseline across restarts —
+  baseline-aware / three-way diff — remains deferred; sequencing tracked
+  outside this ADR.
 
 ## Alternatives considered
 - **Separate `pdmcp` binary crate** — rejected: at personal-use, single-user

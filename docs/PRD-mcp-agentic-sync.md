@@ -99,31 +99,35 @@ service (ADR-0007).
 ### User stories
 
 1. **Upload with verification.** *As an agent*, I call `drive_upload(local_path,
-   remote_parent_uid)` to push a new file, then `drive_list` the parent to
+   remote_parent_path)` to push a new file, then `drive_list` the parent to
    confirm the new node's SHA1 matches what I computed locally before telling
    the user it's done.
 2. **Directed sync.** *As an agent*, I call `sync_plan("~/projects/foo",
-   "/My Files/Projects/foo")` and get back three ops: two `upload` (new local
-   files), one `skip` (hash-equal). I call `sync_apply` naming only the two
-   upload ops — nothing happens to files I didn't name.
+   "/My Files/Projects/foo")` and get back a `plan_id` and three ops: two
+   `upload` (new local files), one `skip` (hash-equal). With no conflicts I
+   call `sync_apply(plan_id)` with an empty `decisions` map; it runs that
+   plan's ops — the two uploads happen, the skip is a no-op. Nothing outside
+   that stored plan can be touched.
 3. **Conflict surfaced, not resolved.** *As an agent*, `sync_plan` reports one
-   `conflict` entry (same path, different hash on each side, both newer than
-   any recorded baseline). I read both files (`drive_download` +local read),
-   decide which one is authoritative, and call `sync_apply` with exactly the
-   one operation that reflects my decision — upload local-over-remote or
-   download remote-over-local, never both, never automatically.
+   `conflict` entry (same path, different hash on each side). I read both files
+   (`drive_download` + local read), decide which side is authoritative, and
+   call `sync_apply(plan_id, decisions={path: keep_local})` (or `keep_remote`)
+   — the engine turns that decision into an `upload_revision` (or `download`),
+   never both, never automatically. An undecided conflict makes the whole
+   apply fail rather than pick a side.
 4. **Staleness check before acting.** *As a long-running agent*, I hold a
-   cursor from a previous `events_poll` call. Before trusting a `sync_plan`
-   result I call `events_poll(since=cursor)` — if it reports a change under
-   the folder I'm about to sync, I re-run `drive_list` first rather than
-   acting on a stale remote listing.
+   `next_anchor` from a previous `events_poll` call. Before trusting a
+   `sync_plan` result I call `events_poll(since_event_id=anchor)` — if it
+   reports a change under the folder I'm about to sync, I re-run `drive_list`
+   first rather than acting on a stale remote listing.
 5. **New project folder.** *As an agent* setting up a new remote mirror, I
-   call `drive_mkdir(parent_uid, "new-project")` once, then upload into it —
+   call `drive_mkdir(parent_path, "new-project")` once, then upload into it —
    no separate out-of-band step required.
 6. **Revise an existing file.** *As an agent* that edited a file already on
-   Drive, I call `drive_upload` again against the same remote path; the tool
-   detects the node already exists and creates a new revision rather than
-   failing with a name collision.
+   Drive, I call `drive_upload` again against the same remote path. By default
+   the tool refuses — a name collision is a hard error, never a silent
+   overwrite — so I re-call with `allow_revision_on_conflict: true` to upload a
+   new revision of the existing node (`created_revision: true` in the result).
 
 ## 5. Reference: what exists today vs what this PRD adds
 
@@ -144,10 +148,10 @@ service (ADR-0007).
 `pdtui mcp` is a new arm of the existing subcommand dispatch
 (`apps/pdtui/src/main.rs:46`): `Some("mcp") => run_mcp().await`. It:
 
-1. Loads the existing session via `session::Session::load()` exactly as
-   `pdtui` (interactive) and `pdtui mvp` already do — if no session exists,
-   it exits with an error telling the operator to run `pdtui login` first.
-   The MCP server is never itself a login surface.
+1. Loads the existing keyring session via `SessionManager::from_keyring`
+   exactly as `pdtui mvp` already does — if no session exists, it exits with an
+   error telling the operator to run `pdtui login` first. The MCP server is
+   never itself a login surface.
 2. Constructs the same `ProtonDriveClient` the rest of the app uses (shared
    `proton-drive-core` construction path, not a bespoke one).
 3. Serves MCP over **stdio only** via `rmcp` — no HTTP/SSE transport, no
@@ -159,16 +163,20 @@ service (ADR-0007).
 
 ### 6.2 Tool catalogue
 
+All paths are logical `'/'`-separated paths from the My Files root (case-
+sensitive), not uids. The one uid that crosses the boundary is `drive_download`'s
+`uid`, which is the `{volume_id, node_id}` object a `drive_list` child carries.
+
 | Tool | Args | Returns | Side effects |
 |---|---|---|---|
-| `drive_list` | `path: string`, `include_digest: bool = false` | `[{uid, name, is_folder, size, sha1?, mtime?}]` | None (read-only). |
-| `drive_download` | `uid: string`, `local_path: string` | `{bytes, sha1, signature_verified}` | Writes `local_path`. |
-| `drive_upload` | `local_path: string`, `remote_parent_uid: string`, `name?: string` | `{uid, revision_uid, sha1}` | Creates a node or a new revision (see below). |
-| `drive_mkdir` | `parent_uid: string`, `name: string` | `{uid}` | Creates a folder node. |
-| `local_index` | `root: string` | `[{path, size, mtime, sha1}]` | None (read-only; may populate the process-lifetime hash cache, §6.3). |
-| `sync_plan` | `local_root: string`, `remote_folder: string` | `[{path, op: upload\|download\|skip\|conflict, local?, remote?}]` | None — pure function of two listings (G3). |
-| `sync_apply` | `ops: [{path, op}]` (must be a subset of a prior `sync_plan` result) | `[{path, op, result: ok\|error}]` | Executes exactly the named ops, nothing else. |
-| `events_poll` | `since: cursor` | `{events: [...], cursor}` | None — adapts `subscribe_drive_events`; no new polling loop (§6.1, G2). |
+| `drive_list` | `path: string`, `include_digest: bool = false` | `{path, uid, count, children: [{uid, name, kind, size, mtime, sha1?}]}` — `kind` is the string `"file"`/`"folder"`/`"album"`; `sha1` present only when `include_digest`. | None (read-only). |
+| `drive_download` | `uid: {volume_id, node_id}` (the object from `drive_list`), `local_path: string`, `overwrite: bool = false` | `{bytes, sha1, signature_verified}` | Writes `local_path`; refuses to clobber an existing file unless `overwrite`. |
+| `drive_upload` | `local_path: string`, `remote_parent_path: string`, `name?: string`, `allow_revision_on_conflict: bool = false` | `{uid, revision_uid, sha1, created_revision}` | Creates a new node; a name collision fails by default (see below). |
+| `drive_mkdir` | `parent_path: string`, `name: string` | `{uid}` | Creates a folder node. |
+| `local_index` | `root: string`, `cache_file?: string` | `{root, count, truncated, entries: [{path, sha1, size, mtime}]}` — the echoed `entries` list is capped at 1000; `count` is the full total. | None (read-only; may read/refresh the hash cache, §6.3). |
+| `sync_plan` | `local_root: string`, `remote_folder: string`, `cache_file?: string` | `{plan_id, summary, ops, conflicts, dirs_to_create, checkpoint}` | None to drive/local content — pure function of two listings (G3); stores the plan in-process and writes a best-effort snapshot checkpoint (§6.4). |
+| `sync_apply` | `plan_id: string`, `decisions: {path → keep_local\|keep_remote\|skip}` | `{plan_id, applied, results: [{path, op, result, error?, uid?, revision_uid?}]}` | Executes the stored plan's full op set; `decisions` only resolve its conflicts. |
+| `events_poll` | `since_event_id?: string`, `volume_id?: string` | `{volume_id, next_anchor, events}` (plus `refreshed` when draining) | None — on-demand drain of the Events API; no new polling loop (§6.1, G2). |
 
 **`drive_list`'s `include_digest` flag exists because digest is not free.**
 WP1's SHA1/mtime come from decrypting each file's `XAttr`, which lives only on
@@ -186,34 +194,41 @@ the transfer queue, `PRD-rust-port-and-tui.md` §7.5) rather than serial N+1
 or unbounded-parallel fetches, to respect the shared per-account rate limits
 `CLAUDE.md` requires every Proton Drive client to honour.
 
-**`drive_upload` detects new-file vs new-revision by name collision, not by a
-separate flag.** It first attempts the existing `CreateFile` path
-(`upload.rs`); if the API returns `AlreadyExists` (error code 2500,
-`nodes.rs::map_api_error`) for that name under that parent, it resolves the
-existing node and retries via WP2's create-draft-revision path instead of
-surfacing the collision as a hard failure. This mirrors what a human doing
-the same thing in the TUI would do — overwrite, not duplicate.
+**`drive_upload` never silently overwrites on a name collision.** It first
+attempts the existing `CreateFile` path (`upload.rs`); if the API returns
+`AlreadyExists` (error code 2500, `nodes.rs::map_api_error`) for that name
+under that parent, the default (`allow_revision_on_conflict: false`) is to
+**fail with a hard error** ("Refusing to overwrite it"), leaving the existing
+file untouched — so a create can never clobber an unrelated file the agent
+didn't mean to. Only when the caller re-invokes with
+`allow_revision_on_conflict: true` does it resolve the existing node and upload
+a **new revision** via WP2's create-draft-revision path; the result then
+carries `created_revision: true`. This is a deliberate reversal of an earlier
+"overwrite, not duplicate" default in favour of failing safe.
 
 ### 6.3 Sync engine internals (WP3)
 
 `local_index` walks a local directory tree and, for each file, looks up
-`(path, size, mtime)` in a hash cache before recomputing SHA1 — if size and
-mtime are unchanged since the last index of that path, the cached hash is
-reused (the same trick `git`/`rsync` use to avoid rehashing unchanged files).
+`(size, mtime)` for that relative path in a hash cache before recomputing SHA1
+— if size and mtime are unchanged since the last index of that path, the
+cached hash is reused (the same trick `git`/`rsync` use to avoid rehashing
+unchanged files).
 
-**This cache is in-memory, keyed by `(path, size, mtime)`, scoped to the
-`pdtui mcp` process's lifetime** — consistent with ADR-0003 (in-memory cache,
-SQLite deferred behind explicit triggers). A long-running agent session that
-keeps one `pdtui mcp` process alive across many tool calls amortises the
-hashing cost; a fresh process re-hashes from scratch on first `local_index`
-call. This is an explicit v1 trade-off, not an oversight: hashing local files
-is cheap relative to the network round trips the remote side needs, and
-introducing cross-process persistence here means also solving cache
-invalidation across process restarts, which ADR-0003 correctly scoped out
-until one of its three named triggers fires. If large local trees or
-short-lived MCP processes make this a real bottleneck, revisit ADR-0003's
-triggers explicitly — this PRD does not pull SQLite forward on its own
-authority.
+**The cache defaults to in-memory, keyed per relative path by
+`(size, mtime) → sha1`, scoped to the `pdtui mcp` process's lifetime** —
+consistent with ADR-0003 (in-memory cache, SQLite deferred behind explicit
+triggers). A long-running agent session that keeps one `pdtui mcp` process
+alive across many tool calls amortises the hashing cost; a fresh process
+re-hashes from scratch on first `local_index` call. As a lightweight, opt-in
+exception, both `local_index` and `sync_plan` accept an optional `cache_file`
+parameter: a JSON file the walk reads a `(size, mtime) → sha1` cache from and
+rewrites, so a fresh process can reuse a prior run's digests without standing
+up the SQLite store ADR-0003 still defers. It is a plain JSON side-file, not a
+database — it carries no cross-process invalidation machinery beyond the
+`(size, mtime)` validity check each entry already makes. If large local trees
+or short-lived MCP processes *without* a `cache_file` make hashing a real
+bottleneck, revisit ADR-0003's triggers explicitly — this PRD does not pull
+SQLite forward on its own authority.
 
 `sync_plan` is a pure function: `diff(local_index(local_root),
 drive_list(remote_folder, include_digest=true))` by matching relative path.
@@ -234,26 +249,37 @@ deferred here, see §11.)
 
 This is the load-bearing design constraint of the whole feature:
 
-- **`sync_plan` has no side effects.** It can be called any number of times,
-  discarded, or used only to inform a decision the agent makes some other
-  way. Nothing about calling it changes local or remote state.
-- **`sync_apply` executes only the operations named in its `ops` argument.**
-  It does not accept a plan ID and "apply everything" — the caller must
-  restate each `{path, op}` pair it wants executed. This is deliberate
-  friction: it is structurally impossible for an agent to accidentally apply
-  an op it never looked at, because the op has to be named to be executed.
+- **`sync_plan` has no side effects on drive or local file content.** It can
+  be called any number of times, discarded, or used only to inform a decision
+  the agent makes some other way. Nothing about calling it changes local or
+  remote content. (It does store the plan in-process under its `plan_id` and
+  write a best-effort remote-snapshot checkpoint side-file — neither touches
+  drive or local file state; see ADR-0013.)
+- **`sync_apply` approves a plan by reference, not by restating ops.** The
+  caller passes the `plan_id` of a plan `sync_plan` already returned; the
+  server looks up that stored plan and applies **its full op set**. Per-path
+  control is limited to the `decisions` map, which only resolves that plan's
+  conflicts (`keep_local` → `upload_revision`, `keep_remote` → `download`,
+  `skip` → drop). The caller cannot smuggle in an op the plan never produced,
+  because it names no ops at all — it names a plan. An `UploadRevision`
+  re-reads the remote active revision and fails safe if it moved since the
+  plan was computed; one op failing never aborts the rest.
 - **Every mutation is auditable.** `drive_upload`, `drive_download`,
   `drive_mkdir`, and each op inside `sync_apply` return enough detail (uid,
   revision uid, sha1) to log what actually happened, not just what was
   requested.
 - **Conflicts are never auto-resolved anywhere in the stack** — not in
-  `sync_plan` (returns `undecided`), not in `sync_apply` (a `conflict`-typed
-  op is invalid input; `sync_apply` should reject it rather than pick a
-  default direction).
-- **Idempotency where it costs nothing:** `skip` ops need not be nameable
-  (there is nothing to apply); `drive_mkdir` on an already-existing name
-  surfaces the same `AlreadyExists` the API already returns rather than
-  silently succeeding as a no-op — the agent decides whether that's fine.
+  `sync_plan` (a hash-differ or missing-remote-digest path is returned
+  `conflict`, undecided), not in `sync_apply` (an unresolved conflict — one
+  with no matching entry in `decisions`, or a `decisions` key naming a
+  non-conflict path — makes the **whole apply** fail with `invalid_params`
+  rather than guessing a direction).
+- **Idempotency where it costs nothing:** `skip` ops run as no-ops;
+  `drive_mkdir` on an already-existing name surfaces the same `AlreadyExists`
+  the API already returns rather than silently succeeding — the agent decides
+  whether that's fine. Re-applying a stored plan after a partial apply is
+  safe: an `Upload` whose target already carries identical content reports
+  idempotent success rather than a duplicate or an overwrite.
 
 ## 7. Constraints
 
@@ -294,18 +320,24 @@ This is the load-bearing design constraint of the whole feature:
   bounded-concurrency, not serial-per-file and not unbounded-parallel.
 - **Extended headless round-trip** (extends the existing `pdtui mvp` shape,
   `docs/PRD-MVP-completion.md`): upload a file → modify it locally → call
-  `sync_plan` and confirm it reports exactly one `upload` op for that path,
-  everything else `skip` → call `sync_apply` naming only that op → re-run
-  `local_index` and `drive_list(include_digest=true)` on both sides and
-  confirm the SHA1s converge.
-- `sync_apply` given an op not present in the most recent `sync_plan` output
-  for that path either rejects it or executes it faithfully and reports
-  exactly what happened — never silently no-ops.
-- A hash-differ case round-trips as `conflict`/`undecided` through
-  `sync_plan` and is rejected (not silently resolved) if named directly to
-  `sync_apply` without the agent picking a direction.
-- `drive_upload` against an already-existing remote name creates a new
-  revision (WP2 path), not a duplicate node or a hard failure.
+  `sync_plan` and confirm it reports exactly one `conflict` op
+  (`content_diverged`) for that path — the file now exists, and differs, on
+  both sides — everything else `skip` → call `sync_apply(plan_id,
+  decisions={path: keep_local})` and confirm that path resolves to an
+  `upload_revision` → re-run `local_index` and `drive_list(include_digest=true)`
+  on both sides and confirm the SHA1s converge. (For a plain `upload` instead,
+  use a brand-new local file with no remote counterpart.)
+- `sync_apply` only ever executes the ops of the stored plan named by
+  `plan_id`; a `decisions` key that does not name one of that plan's conflicts
+  is rejected with `invalid_params`, never silently ignored.
+- A hash-differ case round-trips as `conflict` (`content_diverged`) through
+  `sync_plan` and, if `sync_apply(plan_id)` is called without a `decisions`
+  entry for it, the whole apply is rejected (`invalid_params`) rather than
+  silently resolved.
+- `drive_upload` against an already-existing remote name fails by default
+  (never a silent overwrite); re-called with `allow_revision_on_conflict:
+  true` it creates a new revision (WP2 path) — `created_revision: true` in the
+  result — not a duplicate node.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` all green, per the repo-standard quality gate.
 - No `unwrap`/`expect`/`panic!` introduced outside `#[cfg(test)]` — same
@@ -336,7 +368,9 @@ This is the load-bearing design constraint of the whole feature:
   decision point rather than resolving it — whoever picks up WP2 should
   decide and record that decision (a short ADR update, not a new PRD) before
   `drive_upload`/`sync_apply` ship claiming nested-folder support.
-- **`local_index`/hash-cache persistence.** §6.3 keeps it in-memory,
-  process-lifetime-scoped, consistent with ADR-0003. If real usage shows this
-  is too slow for large local trees, that's an ADR-0003-trigger conversation,
-  not something to quietly work around inside WP3.
+- **`local_index`/hash-cache persistence.** §6.3 defaults to in-memory,
+  process-lifetime scope (consistent with ADR-0003), with an optional
+  `cache_file` JSON side-file as a lightweight opt-in for cross-process digest
+  reuse. Promoting that to the full SQLite store — with proper cross-process
+  invalidation — remains an ADR-0003-trigger conversation, not something to
+  quietly work around inside WP3.
