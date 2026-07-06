@@ -132,6 +132,26 @@ impl Panes {
         Some(self.local.cwd.join(&entry.name))
     }
 
+    /// Return absolute paths of all space-bar-marked local files.
+    ///
+    /// Skips directories and the ".." entry. Returns an empty `Vec` if nothing
+    /// is marked.
+    pub fn marked_local_paths(&self) -> Vec<PathBuf> {
+        self.local
+            .entries
+            .iter()
+            .filter(|e| e.selected && !e.is_dir)
+            .map(|e| self.local.cwd.join(&e.name))
+            .collect()
+    }
+
+    /// Clear the `selected` flag on every local-pane entry.
+    pub fn clear_local_marks(&mut self) {
+        for e in &mut self.local.entries {
+            e.selected = false;
+        }
+    }
+
     /// Return `(NodeUid, name)` of the currently selected remote file.
     ///
     /// Returns `None` if the cursor is on a directory, the entry has no node

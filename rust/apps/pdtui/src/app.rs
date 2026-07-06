@@ -548,31 +548,49 @@ impl App {
     // Transfer actions
     // -----------------------------------------------------------------------
 
-    /// F3 — upload the locally selected file into the remote folder.
+    /// F3 — upload locally selected/marked files into the remote folder.
+    ///
+    /// Prefers space-bar-marked files; falls back to the cursor file when
+    /// nothing is marked. Spawns one transfer per file.
     fn start_upload(&mut self) {
         let Some(client) = self.client.clone() else {
             self.status = Some("not authenticated — press F4 to log in".into());
             return;
         };
 
-        let Some(local_path) = self.panes.selected_local_path() else {
+        let mut paths = self.panes.marked_local_paths();
+        if paths.is_empty() {
+            if let Some(p) = self.panes.selected_local_path() {
+                paths.push(p);
+            }
+        }
+        if paths.is_empty() {
             self.status = Some("select a file in the LOCAL pane first".into());
             return;
-        };
+        }
 
         let Some(parent_uid) = self.panes.remote_folder_uid().cloned() else {
             self.status = Some("remote folder not loaded — authenticate and navigate first".into());
             return;
         };
 
-        let label = local_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| local_path.display().to_string());
+        let count = paths.len();
+        for local_path in paths {
+            let transfer = spawn_upload(client.clone(), local_path, parent_uid.clone());
+            self.transfers.push(transfer);
+        }
+        self.panes.clear_local_marks();
 
-        self.status = Some(format!("uploading {label}..."));
-        let transfer = spawn_upload(client, local_path, parent_uid);
-        self.transfers.push(transfer);
+        if count == 1 {
+            let label = self
+                .transfers
+                .last()
+                .map(|t| t.label.clone())
+                .unwrap_or_default();
+            self.status = Some(format!("uploading {label}..."));
+        } else {
+            self.status = Some(format!("uploading {count} files..."));
+        }
     }
 
     /// F2 — download the remotely selected file into the local folder.
