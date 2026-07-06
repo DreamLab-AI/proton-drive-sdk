@@ -34,6 +34,44 @@ impl NodeUidDto {
     pub fn to_node_uid(&self) -> NodeUid {
         make_node_uid(&self.volume_id, &self.node_id)
     }
+
+    /// Reject a uid whose components are not well-formed opaque ids before they
+    /// are interpolated into an API URL path (see [`validate_opaque_id`]).
+    pub fn validate(&self) -> Result<(), String> {
+        validate_opaque_id("volume_id", &self.volume_id)?;
+        validate_opaque_id("node_id", &self.node_id)
+    }
+}
+
+/// Validate an agent-supplied opaque id (volume/link/event id) before it is
+/// interpolated into an API URL path.
+///
+/// Proton ids are opaque base64url-ish tokens; they never contain a path
+/// separator, URL-significant character, or whitespace. A prompt-injected agent
+/// could otherwise smuggle `../` dot-segments or a `?`/`#` into a `format!`ed
+/// path and steer the request at an endpoint outside the tool catalogue (reqwest
+/// normalises dot-segments and honours embedded query/fragment). Rejecting the
+/// unsafe charset keeps every id confined to the path segment it belongs in.
+pub fn validate_opaque_id(kind: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{kind} must not be empty"));
+    }
+    // Block the characters that let a value break out of its path segment or
+    // start a query/fragment; block the `..` sub-string to stop dot-segment
+    // traversal. A lone `.` is harmless and left alone so ids are not
+    // over-rejected. Proton ids never contain any of these.
+    if let Some(bad) = value
+        .chars()
+        .find(|c| c.is_whitespace() || c.is_control() || "/\\?#".contains(*c))
+    {
+        return Err(format!(
+            "{kind} contains an illegal character {bad:?} (expected an opaque Proton id)"
+        ));
+    }
+    if value.contains("..") {
+        return Err(format!("{kind} must not contain '..' (path traversal)"));
+    }
+    Ok(())
 }
 
 impl From<&NodeUid> for NodeUidDto {
@@ -292,6 +330,10 @@ pub fn is_safe_name_segment(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+        // ':' is a drive/stream separator on Windows (`C:evil`), harmless on
+        // Linux — rejected as a cheap cross-platform belt so the identity means
+        // the same thing everywhere.
+        && !name.contains(':')
 }
 
 #[cfg(test)]
@@ -339,6 +381,20 @@ mod tests {
         assert!(!is_safe_name_segment("a/b"));
         assert!(!is_safe_name_segment("a\\b"));
         assert!(!is_safe_name_segment("a\0b"));
+    }
+
+    #[test]
+    fn validate_opaque_id_rejects_url_breaking_values() {
+        assert!(validate_opaque_id("volume_id", "aBc123-_Xyz").is_ok());
+        assert!(validate_opaque_id("volume_id", "").is_err());
+        assert!(validate_opaque_id("volume_id", "a/b").is_err());
+        assert!(validate_opaque_id("volume_id", "..").is_err());
+        assert!(validate_opaque_id("volume_id", "x/../../../drive/other").is_err());
+        assert!(validate_opaque_id("event_id", "evt?foo=bar").is_err());
+        assert!(validate_opaque_id("event_id", "evt#frag").is_err());
+        assert!(validate_opaque_id("event_id", "has space").is_err());
+        // A lone '.' is harmless and must not be over-rejected.
+        assert!(validate_opaque_id("volume_id", "a.b").is_ok());
     }
 
     #[test]

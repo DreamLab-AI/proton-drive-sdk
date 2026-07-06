@@ -236,12 +236,19 @@ pub(crate) async fn resolve_node_key_via_chain_cached(
 ) -> Result<PrivateKey> {
     // Climb target → root, but stop at the first link whose key a sibling has
     // already cached; seed the fold from that key rather than re-deriving it.
+    //
+    // Cache keys are `(share_id, link_id)`, not `link_id` alone: Proton link ids
+    // are unique only within a volume/share, so a batch spanning shares could
+    // otherwise collide two distinct nodes onto one cached key and return the
+    // wrong private key. The share is fixed for one chain walk (every fetch is
+    // under `/drive/shares/{share_id}/`), so the key stays well-formed.
+    let ck = |id: &str| format!("{share_id}\u{0}{id}");
     let mut chain: Vec<(String, Link)> = Vec::new();
     let mut current_id = link_id.to_owned();
     let mut seed: Option<PrivateKey> = None;
 
     loop {
-        if let Some(cached) = cache.lock().await.get(&current_id).cloned() {
+        if let Some(cached) = cache.lock().await.get(&ck(&current_id)).cloned() {
             seed = Some(cached);
             break;
         }
@@ -295,7 +302,7 @@ pub(crate) async fn resolve_node_key_via_chain_cached(
             );
         }
 
-        cache.lock().await.insert(id.clone(), next.clone());
+        cache.lock().await.insert(ck(id), next.clone());
         current = Some(next);
     }
 

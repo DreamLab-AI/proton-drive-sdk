@@ -43,6 +43,11 @@ const LIST_PAGE_SIZE: u32 = 150;
 /// full index still feeds `sync_plan`; only the echo is truncated.
 const LOCAL_INDEX_ECHO_CAP: usize = 1000;
 
+/// Hard cap on remote nodes visited during a single `sync_plan` subtree walk.
+/// A backstop against a cyclic/oversized remote folder graph — the walk fails
+/// loudly past this rather than flooding requests or exhausting memory.
+const MAX_REMOTE_NODES: usize = 100_000;
+
 // ===========================================================================
 // drive_list
 // ===========================================================================
@@ -127,6 +132,7 @@ pub async fn drive_download(
     server: &DriveMcpServer,
     p: crate::mcp::server::DriveDownloadParams,
 ) -> Result<Value, McpErrorAlias> {
+    p.uid.validate().map_err(mcp_bad_params)?;
     let uid = p.uid.to_node_uid();
     let dest = PathBuf::from(&p.local_path);
     if dest.exists() && !p.overwrite {
@@ -381,6 +387,15 @@ pub async fn events_poll(
     server: &DriveMcpServer,
     p: crate::mcp::server::EventsPollParams,
 ) -> Result<Value, McpErrorAlias> {
+    // Validate agent-supplied ids before they reach a `format!`ed API URL path.
+    // The default volume id comes from the trusted session, so only a
+    // caller-provided override needs checking.
+    if let Some(v) = &p.volume_id {
+        bridge::validate_opaque_id("volume_id", v).map_err(mcp_bad_params)?;
+    }
+    if let Some(since) = &p.since_event_id {
+        bridge::validate_opaque_id("since_event_id", since).map_err(mcp_bad_params)?;
+    }
     let volume_id = p
         .volume_id
         .clone()
@@ -548,6 +563,14 @@ async fn collect_remote_files(
 ) -> Result<Vec<RemoteFile>, McpErrorAlias> {
     let mut out = Vec::new();
     let mut stack: Vec<(NodeUid, String)> = vec![(root.clone(), String::new())];
+    // Cycle + size guards: the remote folder graph is untrusted input. A folder
+    // that is (transitively) its own ancestor — a malformed server response or a
+    // future multi-parent feature — would otherwise loop forever, flooding
+    // requests and growing `out`/`stack` without bound. `visited` breaks cycles;
+    // MAX_REMOTE_NODES caps the walk and fails loudly rather than exhausting.
+    let mut visited: std::collections::HashSet<NodeUid> = std::collections::HashSet::new();
+    visited.insert(root.clone());
+    let mut seen_count: usize = 0;
     while let Some((folder, prefix)) = stack.pop() {
         let children = server
             .client()
@@ -559,6 +582,13 @@ async fn collect_remote_files(
                 if n.trashed {
                     continue;
                 }
+                seen_count += 1;
+                if seen_count > MAX_REMOTE_NODES {
+                    return Err(mcp_err(format!(
+                        "remote subtree exceeds {MAX_REMOTE_NODES} nodes — refusing to walk further \
+                         (cyclic folder graph or a tree too large to sync in one plan)"
+                    )));
+                }
                 // A node whose name failed to decrypt carries a synthetic
                 // placeholder, and a name containing a path separator or a
                 // `.`/`..` segment is not a valid sync identity — folding either
@@ -566,8 +596,16 @@ async fn collect_remote_files(
                 // decrypt failure would masquerade as a distinct remote file).
                 // Skip and report to stderr; the transport stays on stdout.
                 if !n.has_decrypted_name() || !bridge::is_safe_name_segment(&n.name) {
+                    // Skipping a FOLDER drops its entire subtree from the
+                    // snapshot, so any local counterparts diff as local-only and
+                    // would re-upload as duplicates. Say so, not just "one node".
+                    let scope = if matches!(n.node_type, NodeType::Folder) {
+                        " (and its entire subtree)"
+                    } else {
+                        ""
+                    };
                     eprintln!(
-                        "sync_plan: skipping remote node {} — name is not a usable sync identity ('{}')",
+                        "sync_plan: skipping remote node {}{scope} — name is not a usable sync identity ('{}')",
                         n.uid.node_id, n.name
                     );
                     continue;
@@ -578,7 +616,18 @@ async fn collect_remote_files(
                     format!("{prefix}/{}", n.name)
                 };
                 match n.node_type {
-                    NodeType::Folder => stack.push((n.uid.clone(), rel)),
+                    // Descend a folder only the first time it is seen; a repeat
+                    // uid is a cycle and is skipped (reported to stderr).
+                    NodeType::Folder => {
+                        if visited.insert(n.uid.clone()) {
+                            stack.push((n.uid.clone(), rel));
+                        } else {
+                            eprintln!(
+                                "sync_plan: skipping already-visited remote folder {} — cyclic graph",
+                                n.uid.node_id
+                            );
+                        }
+                    }
                     NodeType::File => {
                         if let Some(rev) = n.active_revision.as_ref().map(|r| r.uid.clone()) {
                             out.push(RemoteFile {
@@ -1069,11 +1118,12 @@ async fn run_upload(
 ///
 /// A stored plan may be re-applied after a partial apply (the plan store does
 /// not consume plans — domain invariant 4). So a name collision here is not
-/// automatically a failure: if the remote file already carries the *same*
-/// content hash as the local file, the upload already happened on a prior run
-/// and the op reports success; only a collision with *different* remote content
-/// is an error (the plan is stale — re-plan). It never auto-overwrites, matching
-/// the plan/apply safety contract.
+/// automatically a failure: if the remote file's digest can be fetched and
+/// already equals the local file's, the upload happened on a prior run and the
+/// op reports success. Any other outcome — different remote content, or a
+/// digest that could not be fetched right now — is reported as an error rather
+/// than an overwrite; it is fail-safe and self-heals on a fresh sync_plan. It
+/// never auto-overwrites, matching the plan/apply safety contract.
 async fn exec_upload_new(
     server: &DriveMcpServer,
     parent: &NodeUid,
