@@ -14,16 +14,16 @@ Easiest sources, ordered by friction:
 
 1. **Browser**: log into `drive.proton.me`, open devtools → Network → any `/api/drive/v2/...` request → Headers → grab `Authorization: Bearer <...>` and `x-pm-uid: <...>`.
 2. **mitmproxy / Charles**: if you already proxy your browser traffic, the tokens are in the request headers tab.
-3. **JS SDK CLI**: not currently in this checkout — see the commit log for `1491833 Add public CLI`, which lives in a separate Proton repo. If you have access, the CLI persists tokens to `auth-session.json` which you can `jq` for the values.
+3. **JS SDK CLI**: not currently in this checkout; see the commit log for `1491833 Add public CLI`, which lives in a separate Proton repo. If you have access, the CLI persists tokens to `auth-session.json` which you can `jq` for the values.
 
 ## Why two backends?
 
-- **Rust backend** (`pdtui probe`) — exercises `proton-drive-api` DTOs + `ReqwestHttpClient` retry middleware (M1 + M3). This is what we're building.
-- **Node backend** (`js-probe.mjs`) — raw `fetch` against the same endpoints with the same session. **No SDK dependency.** Acts as ground truth for the HTTP layer.
+- **Rust backend** (`pdtui probe`): exercises `proton-drive-api` DTOs + `ReqwestHttpClient` retry middleware (M1 + M3). This is what we're building.
+- **Node backend** (`js-probe.mjs`): raw `fetch` against the same endpoints with the same session. **No SDK dependency.** Acts as ground truth for the HTTP layer.
 
 A divergence in `status` or `body_preview` between the two means the Rust side is sending a malformed request, missing a header, or mishandling a response. Same status + same body shape = M1 + M3 are correct.
 
-For crypto-aware comparisons (decrypted folder listings, upload, download), we'd need **Tier B** — a Node shim that wraps the actual `@protontech/drive-sdk`. That's deferred until M2 crypto bodies land — see `HANDOFF.md` § "How to make progress."
+For crypto-aware comparisons (decrypted folder listings, upload, download), we'd need **Tier B**, a Node shim that wraps the actual `@protontech/drive-sdk`. That's deferred until M2 crypto bodies land; see `HANDOFF.md` § "How to make progress."
 
 ## Safety notes
 

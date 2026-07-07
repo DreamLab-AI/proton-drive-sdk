@@ -1,9 +1,9 @@
-# ADR-0009: Block-download protocol — port JS happy path
+# ADR-0009: Block-download protocol (port JS happy path)
 
 **Status:** accepted, 2026-05-28. **Verification order corrected, 2026-07-05**
-(see `docs/audit-2026-07-05.md`) — the original text below described a
-verify-before-fetch protocol that was never what shipped or what JS actually
-does; §"The protocol" and the quality gates are rewritten to match the real,
+(see `docs/audit-2026-07-05.md`): the original text below described a
+verify-before-fetch protocol that was never what shipped or what JS does;
+§"Protocol" and the quality gates are rewritten to match the real,
 JS-faithful "deliver-then-flag" design.
 **Context milestone:** ME.
 **Depends on:** ADR-0008 (block-upload symmetry), ADR-0011 (zeroize), ADR-0012 (wire-format validation).
@@ -12,7 +12,7 @@ JS-faithful "deliver-then-flag" design.
 
 Port `client/js/src/internal/download/` happy path 1:1 into `proton-drive-core::download`. Sequential block fetch, per-block ciphertext-hash check, write to async stream, then manifest-signature verification. Seekable/parallel download deferred.
 
-## The protocol (as derived from the JS SDK and matching `download_to_writer`, `crates/proton-drive-core/src/download.rs`)
+## Protocol (as derived from the JS SDK and matching `download_to_writer`, `crates/proton-drive-core/src/download.rs`)
 
 ```
 1. Client: GET /drive/v2/volumes/{volumeID}/files/{linkID}/revisions/{revisionID}
@@ -68,11 +68,11 @@ Port `client/js/src/internal/download/` happy path 1:1 into `proton-drive-core::
 ## Implementation constraints
 
 - **Concurrency: 1 block at a time** (matches MD).
-- **No retry mid-block:** transient HTTP errors during a block GET fail the whole download. MVP user can re-invoke. Retries belong to a later "robust transfer" milestone.
+- **No retry mid-block:** transient HTTP errors during a block GET fail the whole download. MVP user can re-invoke. Retries belong to a later transfer-resilience milestone.
 - **No range requests:** full block, full file. No seek.
 - **XAttr size/SHA1 mismatch is deliberately non-fatal.** Corrected 2026-07-05:
   this ADR previously claimed "the JS SDK does verify the assembled size
-  matches XAttr.Common.Size; we should too" — that is false. Neither
+  matches XAttr.Common.Size; we should too": that claim is false. Neither
   `reference/client/js`'s `fileDownloader.ts` (which uses the claimed size only
   for progress reporting) nor the Rust port asserts on a size/SHA1 mismatch;
   `verify_xattr` (`download.rs`) logs a warning and still returns the decrypted
@@ -80,18 +80,18 @@ Port `client/js/src/internal/download/` happy path 1:1 into `proton-drive-core::
   size/SHA1/ModificationTime XAttr disagreement never is.
 - **Update 2026-07-05 (wp/c2-resilience, cs/v0.15.0 alignment):** the
   "claimed size only for progress reporting" use noted just above is now
-  itself ported — `FileDownloader::claimed_size()` decrypts the XAttr
+  itself ported: `FileDownloader::claimed_size()` decrypts the XAttr
   independently (a single extra revision-page fetch) and returns
   `Common.Size`, which `pdtui`'s transfer layer uses as the download's
   progress-gauge total, mirroring the C# SDK's `RevisionOperations.
   GetClaimedSizeAsync`/`DownloadState.ClaimedSize`. This is *not* the
-  size/SHA1 cross-check described above (still non-fatal, unchanged) — it's
+  size/SHA1 cross-check described above (still non-fatal, unchanged); it's
   a separate, best-effort read of the same field for UI purposes only.
 
 ## What is NOT ported
 
-- `seekableStream.ts` — random-access download
-- `blockIndex.ts` — block-skip optimisation
+- `seekableStream.ts`: random-access download
+- `blockIndex.ts`: block-skip optimisation
 - Thumbnail download (`thumbnailDownloader.ts`)
 - `queue.ts` parallel orchestration
 - Telemetry
@@ -128,7 +128,7 @@ pub struct DownloadStats {
 - **Negative-path tests required (see `download.rs` test names in parens):**
   - Tampered block (flip one byte in `tests/fixtures/tampered_block.bin`) → `Error::IntegrityCheckFailed`
   - Missing ManifestSignature → abort before any block is fetched, `Error::Verification` (`missing_manifest_signature_aborts`)
-  - Present-but-wrong-signer ManifestSignature → download still completes, `DownloadStats::signature_verified == false` (`manifest_wrong_signer_delivers_data_unverified`) — **not** an abort; see the corrected protocol above
+  - Present-but-wrong-signer ManifestSignature → download still completes, `DownloadStats::signature_verified == false` (`manifest_wrong_signer_delivers_data_unverified`), not an abort; see the corrected protocol above
   - Server returns 404 on revision lookup → `Error::NotFound`
 
 ## References

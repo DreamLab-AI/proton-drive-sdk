@@ -24,9 +24,9 @@ The Rust port uses **TypeScript SDK v0.15.2** as the reference. Where the C# SDK
 ## Consequences
 - File-to-file mapping is `client/js/src/internal/{nodes,events,upload,download}/*` → `rust/crates/proton-drive-core/src/{nodes,events,upload,download}.rs`. Reviewers map by sibling.
 - Async model translates 1:1: JS `AsyncGenerator` → Rust `Stream`, `AbortSignal` → `CancellationToken`, `ReadableStream` → `AsyncRead`.
-- We inherit the JS public-interface taxonomy and error names — easier to cross-reference, harder to invent our own.
+- We inherit the JS public-interface taxonomy and error names: easier to cross-reference, harder to invent our own.
 - C# crypto choices (BouncyCastle vs PGPCore vs whatever) do **not** constrain us.
 
 ## Alternatives considered
-- **C# as source** — rejected: fewer commits, smaller surface, less recent feature work, AOT/native-library complexity bleeds into the port design.
-- **Derive from protobuf schemas alone** — rejected: protobuf covers wire format but not the encryption lifecycle, key caching, or event subscription patterns that make the SDK behave correctly.
+- **C# as source**, rejected: fewer commits, smaller surface, less recent feature work, AOT/native-library complexity bleeds into the port design.
+- **Derive from protobuf schemas alone**, rejected: protobuf covers wire format but not the encryption lifecycle, key caching, or event subscription patterns that make the SDK behave correctly.

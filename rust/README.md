@@ -1,4 +1,4 @@
-# Rust port — `proton-drive` + `pdtui`
+# Rust port: `proton-drive` + `pdtui`
 
 Personal-use Rust port of the Proton Drive SDK plus a two-pane tmux-ready TUI.
 Scope and decisions live in [`../docs/PRD-rust-port-and-tui.md`](../docs/PRD-rust-port-and-tui.md),
@@ -17,7 +17,7 @@ Scope and decisions live in [`../docs/PRD-rust-port-and-tui.md`](../docs/PRD-rus
 > access are largely untested. Do not rely on it for data you cannot afford to
 > lose or expose. No warranty of correctness, durability, or confidentiality.
 
-![pdtui (right) listing the same MVP round-trip files that the official Proton Drive web UI (left) shows — proof of a live upload/download against the real API.](docs/pdtui-mvp-roundtrip.png)
+![pdtui (right) listing the same MVP round-trip files that the official Proton Drive web UI (left) shows: proof of a live upload/download against the real API.](docs/pdtui-mvp-roundtrip.png)
 
 `pdtui` (right) beside the official Proton Drive web UI (left): the same
 `pdtui-mvp-*.txt` files appear in both panes, uploaded and downloaded
@@ -33,9 +33,10 @@ rust/
 │  ├─ proton-drive-api         # HTTP DTOs (M1: codegen from reference/client/cs protos)
 │  ├─ proton-drive-crypto      # OpenPgpCrypto trait + rpgp impl (M2)
 │  ├─ proton-drive-cache       # ProtonDriveCache trait + MemoryCache
-│  └─ proton-drive-telemetry   # Telemetry trait + NullTelemetry
+│  ├─ proton-drive-telemetry   # Telemetry trait + NullTelemetry
+│  └─ proton-drive-sync        # local index + diff engine behind `pdtui mcp` (ADR-0013)
 └─ apps/
-   └─ pdtui                    # two-pane TUI binary
+   └─ pdtui                    # two-pane TUI binary; also `login`/`mvp`/`probe`/`mcp`/`logout`/`where` subcommands
 ```
 
 ## Build
@@ -46,14 +47,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p pdtui
 ```
 
-## Current state (v0.1.0 — unaudited MVP)
+## Current state (v0.1.0, unaudited MVP)
 
 - ✅ Workspace scaffolded, all crates compile
 - ✅ Trait surface mirrors JS `interface/` 1:1
 - ✅ Error taxonomy, config, value objects in place
 - ✅ pdtui skeleton with keymap dispatch and ratatui rendering
 - ◐ M1: protobuf codegen in `proton-drive-api` (build-time, from `reference/client/cs/src/protos`).
-  OpenAPI codegen deferred — REST DTOs stay hand-written until the specs are
+  OpenAPI codegen deferred; REST DTOs stay hand-written until the specs are
   vendored into this repo.
 - ✅ M2: `rpgp` bodies in `proton-drive-crypto` (SEIPDv1 path), SRP verifier,
   SKESK password session keys
@@ -63,8 +64,10 @@ cargo build -p pdtui
   `pdtui`'s remote pane (`apps/pdtui/src/events_bridge.rs`) with graceful
   fallback to pull-on-focus refresh
 - ✅ M7: pdtui v0.1.0
+- ✅ M8: MCP server surface (`pdtui mcp`) over stdio for agent-driven browse
+  and sync, backed by the new `proton-drive-sync` crate (ADR-0013)
 
-Known gaps: uploading into a **nested** (non-root-parent) folder — the
+Known gaps: uploading into a **nested** (non-root-parent) folder, where the
 parent-hash-key resolution in `upload.rs::resolve_parent_context` only
 handles a share-root parent by design; nested-file **download** and listing
 are unaffected and live-verified at depth ≥ 3 against a 646 MB file. Core

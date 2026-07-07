@@ -3,11 +3,15 @@
 //! Personal use only (ADR-0007). Run from source: `cargo run -p pdtui`.
 //!
 //! Subcommands:
-//!   pdtui            — launch the TUI
-//!   pdtui probe      — run live-API diagnostic probes against the configured
-//!                      session, print one JSON object per probe to stdout
-//!   pdtui logout     — clear the keyring entry and truncate session.json
-//!   pdtui where      — print where the session config file should live
+//!   pdtui            launch the TUI
+//!   pdtui login      authenticate via SRP and persist the session to the keyring
+//!   pdtui mvp        headless live round-trip: list, upload, byte-identical download
+//!   pdtui mcp        serve the Model Context Protocol over stdio (agentic control
+//!                    and hash-based local/remote sync, ADR-0013)
+//!   pdtui probe      run live-API diagnostic probes against the configured
+//!                    session, print one JSON object per probe to stdout
+//!   pdtui logout     clear the keyring entry and truncate session.json
+//!   pdtui where      print where the session config file should live
 
 #![forbid(unsafe_code)]
 

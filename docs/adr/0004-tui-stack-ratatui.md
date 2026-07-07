@@ -18,13 +18,13 @@ Two-pane Midnight-Commander-style browser. Must run inside tmux, on a normal Lin
 - **notify** for local-pane file-watching.
 
 ## Consequences
-- Same runtime drives the SDK and the UI — no bridging.
+- Same runtime drives the SDK and the UI: no bridging.
 - Crossterm's TTY handling is well-tested under tmux; alt screen + mouse opt-in keeps tmux's own mouse mode functional.
 - Single dependency footprint: ratatui+crossterm pulls in no native C libs.
 - Windows is best-effort (crossterm supports it but we don't validate).
 
 ## Alternatives considered
-- **tui-rs (the predecessor)** — rejected: deprecated; ratatui is the maintained fork.
-- **Cursive** — rejected: heavier widget abstraction, more opinionated about event loops, less ergonomic with tokio.
-- **termion** — rejected: Unix-only and lower-level than we need.
-- **Iced TUI / Bubbletea-equivalent** — none mature enough in Rust.
+- **tui-rs (the predecessor)**, rejected: deprecated; ratatui is the maintained fork.
+- **Cursive**, rejected: heavier widget abstraction, more opinionated about event loops, less ergonomic with tokio.
+- **termion**, rejected: Unix-only and lower-level than we need.
+- **Iced TUI / Bubbletea-equivalent**: none mature enough in Rust.

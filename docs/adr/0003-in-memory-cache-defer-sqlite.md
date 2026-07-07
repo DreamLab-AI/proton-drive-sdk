@@ -12,7 +12,7 @@ The JS SDK ships `MemoryCache` and lets hosts inject persistent variants. The C#
 For our use case:
 - Single user, single session TUI
 - Two caches required by the SDK: `entitiesCache` (metadata) and `cryptoCache` (key material)
-- Browse + upload + download — none of which benefits structurally from cross-session persistence
+- Browse + upload + download: none of which benefits structurally from cross-session persistence
 - Event-based refresh keeps visited folders fresh without re-fetching
 
 ## Decision
@@ -23,14 +23,14 @@ Pull SQLite forward only if **one** of these triggers fires:
 2. A background watcher / sync daemon enters scope.
 3. Offline browsing of visited folders becomes a requirement.
 
-When pulled forward, port the C# schema directly — do not design fresh.
+When pulled forward, port the C# schema directly. Do not design fresh.
 
 ## Consequences
 - No `rusqlite` dependency. No schema migration tooling. No "stale cache vs server truth" failure mode.
 - Cold-start latency for every session: browse hits the API for the first folder listing. Acceptable for personal interactive use.
-- Crypto material is rebuilt per session — keys decrypted from address-key passphrases each launch.
+- Crypto material is rebuilt per session: keys decrypted from address-key passphrases each launch.
 
 ## Alternatives considered
-- **SQLite from day one** — rejected: complexity ahead of need, three triggers for revisiting documented.
-- **sled / redb** — rejected: SQLite is the C# choice and porting their schema later is the planned path.
-- **File-based per-key cache** — rejected: indexing and eviction would be reinvented.
+- **SQLite from day one**, rejected: complexity ahead of need, three triggers for revisiting documented.
+- **sled / redb**, rejected: SQLite is the C# choice and porting their schema later is the planned path.
+- **File-based per-key cache**, rejected: indexing and eviction would be reinvented.

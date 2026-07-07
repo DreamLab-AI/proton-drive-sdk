@@ -32,10 +32,10 @@ Default implementations live in **separate crates** and are not required by the 
 ## Consequences
 - The core crate has zero non-essential deps. Anyone can plug in their own HTTP/cache/crypto without forking.
 - Auth stays out of `proton-drive`. `pdtui` is responsible for producing a configured `ProtonDriveAccount`.
-- Mocking for tests is trivial — implement the trait.
+- Mocking for tests is trivial: implement the trait.
 - Two caches must be wired explicitly; we cannot collapse them into one because the JS SDK distinguishes their lifecycle semantics (crypto cache can be wiped without invalidating metadata).
 
 ## Alternatives considered
-- **Single `Client` struct with concrete deps** — rejected: ties the SDK to specific HTTP/crypto choices, contradicts the JS contract.
-- **Cargo features for swappable impls** — rejected: feature-flag combinatorics ugly; trait injection scales better.
-- **Builder pattern with optional fields and panic on missing** — rejected: prefer typed compile-time enforcement via the options struct.
+- **Single `Client` struct with concrete deps**, rejected: ties the SDK to specific HTTP/crypto choices, contradicts the JS contract.
+- **Cargo features for swappable impls**, rejected: feature-flag combinatorics ugly; trait injection scales better.
+- **Builder pattern with optional fields and panic on missing**, rejected: prefer typed compile-time enforcement via the options struct.

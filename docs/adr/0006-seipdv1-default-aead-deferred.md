@@ -31,11 +31,11 @@ SEIPDv2 / AEAD-GCM lands in **M2.5** as a separate sub-milestone, gated by:
 2. `rpgp` AEAD-GCM path tested against those fixtures.
 
 ## Consequences
-- M2 ships faster — SEIPDv1 is well-trodden in `rpgp`.
+- M2 ships faster: SEIPDv1 is well-trodden in `rpgp`.
 - We can interoperate with **today's** Proton Drive (server happily accepts SEIPDv1 from properly identified clients).
-- Reading messages encrypted by AEAD-enabled peers will fail in v1 — acceptable for single-user personal use until M2.5.
+- Reading messages encrypted by AEAD-enabled peers will fail in v1; acceptable for single-user personal use until M2.5.
 - When the 2026/2027 migration arrives, M2.5 becomes mandatory; the trait seam lets us swap without ripping out call sites.
 
 ## Alternatives considered
-- **AEAD from day one** — rejected: doubles the M2 surface area and `rpgp` AEAD coverage needs fixture validation we don't have yet.
-- **Skip SEIPDv1 entirely** — rejected: server still serves SEIPDv1 for legacy keys; we'd fail to read existing account content.
+- **AEAD from day one**, rejected: doubles the M2 surface area and `rpgp` AEAD coverage needs fixture validation we don't have yet.
+- **Skip SEIPDv1 entirely**, rejected: server still serves SEIPDv1 for legacy keys; we'd fail to read existing account content.

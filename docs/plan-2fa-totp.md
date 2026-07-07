@@ -1,8 +1,8 @@
-# Plan — TOTP 2FA in native Rust SRP login
+# Plan: TOTP 2FA in native Rust SRP login
 
 Date: 2026-07-05. Baseline: `main` @ `bb3ea1d` (post v0.19 alignment).
 Status: **implemented same day** (steps 1–8 below all landed; kept as the
-design record). What remains is the live validation described at the bottom —
+design record). What remains is the live validation described at the bottom:
 no code path here has been proven against a real 2FA-enabled account yet.
 
 Implementation summary: `LoginOutcome::{Complete, NeedsSecondFactor}` +
@@ -27,7 +27,7 @@ field (`TwoFactor { enabled: u32 }`,
 `auth.rs:141` with `AuthError::TwoFactorRequired`, pointing at the
 `scripts/configure-session.sh` workaround (probe-only bearer capture).
 
-## The gap is one endpoint call
+## One endpoint call closes the gap
 
 Between "server proof verified" and "fetch key salts":
 
@@ -41,21 +41,21 @@ x-pm-uid: <UID from the /auth response>
 
 On envelope `Code == 1000` the session gains full scope; continue to
 `/core/v4/keys/salts` exactly as today. **2FA does not touch key-password
-derivation** — once this lands, the full encrypted TUI/list/upload/download
+derivation**: once this lands, the full encrypted TUI/list/upload/download
 path works behind TOTP, and the current error message's claim to the contrary
 becomes obsolete.
 
 ### Wire truth (vendored reference @ `f249616`)
 
-- `reference/incubating/account/cs/src/Proton.Drive.Sdk.Account/Api/Authentication/SecondFactorValidationRequest.cs`
-  — body shape (`TwoFactorCode`).
-- `.../AuthenticationApiClient.cs` — `ValidateSecondFactorAsync`, route
+- `reference/incubating/account/cs/src/Proton.Drive.Sdk.Account/Api/Authentication/SecondFactorValidationRequest.cs`:
+  body shape (`TwoFactorCode`).
+- `.../AuthenticationApiClient.cs`: `ValidateSecondFactorAsync`, route
   `auth/v4/2fa` (same endpoint family as our `/core/v4/auth`); response is
   `ScopesResponse` (we only need the envelope code).
 - `.../ProtonApiSession.cs` (~lines 141–150 and `ApplySecondFactorCodeAsync`
-  ~line 275) — sequencing: auth → if `2FA.Enabled` submit code → then key
+  ~line 275): sequencing: auth → if `2FA.Enabled` submit code → then key
   salts / data password.
-- `reference/client/js/src/internal/apiService/coreTypes.ts:4121` — OpenAPI
+- `reference/client/js/src/internal/apiService/coreTypes.ts:4121`: OpenAPI
   route `/core/{_version}/auth/2fa`, "Submit second factor."
 
 ## Implementation steps
@@ -65,7 +65,7 @@ becomes obsolete.
    needs no new DTO (envelope-only; upstream reads back `Scopes`, which we
    don't track).
 2. **`auth.rs::login`**: replace the bail with a continuation. Preferred
-   shape: split into begin/continue —
+   shape: split into begin/continue:
    `LoginOutcome::{Complete(Credentials), NeedsSecondFactor(PendingLogin)}`
    where `PendingLogin` holds the http handle, bearer headers, and everything
    needed to resume; `PendingLogin::submit_totp(code)` posts
@@ -90,7 +90,7 @@ becomes obsolete.
 ## Scope and validation
 
 - **TOTP only.** Upstream's own incubating account SDK collapses
-  `2FA.Enabled` to a bool and supports code submission only — no
+  `2FA.Enabled` to a bool and supports code submission only, no
   FIDO2/WebAuthn. A hardware-key-only second factor is out of scope here too.
 - **Live validation** needs a TOTP-enabled account: `pdtui login` →
   `pdtui mvp`. Unit/mock coverage alone leaves the rejected-code error number
